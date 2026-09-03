@@ -469,3 +469,254 @@ pub fn read_table(
         .collect();
     Ok(rows)
 }
+
+// ========================================================================
+// 依赖签名前言（prologue）：扫 CALL FUNCTION → 内联被调函数的紧凑接口
+// ========================================================================
+
+/// prologue 构建结果。
+pub struct PrologueSummary {
+    /// 成功取到接口的
+    pub resolved: usize,
+    /// 读取失败的（文本中保留占位行，缺口可见而非静默丢弃）
+    pub failed: usize,
+    /// ABAP 注释风格的签名块，可直接粘贴到源码上方
+    pub text: String,
+}
+
+/// 扫描 ABAP 源码行里的 `CALL FUNCTION 'X'` 目标（FM 依赖）。
+///
+/// - 跳过整行注释（行首 `*` 或 `"`）并截断 `"` 起的行内注释；
+/// - 名字取单引号内内容，转大写、去重、保持首次出现顺序；
+/// - `skip`（通常是函数自身）与 cap 截断防递归自引用/病态源码；
+/// - 动态调用（`CALL FUNCTION lv_name`）引号缺失，自然跳过；
+/// - `CALL` 与 `FUNCTION` 跨行的写法不识别（罕见，见端点文档）。
+pub fn scan_called_functions(lines: &[String], skip: &str, cap: usize) -> Vec<String> {
+    let mut seen: Vec<String> = Vec::with_capacity(cap.min(16));
+    let skip_upper = skip.to_uppercase();
+    'outer: for raw in lines {
+        let trimmed = raw.trim_start();
+        // 整行注释
+        if trimmed.starts_with('*') || trimmed.starts_with('"') {
+            continue;
+        }
+        // 截断行内注释
+        let code = match raw.find('"') {
+            Some(i) => &raw[..i],
+            None => raw.as_str(),
+        };
+        let up = code.to_uppercase();
+        let mut search_from = 0usize;
+        while let Some(rel) = up[search_from..].find("CALL FUNCTION") {
+            let mut rest = &code[search_from + rel + "CALL FUNCTION".len()..];
+            // 关键字与引号之间只有空白
+            let rest_trim = rest.trim_start();
+            if !rest_trim.starts_with('\'') {
+                // 动态调用（变量名）或跨行：跳过本次出现
+                search_from += rel + "CALL FUNCTION".len();
+                continue;
+            }
+            rest = rest_trim;
+            let name_part = &rest[1..];
+            if let Some(end) = name_part.find('\'') {
+                let name = name_part[..end].trim().to_uppercase();
+                if !name.is_empty()
+                    && name != skip_upper
+                    && crate::api::validate_func_name(&name).is_ok()
+                    && !seen.contains(&name)
+                {
+                    if seen.len() >= cap {
+                        break 'outer;
+                    }
+                    seen.push(name);
+                }
+            }
+            search_from += rel + "CALL FUNCTION".len();
+        }
+    }
+    seen
+}
+
+/// 按字符数截断（不切多字节字符）。
+fn truncate_chars(s: &str, max: usize) -> &str {
+    match s.char_indices().nth(max) {
+        Some((i, _)) => &s[..i],
+        None => s,
+    }
+}
+
+/// 单个依赖的紧凑签名块（纯格式化，可测）。
+///
+/// 形如：
+/// ```text
+/// FUNCTION BAPI_TRANSACTION_COMMIT.
+///   IMPORT   WAIT        CHAR(1) 可选
+///   EXPORT   RETURN      STRUCT(TYPE,ID,NUMBER,MESSAGE)
+/// ```
+fn format_prologue_dep(
+    name: &str,
+    params: &[(String, String, String, usize, bool, String)], // (方向, 名, 类型表达, 长度, 可选, 描述)
+) -> Vec<String> {
+    let mut out = vec![format!("FUNCTION {}.", name)];
+    for (dir, pname, type_repr, _len, optional, desc) in params {
+        let mut line = format!("  {:<8}{:<31}{}", dir, pname, type_repr);
+        if *optional {
+            line.push_str(" 可选");
+        }
+        if !desc.is_empty() {
+            line.push_str(" -- ");
+            line.push_str(truncate_chars(desc, 40));
+        }
+        out.push(line);
+    }
+    out
+}
+
+/// 取一个函数参数的紧凑类型表达：
+/// 标量 `CHAR(12)` / `INT`；STRUCTURE/TABLE 带一层子字段名 `STRUCT(TYPE,ID,…)`（上限 15 个）。
+fn param_type_repr(p: &crate::connection::ParamInfo) -> String {
+    let ty = crate::api::rfctype_name(p.type_);
+    if ty != "STRUCTURE" && ty != "TABLE" {
+        return if p.char_length > 0 {
+            format!("{}({})", ty, p.char_length)
+        } else {
+            ty.to_string()
+        };
+    }
+    let Some(handle) = p.type_desc_handle else {
+        return ty.to_string();
+    };
+    // SAFETY: handle 来自刚拉取的接口元数据，连接仍有效
+    let subs = match unsafe { crate::connection::get_field_infos(handle) } {
+        Ok(s) => s,
+        Err(_) => return ty.to_string(),
+    };
+    if subs.is_empty() {
+        return ty.to_string();
+    }
+    let mut names: Vec<&str> = subs.iter().map(|sf| sf.name.as_str()).collect();
+    let more = names.len() > 15;
+    names.truncate(15);
+    let mut s = format!("{}({}", ty, names.join(","));
+    if more {
+        s.push_str(",…");
+    }
+    s.push(')');
+    s
+}
+
+/// 为依赖列表构建 prologue 文本：逐个读接口，失败保留占位行（缺口可见）。
+pub fn build_function_prologue(conn: &RfcConnection, deps: &[String]) -> PrologueSummary {
+    let mut text = String::new();
+    let mut resolved = 0usize;
+    let mut failed = 0usize;
+    for d in deps {
+        match conn.get_param_infos(d) {
+            Ok(infos) => {
+                resolved += 1;
+                let params: Vec<(String, String, String, usize, bool, String)> = infos
+                    .iter()
+                    .map(|p| {
+                        (
+                            crate::api::direction_name(p.direction).to_string(),
+                            p.name.clone(),
+                            param_type_repr(p),
+                            p.char_length,
+                            p.optional,
+                            p.parameter_text.clone(),
+                        )
+                    })
+                    .collect();
+                for line in format_prologue_dep(d, &params) {
+                    text.push_str("\" ");
+                    text.push_str(&line);
+                    text.push('\n');
+                }
+            }
+            Err(e) => {
+                failed += 1;
+                text.push_str(&format!("\" FUNCTION {} -- 接口读取失败: {}\n", d, e.message));
+            }
+        }
+    }
+    PrologueSummary {
+        resolved,
+        failed,
+        text,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scan_finds_quoted_call_function_targets() {
+        let lines: Vec<String> = vec![
+            "  CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'".into(),
+            "    call function 'z_foo'".into(),
+            "  CALL FUNCTION '/SDF/EWA_GET_ABAP_DUMPS' DESTINATION 'NONE'.".into(),
+            "  PERFORM do_something.".into(),
+        ];
+        assert_eq!(
+            scan_called_functions(&lines, "", 30),
+            vec!["BAPI_TRANSACTION_COMMIT", "Z_FOO", "/SDF/EWA_GET_ABAP_DUMPS"]
+        );
+    }
+
+    #[test]
+    fn scan_skips_comments_dynamics_duplicates_and_self() {
+        let lines: Vec<String> = vec![
+            "* CALL FUNCTION 'COMMENTED_OUT'".into(),
+            "  X = 1. \" CALL FUNCTION 'INLINE_COMMENT'".into(),
+            "  CALL FUNCTION lv_dynamic.".into(),
+            "  CALL FUNCTION 'DUP'.".into(),
+            "  CALL FUNCTION 'dup'.".into(),
+            "  CALL FUNCTION 'SELF'.".into(),
+            "  CALL FUNCTION 'KEPT'.".into(),
+        ];
+        assert_eq!(scan_called_functions(&lines, "SELF", 30), vec!["DUP", "KEPT"]);
+    }
+
+    #[test]
+    fn scan_respects_cap_in_first_seen_order() {
+        let lines: Vec<String> = (1..=5)
+            .map(|i| format!("  CALL FUNCTION 'FM_{}'.", i))
+            .collect();
+        assert_eq!(
+            scan_called_functions(&lines, "", 3),
+            vec!["FM_1", "FM_2", "FM_3"]
+        );
+    }
+
+    #[test]
+    fn prologue_formats_scalars_structs_and_optionals() {
+        let params = vec![
+            (
+                "IMPORT".into(),
+                "WAIT".into(),
+                "CHAR(1)".into(),
+                1,
+                true,
+                "等待更新结束".into(),
+            ),
+            (
+                "EXPORT".into(),
+                "RETURN".into(),
+                "STRUCT(TYPE,ID,NUMBER,MESSAGE)".into(),
+                0,
+                false,
+                String::new(),
+            ),
+        ];
+        let out = format_prologue_dep("BAPI_TRANSACTION_COMMIT", &params);
+        assert_eq!(out[0], "FUNCTION BAPI_TRANSACTION_COMMIT.");
+        assert!(out[1].starts_with("  IMPORT  WAIT"), "got: {}", out[1]);
+        assert!(out[1].ends_with("CHAR(1) 可选 -- 等待更新结束"), "got: {}", out[1]);
+        assert!(out[2].starts_with("  EXPORT  RETURN"), "got: {}", out[2]);
+        assert!(out[2].ends_with("STRUCT(TYPE,ID,NUMBER,MESSAGE)"), "got: {}", out[2]);
+        // 列对齐：方向列 8 字符、名字列 31 字符，两行的类型表达从同一列开始
+        let type_col = |l: &str| l.find("CHAR(1)").or_else(|| l.find("STRUCT("));
+        assert_eq!(type_col(&out[1]), type_col(&out[2]));
+    }
+}

@@ -6,7 +6,7 @@
 
 ## 这是什么
 
-sap_for_agents 是一个 **SAP NWRFC → REST 网关**：把 SAP 的 RFC/BAPI 函数暴露为 HTTP 接口。你（AI）通过它能在不安装 SAP 客户端的情况下，搜索、查询、调用 SAP 系统里的函数模块。
+sap-for-agents 是一个 **SAP NWRFC → REST 网关**：把 SAP 的 RFC/BAPI 函数暴露为 HTTP 接口。你（AI）通过它能在不安装 SAP 客户端的情况下，搜索、查询、调用 SAP 系统里的函数模块。
 
 - **项目地址**：https://github.com/Jack-Liang/sap-for-agents
 - **问题反馈**：https://github.com/Jack-Liang/sap-for-agents/issues
@@ -35,9 +35,13 @@ curl -H "Authorization: Bearer <SAP_API_KEY>" http://127.0.0.1:3000/api/function
 | 想查某张表/结构有哪些字段 | `GET /api/ddic/type/{name}` |
 | 想理解某个字段的含义、合法取值 | `GET /api/ddic/field/{table}/{field}` |
 | 想看函数的 ABAP 源码（怎么实现的） | `GET /api/functions/{name}/source` |
+| 想一次拿到函数源码 + 它所调用函数的签名（省 N 次往返） | `GET /api/functions/{name}/source?prologue=true` |
 | 想看程序/报表/include 的源码 | `GET /api/programs/{name}/source` |
 | 想读透明表数据（不用裸调 RFC_READ_TABLE） | `POST /api/table/read` |
-| 想查 ABAP 短转储：列表 + 完整 ST22 正文（发生了什么/错误分析） | `GET /api/adt/runtime/dumps` |
+| 想列 ABAP 短转储（结构化：错误类型、终止程序、用户、时间） | `GET /api/dumps` |
+| 想知道**什么在反复失败**（按错误类型 + 终止程序聚合） | `GET /api/dumps/grouped` |
+| 想看某个转储的调用栈/出错行/组件（免拉 45KB–1MB 的 ST22 正文） | `GET /api/dumps/{key}/detail` |
+| 想要原始的完整 ST22 正文（发生了什么/错误分析） | `GET /api/adt/runtime/dump/{key}/formatted` |
 | 想读/写 ABAP 类源码等 ADT（Eclipse 工具链）资源 | `ANY /api/adt/{path}` |
 | **实际调用一个 SAP 函数** | `POST /api/rfc` |
 
@@ -173,6 +177,31 @@ curl -H "Accept: application/atomsvc+xml" http://127.0.0.1:3000/api/adt/discover
 - 写方法（POST/PUT/DELETE/PATCH）：网关自动获取并携带 `X-CSRF-Token` 与会话 Cookie，遇 403（token 过期）自动刷新重试一次。
 - 网关侧故障走 JSON 错误契约：400 `ADT_PATH_INVALID`、502 `ADT_UNREACHABLE`、503 `ADT_DISABLED`（`SAP_ADT_BASE_URL` 为空）、504 `ADT_TIMEOUT`。
 - 需要目标系统的 ADT ICF 服务处于激活状态（SICF）。基地址默认 `http://<SAP_ASHOST>:50000`，可用 `SAP_ADT_BASE_URL` 覆盖（设为空串禁用）。
+
+### 8. 短转储结构化分析（ST22）
+
+对第 7 节同一份 ADT 数据的**解析视图**：拿到的是结构化 JSON，而不是原始 Atom feed / 45KB–1MB 的 ST22 文本：
+
+```bash
+# 结构化列表（最新在前）：error_type、program、user、at、message、key
+curl http://127.0.0.1:3000/api/dumps
+
+# 什么在「反复」失败：按（错误类型 + 终止程序）聚合
+curl http://127.0.0.1:3000/api/dumps/grouped
+
+# 单个转储的解析详情：头表、终止点（include/行号/过程）、调用栈（最内层在前）。
+# key 取列表/聚合响应里的 key 字段
+curl http://127.0.0.1:3000/api/dumps/20260824012009%20a4h/detail
+```
+
+- `GET /api/dumps` —— 查询参数：`from`/`to`（`yyyyMMddHHmmss`，UTC，透传给 ADT 服务端翻页）、`limit`（默认 100，上限 1000）。
+- `GET /api/dumps/grouped` —— 参数同上；返回组按条数降序（同数按最新在前），每组含 `count` / `first` / `last` / `users` / `latest_key` / `latest_message`，`latest_key` 可直接接详情端点。
+- `GET /api/dumps/{key}/detail` —— 网关内部拉英文渲染并解析：`error_type`、`exception`、`program`（头表值，RAISE_EXCEPTION 时可能与 feed 的终止程序不同——feed 指抛异常的标准类，头表指调用它的类）、`component`（"Not assigned" 归一化为空）、`include`/`line`/`procedure`/`main_program`、`stack[]`（position/type/program/include/line/name）与头表原始 `header` 标签→值。
+- 典型排查流：`grouped` → 挑最上面的组 → 用 `latest_key` 拉 `detail` → 用 `/api/programs/{program}/source` 读出错行的源码。
+- 详情里的 `program` 对类转储是 **class pool 名**（`ZCL_X=========CP`），类本身是 `ZCL_X`。
+- 需要启用 ADT（同第 7 节）；未启用返回 503 `ADT_DISABLED`。详情解析按英文标签匹配——非英文系统上字段返回空而非错值，需要原文时走第 7 节的 `/formatted`。详情 404 = 转储已过期或该 release 无详情资源（7.50 有 feed 无详情）。
+
+`GET /api/functions/{name}/source?prologue=true`（同一「省往返」思路）：返回源码 + 依赖签名前言——扫描源码里的 `CALL FUNCTION 'X'`，逐个解析成紧凑签名块（`prologue.text`，ABAP 注释风格），一次调用同时拿到「代码 + 它调用的东西的契约」。读取失败的依赖保留 `FUNCTION X -- 接口读取失败` 占位行，缺口可见而非静默丢弃。
 
 ## 关键约束（避坑）
 

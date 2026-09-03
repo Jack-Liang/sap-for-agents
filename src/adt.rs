@@ -212,6 +212,51 @@ fn is_write_method(m: &Method) -> bool {
     matches!(*m, Method::POST | Method::PUT | Method::DELETE | Method::PATCH)
 }
 
+/// 内部 GET 通道：供网关自身的结构化端点（`/api/dumps/**`）复用 ADT 配置、
+/// 认证与错误契约，避免各自直接拼 URL。
+///
+/// `rel_raw` 是 `/sap/bc/adt/` 之后的相对路径（原始 percent-encoded 形式，
+/// 可带 query）。返回 `(HTTP 状态码, Content-Type, body)`，状态与内容由
+/// ADT 原样给出，调用方自行解读。
+pub(crate) async fn adt_get_raw(
+    rel_raw: &str,
+    accept: &str,
+) -> Result<(u16, Option<String>, Bytes), RfcError> {
+    let cfg = ADT.get().ok_or_else(|| RfcError {
+        code: -1,
+        status: 503,
+        message: "ADT 代理未启用（设置 SAP_ADT_BASE_URL 后重启）".into(),
+        key: "ADT_DISABLED".into(),
+    })?;
+    let rel_raw = validate_raw_path(rel_raw)?;
+    let url = format!("{}/sap/bc/adt/{}", cfg.base_url, rel_raw);
+
+    let resp = cfg
+        .client
+        .get(&url)
+        .header("Authorization", &cfg.basic)
+        .header("Accept", accept)
+        .send()
+        .await
+        .map_err(|e| {
+            metrics::counter!("adt_calls_total", "method" => "GET", "result" => "err").increment(1);
+            adt_unreachable(e)
+        })?;
+
+    let status = resp.status().as_u16();
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    let body = resp.bytes().await.map_err(|e| {
+        metrics::counter!("adt_calls_total", "method" => "GET", "result" => "err").increment(1);
+        adt_unreachable(e)
+    })?;
+    metrics::counter!("adt_calls_total", "method" => "GET", "result" => "ok").increment(1);
+    Ok((status, content_type, body))
+}
+
 /// `ANY /api/adt/{*path}` —— ADT REST 通用代理。
 ///
 /// 透传规则：

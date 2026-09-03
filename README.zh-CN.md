@@ -310,18 +310,21 @@ curl -H "Authorization: Bearer $SAP_API_KEY" \
 
 ### 3.3 面向 AI 的元数据 API
 
-8 个端点让 AI/Agent 自服务地发现函数、理解参数、查数据字典、读文档、看源码、读表数据。典型工作流：**搜索 → 查接口 → 查文档 → 看源码 → 调用**。给 AI 的完整操作指南见 [`AGENTS.md`](./AGENTS.md)。
+11 个端点让 AI/Agent 自服务地发现函数、理解参数、查数据字典、读文档、看源码、读表数据、排查短转储。典型工作流：**搜索 → 查接口 → 查文档 → 看源码 → 调用**。给 AI 的完整操作指南见 [`AGENTS.md`](./AGENTS.md)。
 
 | 端点 | 用途 | 示例 |
 |------|------|------|
 | `POST /api/functions/search` | 按通配符搜索函数 | `{"pattern":"BAPI_USER_*","max_results":10}` |
 | `GET /api/functions/:name` | 查函数完整接口（参数/类型/方向/嵌套字段） | `/api/functions/BAPI_USER_GET_DETAIL` |
 | `GET /api/functions/:name/doc` | 查文档（短文本+SE37长文档+参数说明） | `/api/functions/BAPI_USER_GET_DETAIL/doc?lang=EN` |
-| `GET /api/functions/:name/source` | 读函数 ABAP 源码（怎么实现的） | `/api/functions/STFC_CONNECTION/source` |
+| `GET /api/functions/:name/source` | 读函数 ABAP 源码（怎么实现的）；`?prologue=true` 附带所调 `CALL FUNCTION` 目标的紧凑签名 | `/api/functions/STFC_CONNECTION/source?prologue=true` |
 | `GET /api/programs/:name/source` | 读程序/报表/include 源码 | `/api/programs/RSBDCOS0/source` |
 | `POST /api/table/read` | 读透明表数据（封装 RFC_READ_TABLE） | `{"table":"T000","fields":["MANDT","MTEXT"]}` |
 | `GET /api/ddic/type/:name` | 查 DDIC 结构/表字段定义 | `/api/ddic/type/BAPIRET2` |
 | `GET /api/ddic/field/:table/:field` | 查字段语义（数据元素/域/固定值） | `/api/ddic/field/BAPIRET2/TYPE` |
+| `GET /api/dumps` | 短转储结构化列表（解析自 ADT Atom feed） | `/api/dumps?limit=50` |
+| `GET /api/dumps/grouped` | 按（错误类型、终止程序）聚合——什么在反复失败 | `/api/dumps/grouped` |
+| `GET /api/dumps/:key/detail` | 单个转储的解析详情：头表/终止点/调用栈 | `/api/dumps/<key>/detail` |
 
 端到端示例（列出用户）：
 ```bash
@@ -335,6 +338,7 @@ curl -X POST http://127.0.0.1:3000/api/rfc -H "Content-Type: application/json" \
 > - DDIC 类型查询(端点 4/5)对**结构**普遍可用；**透明表**(如 MARA)视目标系统 DDIC 配置可能 `NOT_FOUND`。
 > - 长文档(端点 3)依赖 `DOCU_GET`，个别系统未启用时 `long_text` 为空，但参数描述仍可用。
 > - `fixed_values` 对理解状态码/枚举字段的合法取值特别有用。
+> - `/api/dumps*` 端点需要启用 ADT（`SAP_ADT_BASE_URL`），否则与 ADT 代理一样返回 503 `ADT_DISABLED`。详情解析按英文标签匹配——非英文 logon 系统上字段返回空而非错值（需要原文走 `/api/adt/runtime/dump/{key}/formatted`）。列表/聚合端点只解析结构化 Atom feed，零详情请求。
 
 ---
 
@@ -576,6 +580,7 @@ src/
 ├── auth.rs           /api/* 的可选 Bearer Token 鉴权（SAP_API_KEY，常量时间比对）；探针与文档页始终免鉴权
 ├── server_rfc.rs     server 模式：注册到 Gateway + dispatch 回调 + webhook 转发
 ├── adt.rs            ADT REST 代理 /api/adt/**：透传到 /sap/bc/adt/**，Basic 认证 + CSRF token/会话管理（写方法遇 403 自动重试）
+├── dumps.rs          ST22 结构化分析 /api/dumps**：Atom feed 解析、（错误类型×程序）聚合、/formatted 文本 → 头表/终止点/调用栈
 ├── api.rs            请求/响应 DTO（serde）+ execute_invoke 执行核心 + 输入校验
 ├── executor.rs       execute_collect：注入元数据解析后委托 execute_invoke
 ├── connection.rs     RfcConnection：建连/关闭/取函数/拉参数元数据（unsafe impl Send）
@@ -619,6 +624,8 @@ src/
 | FFI 句柄防御 | ✅ 已实现（OpenConnection/CreateFunction/AppendNewRow 等返回值 null 检查） |
 | 命名空间函数 `/NS/NAME` | ✅ 已实现（校验放行 + 通配路由分发，v0.4.10 起） |
 | ADT REST 代理 | ✅ 已实现（`/api/adt/**` 透传 + 写方法 CSRF 自动处理，v0.4.11 起） |
+| ST22 结构化分析 | ✅ 已实现（`/api/dumps` 列表/聚合/详情，解析自 ADT——免去几十万字节原始文本，v0.5.0 起） |
+| 源码依赖前言 | ✅ 已实现（`/api/functions/:name/source?prologue=true` 内联 `CALL FUNCTION` 目标紧凑签名，v0.5.0 起） |
 | 按 IP 限流 | ✅ 已实现（可选 `SAP_RATE_LIMIT_RPS`，governor 键控限流器，超限 429） |
 | 单次 RFC 执行超时 | ✅ 已实现（`run_blocking_with_timeout` 用 `tokio::time::timeout` 包 `spawn_blocking`；默认 60s / `SAP_REQUEST_TIMEOUT_SECS`，单请求 `timeout_secs`，超时 504） |
 | tRFC/qRFC | 暂不支持 |

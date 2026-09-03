@@ -4,6 +4,7 @@ mod auth;
 mod config;
 mod connection;
 mod discovery;
+mod dumps;
 mod error;
 mod executor;
 mod ffi;

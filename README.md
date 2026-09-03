@@ -310,18 +310,21 @@ Fields you don't read (e.g. you didn't pass `table_outputs`) do **not** appear i
 
 ### 3.3 AI-facing metadata API
 
-8 endpoints let an AI/agent self-service discover functions, understand parameters, query the data dictionary, read docs, view source, and read table data. Typical workflow: **search → inspect interface → read docs → view source → call**. The full operator guide for AI lives in [`AGENTS.md`](./AGENTS.md).
+11 endpoints let an AI/agent self-service discover functions, understand parameters, query the data dictionary, read docs, view source, read table data, and triage short dumps. Typical workflow: **search → inspect interface → read docs → view source → call**. The full operator guide for AI lives in [`AGENTS.md`](./AGENTS.md).
 
 | Endpoint | Purpose | Example |
 |------|------|------|
 | `POST /api/functions/search` | Search functions by wildcard | `{"pattern":"BAPI_USER_*","max_results":10}` |
 | `GET /api/functions/:name` | Inspect a function's full interface (parameters/types/direction/nested fields) | `/api/functions/BAPI_USER_GET_DETAIL` |
 | `GET /api/functions/:name/doc` | Read docs (short text + SE37 long doc + parameter descriptions) | `/api/functions/BAPI_USER_GET_DETAIL/doc?lang=EN` |
-| `GET /api/functions/:name/source` | Read a function's ABAP source (how it's implemented) | `/api/functions/STFC_CONNECTION/source` |
+| `GET /api/functions/:name/source` | Read a function's ABAP source (how it's implemented); `?prologue=true` appends compact signatures of every `CALL FUNCTION` target | `/api/functions/STFC_CONNECTION/source?prologue=true` |
 | `GET /api/programs/:name/source` | Read program/report/include source | `/api/programs/RSBDCOS0/source` |
 | `POST /api/table/read` | Read transparent-table data (wraps RFC_READ_TABLE) | `{"table":"T000","fields":["MANDT","MTEXT"]}` |
 | `GET /api/ddic/type/:name` | Query DDIC structure/table field definitions | `/api/ddic/type/BAPIRET2` |
 | `GET /api/ddic/field/:table/:field` | Query field semantics (data element/domain/fixed values) | `/api/ddic/field/BAPIRET2/TYPE` |
+| `GET /api/dumps` | Structured short-dump list (parsed from the ADT Atom feed) | `/api/dumps?limit=50` |
+| `GET /api/dumps/grouped` | Dumps grouped by (error type, terminated program) — what keeps failing | `/api/dumps/grouped` |
+| `GET /api/dumps/:key/detail` | One dump's parsed detail: header, termination point, call stack | `/api/dumps/<key>/detail` |
 
 End-to-end example (list users):
 ```bash
@@ -335,6 +338,7 @@ curl -X POST http://127.0.0.1:3000/api/rfc -H "Content-Type: application/json" \
 > - DDIC type queries (endpoints 4/5) are generally available for **structures**; **transparent tables** (e.g. MARA) may return `NOT_FOUND` depending on the target system's DDIC configuration.
 > - Long docs (endpoint 3) rely on `DOCU_GET`; on some systems where it isn't enabled, `long_text` is empty, but parameter descriptions still work.
 > - `fixed_values` is especially useful for understanding the legal values of status-code / enum fields.
+> - The `/api/dumps*` endpoints need ADT enabled (`SAP_ADT_BASE_URL`); like the ADT proxy they return 503 `ADT_DISABLED` otherwise. Detail parsing matches English labels — on a non-English logon, fields come back empty rather than wrong (fall back to the raw `/api/adt/runtime/dump/{key}/formatted`). The list/grouped endpoints parse only the structured Atom feed and cost zero detail requests.
 
 ---
 
@@ -575,6 +579,7 @@ src/
 ├── auth.rs           Optional Bearer-token auth for /api/* (SAP_API_KEY, constant-time compare); probes & doc pages always open
 ├── server_rfc.rs     Server mode: register with the Gateway + dispatch callbacks + webhook forwarding
 ├── adt.rs            ADT REST proxy /api/adt/**: passthrough to /sap/bc/adt/** with Basic auth + CSRF token/session handling (write methods retry once on 403)
+├── dumps.rs          Structured ST22 analysis /api/dumps**: Atom feed parsing, (error type × program) grouping, /formatted text → header/termination point/call stack
 ├── api.rs            Request/response DTOs (serde) + execute_invoke execution core + input validation
 ├── executor.rs       execute_collect: injects metadata resolution then delegates to execute_invoke
 ├── connection.rs     RfcConnection: open/close/fetch function/pull parameter metadata (unsafe impl Send)
@@ -618,6 +623,8 @@ src/
 | FFI handle defense | ✅ Implemented (null checks on OpenConnection/CreateFunction/AppendNewRow return values) |
 | Namespaced function modules `/NS/NAME` | ✅ Implemented (validation + wildcard route dispatch, since v0.4.10) |
 | ADT REST proxy | ✅ Implemented (`/api/adt/**` passthrough with automatic CSRF handling, since v0.4.11) |
+| Structured ST22 analysis | ✅ Implemented (`/api/dumps` list/grouped/detail parsed from ADT — no more multi-hundred-KB raw texts; since v0.5.0) |
+| Source dependency prologue | ✅ Implemented (`/api/functions/:name/source?prologue=true` inlines compact signatures of `CALL FUNCTION` targets; since v0.5.0) |
 | Per-IP rate limiting | ✅ Implemented (optional `SAP_RATE_LIMIT_RPS`, `governor`-keyed limiter, 429 on excess) |
 | Per-RFC execution timeout | ✅ Implemented (`run_blocking_with_timeout` wraps `spawn_blocking` with `tokio::time::timeout`; default 60s / `SAP_REQUEST_TIMEOUT_SECS`, per-request `timeout_secs`, 504 on timeout) |
 | tRFC/qRFC | Not supported yet |

@@ -35,9 +35,13 @@ curl -H "Authorization: Bearer <SAP_API_KEY>" http://127.0.0.1:3000/api/function
 | Want the fields of a table/structure | `GET /api/ddic/type/{name}` |
 | Want to understand a field's meaning and valid values | `GET /api/ddic/field/{table}/{field}` |
 | Want the function's ABAP source (how it's implemented) | `GET /api/functions/{name}/source` |
+| Want function source + signatures of the functions it calls (one round trip) | `GET /api/functions/{name}/source?prologue=true` |
 | Want the source of a program/report/include | `GET /api/programs/{name}/source` |
 | Want to read transparent table data (without calling RFC_READ_TABLE directly) | `POST /api/table/read` |
-| Want ABAP short-dump info: list, full ST22 text (What happened/Error analysis) | `GET /api/adt/runtime/dumps` |
+| Want to list ABAP short dumps (structured: error type, program, user, time) | `GET /api/dumps` |
+| Want to know **what keeps failing** (dumps grouped by error type + program) | `GET /api/dumps/grouped` |
+| Want one dump's call stack / failing line / component (without the 45KB–1MB ST22 text) | `GET /api/dumps/{key}/detail` |
+| Want the raw full ST22 text (What happened/Error analysis) | `GET /api/adt/runtime/dump/{key}/formatted` |
 | Want to read/write ABAP class sources and other ADT (Eclipse tooling) resources | `ANY /api/adt/{path}` |
 | **Actually invoke an SAP function** | `POST /api/rfc` |
 
@@ -173,6 +177,31 @@ Behavior:
 - Write methods (POST/PUT/DELETE/PATCH): the gateway fetches and attaches the `X-CSRF-Token` + session cookie automatically and retries once on 403 (token expiry).
 - Gateway-side failures use the JSON error contract: 400 `ADT_PATH_INVALID`, 502 `ADT_UNREACHABLE`, 503 `ADT_DISABLED` (empty `SAP_ADT_BASE_URL`), 504 `ADT_TIMEOUT`.
 - Requires the ADT ICF service to be active in the target system (SICF). Base URL defaults to `http://<SAP_ASHOST>:50000`, override with `SAP_ADT_BASE_URL` (empty string disables).
+
+### 8. Structured short-dump analysis (ST22)
+
+Parsed views over the same ADT data as section 7 — you get structured JSON instead of raw XML feed / 45KB–1MB of ST22 text:
+
+```bash
+# Structured list, newest first: error_type, program, user, at, message, key
+curl http://127.0.0.1:3000/api/dumps
+
+# What KEEPS failing: dumps collapsed by (error type, terminated program)
+curl http://127.0.0.1:3000/api/dumps/grouped
+
+# One dump's parsed detail: header, termination point (include/line/procedure),
+# call stack (innermost first). Use the `key` from the list/grouped response.
+curl http://127.0.0.1:3000/api/dumps/20260824012009%20a4h/detail
+```
+
+- `GET /api/dumps` — query params: `from`/`to` (`yyyyMMddHHmmss`, UTC, passed through to ADT), `limit` (default 100, max 1000).
+- `GET /api/dumps/grouped` — same params; returns groups sorted by count desc (ties: most recent first), each with `count` / `first` / `last` / `users` / `latest_key` / `latest_message`. A group's `latest_key` plugs straight into the detail endpoint.
+- `GET /api/dumps/{key}/detail` — the gateway fetches the English rendering of the dump and parses it: `error_type`, `exception`, `program` (header table's, which can differ from the feed's terminated program on RAISE_EXCEPTION), `component` (empty when "Not assigned"), `include`/`line`/`procedure`/`main_program`, `stack[]` (position/type/program/include/line/name), and the raw `header` label→value map.
+- Typical triage flow: `grouped` → pick the top group → `detail` on `latest_key` → read the failing line's source via `/api/programs/{program}/source`.
+- `program` in the detail is a **class pool name** for class dumps (`ZCL_X=========CP`) — the class itself is `ZCL_X`.
+- Requires ADT enabled (like section 7); these endpoints return 503 `ADT_DISABLED` when `SAP_ADT_BASE_URL` is empty. Detail parsing matches English labels — on a non-English system fields come back empty rather than wrong; fall back to the raw `/formatted` text via section 7 if you need it. A 404 on detail means the dump is gone or the release has no detail resource (7.50 has the feed but not per-dump details).
+
+`GET /api/functions/{name}/source?prologue=true` (also under this "save round trips" theme) returns the source plus a dependency prologue: every `CALL FUNCTION 'X'` target resolved to a compact signature block (`prologue.text`, ABAP-comment style), so one call gives you the code *and* the contracts of what it calls. Failures stay visible as `FUNCTION X -- 接口读取失败` lines rather than being dropped.
 
 ## Key constraints (pitfalls to avoid)
 

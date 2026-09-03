@@ -151,6 +151,10 @@ pub fn app(pool: SharedPool) -> Router {
         .route("/api/table/read", post(table_read_handler))
         .route("/api/ddic/type/:name", axum::routing::get(ddic_type_handler))
         .route("/api/ddic/field/:table/:field", axum::routing::get(ddic_field_handler))
+        // ABAP 短转储结构化读取（解析自 ADT，免拉 45KB–1MB 原始文本）
+        .route("/api/dumps", axum::routing::get(dumps_list_handler))
+        .route("/api/dumps/grouped", axum::routing::get(dumps_grouped_handler))
+        .route("/api/dumps/*key", axum::routing::get(dump_detail_handler))
         // ADT REST 通用代理（dump 正文、类/程序源码等，任何方法透传）
         .route("/api/adt/*path", axum::routing::any(crate::adt::adt_proxy))
         .layer(axum::middleware::from_fn(crate::auth::require_api_key))
@@ -560,7 +564,7 @@ async fn function_route_dispatcher(
             .into_response();
     }
     if let Some(base) = name.strip_suffix("/source").filter(|b| !b.is_empty()) {
-        return function_source_handler(State(pool), Path(base.to_string()))
+        return function_source_handler(State(pool), Path(base.to_string()), q.prologue.clone())
             .await
             .into_response();
     }
@@ -677,6 +681,9 @@ async fn ddic_type_handler(
 struct LangQuery {
     #[serde(default)]
     lang: Option<String>,
+    /// /source 端点专用：是否附依赖签名前言（"true"/"1"）
+    #[serde(default)]
+    prologue: Option<String>,
 }
 /// ④ GET /api/ddic/field/:table/:field —— 查字段的语义元数据（数据元素/域/固定值）
 async fn ddic_field_handler(
@@ -710,20 +717,40 @@ async fn ddic_field_handler(
 }
 
 /// ⑥ `GET /api/functions/:name/source` —— 读函数 ABAP 源代码（调 `RPY_FUNCTIONMODULE_READ`）
+/// `?prologue=true` 时附带依赖签名前言：扫描源码里的 `CALL FUNCTION 'X'`，
+/// 逐个取其接口，内联成紧凑签名块（ABAP 注释风格，可直接粘贴到源码上方），
+/// 让调用方一次拿到「源码 + 依赖契约」，省去 N 次接口往返。
 async fn function_source_handler(
     axum::extract::State(pool): axum::extract::State<SharedPool>,
     axum::extract::Path(name): axum::extract::Path<String>,
+    prologue: Option<String>,
 ) -> Result<Json<serde_json::Value>, RfcError> {
     crate::api::validate_func_name(&name)?;
+    let want_prologue = matches!(prologue.as_deref(), Some("true") | Some("1"));
     let lookup = name.clone();
-    let lines = run_blocking(pool, move |conn| {
-        crate::discovery::read_function_source(conn, &lookup)
+    let (lines, prologue_json) = run_blocking(pool, move |conn| {
+        let lines = crate::discovery::read_function_source(conn, &lookup)?;
+        if !want_prologue {
+            return Ok((lines, None));
+        }
+        let deps = crate::discovery::scan_called_functions(&lines, &lookup, 30);
+        let deps_found = deps.len();
+        let p = crate::discovery::build_function_prologue(conn, &deps);
+        let json = serde_json::json!({
+            "deps_found": deps_found,
+            "resolved": p.resolved,
+            "failed": p.failed,
+            "text": p.text,
+        });
+        Ok((lines, Some(json)))
     })
     .await?;
     let count = lines.len();
-    Ok(Json(
-        serde_json::json!({"name": name, "count": count, "lines": lines}),
-    ))
+    let mut body = serde_json::json!({"name": name, "count": count, "lines": lines});
+    if let Some(p) = prologue_json {
+        body["prologue"] = p;
+    }
+    Ok(Json(body))
 }
 
 /// ⑦ `GET /api/programs/:name/source` —— 读 ABAP 程序源代码（调 `RPY_PROGRAM_READ`，含 include/报表）
@@ -809,6 +836,91 @@ async fn table_read_handler(
     Ok(Json(
         serde_json::json!({"table": table, "fields": fields, "count": rows.len(), "rows": rows}),
     ))
+}
+
+// ========================================================================
+// ABAP 短转储（ST22）结构化 handler（端点 ⑨~⑪）
+// ========================================================================
+
+/// `/api/dumps` 系列查询参数。
+#[derive(serde::Deserialize)]
+struct DumpsQuery {
+    /// 起始时间（UTC `yyyyMMddHHmmss`，透传给 ADT 让其服务端翻页）
+    #[serde(default)]
+    from: Option<String>,
+    /// 结束时间（同上）
+    #[serde(default)]
+    to: Option<String>,
+    /// 最多处理条数（默认 100，上限 1000；grouped 在截断后聚合）
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+/// 校验 `yyyyMMddHHmmss`（14 位数字）。
+fn validate_dump_stamp(s: &str) -> Result<(), RfcError> {
+    if s.len() == 14 && s.bytes().all(|b| b.is_ascii_digit()) {
+        Ok(())
+    } else {
+        Err(RfcError {
+            code: -1,
+            status: 400,
+            message: format!(
+                "from/to 须为 14 位数字时间戳 yyyyMMddHHmmss（UTC），收到: {}",
+                s
+            ),
+            key: "DUMP_QUERY_INVALID".into(),
+        })
+    }
+}
+
+/// ⑨ `GET /api/dumps` —— 短转储列表（ADT Atom feed 解析为结构化条目，newest-first）。
+/// 每条含 error_type / program / user / at / message / key，key 可接 `/api/dumps/{key}/detail`。
+async fn dumps_list_handler(
+    axum::extract::Query(q): axum::extract::Query<DumpsQuery>,
+) -> Result<Json<serde_json::Value>, RfcError> {
+    let limit = q.limit.unwrap_or(100).clamp(1, 1000);
+    if let Some(v) = q.from.as_deref() {
+        validate_dump_stamp(v)?;
+    }
+    if let Some(v) = q.to.as_deref() {
+        validate_dump_stamp(v)?;
+    }
+    let mut dumps = crate::dumps::fetch_feed(q.from.as_deref(), q.to.as_deref()).await?;
+    dumps.truncate(limit);
+    Ok(Json(
+        serde_json::json!({"count": dumps.len(), "dumps": dumps}),
+    ))
+}
+
+/// ⑩ `GET /api/dumps/grouped` —— 按 (错误类型, 终止程序) 聚合，
+/// 回答「什么在反复失败」。组按条数降序，`latest_key` 可直接接详情端点。
+async fn dumps_grouped_handler(
+    axum::extract::Query(q): axum::extract::Query<DumpsQuery>,
+) -> Result<Json<serde_json::Value>, RfcError> {
+    let limit = q.limit.unwrap_or(100).clamp(1, 1000);
+    if let Some(v) = q.from.as_deref() {
+        validate_dump_stamp(v)?;
+    }
+    if let Some(v) = q.to.as_deref() {
+        validate_dump_stamp(v)?;
+    }
+    let mut dumps = crate::dumps::fetch_feed(q.from.as_deref(), q.to.as_deref()).await?;
+    dumps.truncate(limit);
+    let groups = crate::dumps::group_dumps(&dumps);
+    Ok(Json(
+        serde_json::json!({"count": groups.len(), "groups": groups}),
+    ))
+}
+
+/// ⑪ `GET /api/dumps/{key}/detail` —— 单个转储的结构化详情（头表/终止点/调用栈）。
+/// key 取列表返回的 `key` 字段；原始 `%20` 编码或解码形态均可。
+/// 路由是通配捕获（key 本身可含 `/`），此处剥掉文档形态的尾部 `/detail`。
+async fn dump_detail_handler(
+    axum::extract::Path(key): axum::extract::Path<String>,
+) -> Result<Json<crate::dumps::DumpDetail>, RfcError> {
+    let key = key.strip_suffix("/detail").unwrap_or(&key);
+    let detail = crate::dumps::fetch_detail(key).await?;
+    Ok(Json(detail))
 }
 
 /// ⑤ GET /api/functions/:name/doc —— 查函数文档（短文本 + SE37 长文本 + 参数说明）
