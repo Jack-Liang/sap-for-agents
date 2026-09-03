@@ -300,7 +300,9 @@ fn text_lines_spec() -> Vec<FieldSpec> {
     ]
 }
 
-/// 读函数模块的 ABAP 源代码（内部调 `RPY_FUNCTIONMODULE_READ`，源码在 `SOURCE` 表）。
+/// 读函数模块的 ABAP 源代码（内部调 `RPY_FUNCTIONMODULE_READ`，源码在 `SOURCE_EXTENDED` 表）。
+/// 用 SOURCE_EXTENDED（CHAR255）而非 SOURCE（CHAR72）：现代 SAP 代码行宽常超 72，
+/// 走窄表会触发 FL 180「Source wider than 72 char」直接失败。
 /// 返回源码行列表（每行一个字符串）。
 pub fn read_function_source(
     conn: &RfcConnection,
@@ -312,13 +314,16 @@ pub fn read_function_source(
             "FUNCTIONNAME".to_string(),
             ScalarValue::Chars(func_name.to_uppercase()),
         )]),
-        table_outputs: HashMap::from([("SOURCE".to_string(), source_line_spec())]),
+        table_outputs: HashMap::from([(
+            "SOURCE_EXTENDED".to_string(),
+            source_line_spec(),
+        )]),
         ..Default::default()
     };
     let resp = execute_collect(conn, &req)?;
     Ok(resp
         .tables
-        .get("SOURCE")
+        .get("SOURCE_EXTENDED")
         .cloned()
         .unwrap_or_default()
         .into_iter()
