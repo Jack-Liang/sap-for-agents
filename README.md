@@ -9,6 +9,8 @@ Wraps the SAP NWRFC SDK into a long-running HTTP service that exposes any SAP RF
 - **Generic interface**: one endpoint, `/api/rfc`, describes any BAPI — no per-BAPI glue code
 - **AI-friendly**: 8 metadata endpoints (search functions / inspect interfaces / read docs / query the data dictionary / read transparent tables / view source) let agents explore self-service. The operator guide for AI lives in [`AGENTS.md`](./AGENTS.md)
 
+> ⚠️ **Risk disclaimer**: this is an **exploratory, experimental project**, primarily built for learning, testing, and local development scenarios. It has not been hardened for production use, offers no guarantee of stability or correctness, and its APIs may change at any time. It grants RFC access with the full privileges of the configured `SAP_USER` — before using it, you must evaluate the risks yourself (data exposure, unauthorized calls, compliance, etc.) and take your own precautions. Use it against production SAP systems at your own risk; the authors accept no liability for any loss arising from its use.
+
 ## Table of Contents
 
 - [Quick Start](#quick-start)
