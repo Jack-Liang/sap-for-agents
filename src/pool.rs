@@ -11,7 +11,8 @@
 use crate::connection::RfcConnection;
 use crate::error::RfcError;
 use crate::ffi::{
-    RFC_ABAP_RUNTIME_FAILURE, RFC_CLOSED, RFC_COMMUNICATION_FAILURE, RFC_LOGON_FAILURE, RFC_RC,
+    RFC_ABAP_RUNTIME_FAILURE, RFC_CLOSED, RFC_COMMUNICATION_FAILURE, RFC_INVALID_HANDLE,
+    RFC_LOGON_FAILURE, RFC_RC,
 };
 use std::sync::{Condvar, Mutex};
 
@@ -20,11 +21,29 @@ use std::sync::{Condvar, Mutex};
 /// 这些都是「连接已不可用 / 状态不可靠」类错误，复用废连接无意义，应销毁后新建。
 /// 用 ffi 命名常量（值见 nwrfcsdk/include/sapnwrfc.h 的 _RFC_RC 枚举），不再写魔法数字，
 /// 避免此前把 CONVERSION_FAILURE(22) 误当 CLOSED 的错误。
-const RECONNECT_RC: [RFC_RC; 4] = [
-    RFC_COMMUNICATION_FAILURE, // 1：网络/通信层失败
+///
+/// ## 为什么 RFC_INVALID_HANDLE(13) 也在里面
+///
+/// SDK 文档定义：「`RFC_INVALID_HANDLE, if the given rfcHandle is not connected`」
+/// （sapnwrfc.h L1582）——只要句柄处于"非连接"状态就报这个，不仅仅是"已 close"。
+///
+/// 实证（dev_rfc.log 复现路径）：
+/// 1. 一次 ABAP 短转储（code 3，如 `DATA_OFFSET_LENGTH_TOO_LARGE`）
+///    → 池丢弃旧 conn、新 conn 入池
+/// 2. 新 conn 在做下一次 FFI 调用时，SDK 检测该句柄在 SAP 端 CPIC 会话已死
+///    → 返回 code 13（不是 code 1 的「no conversation found」——那次是
+///    CPIC 层，下一次 FFI 时 SDK 看到句柄不可达就报 13）
+/// 3. 之前 13 不在丢弃名单 → should_discard=false → conn 被 release 入池
+/// 4. 后续请求 pop 到这个毒连接 → 又是 code 13 → 永久全挂，
+///    直到 SAP NWRFC DLL 自身状态机崩溃（`process exit code: 1`）
+///
+/// 加入 13 后：code 13 一出现就立刻丢弃 + 新建，断开毒连接的死循环。
+const RECONNECT_RC: [RFC_RC; 5] = [
+    RFC_COMMUNICATION_FAILURE, // 1：网络/通信层失败（含 CPIC 「no conversation found」）
     RFC_LOGON_FAILURE,         // 2：登录/会话失效，重连可能恢复
     RFC_ABAP_RUNTIME_FAILURE,  // 3：SYSTEM_FAILURE(shortdump) 后连接状态不可靠
     RFC_CLOSED,                // 6：连接被对端/gateway 关闭
+    RFC_INVALID_HANDLE,        // 13：句柄"非连接"——SAP 端会话已死后 SDK 的状态机错误
 ];
 
 fn should_discard(err: &RfcError) -> bool {
@@ -115,7 +134,22 @@ impl RfcConnectionPool {
                 // 重新借一个（此时池里至少有刚新建的那个）
                 let conn2 = self.acquire()?;
                 let r = f(&conn2);
-                self.release(conn2);
+                // 重试失败时也要按错误码决定丢弃/归还：
+                // 若仍属"应丢弃"类（含 RFC_INVALID_HANDLE）→ conn2 也丢，避免把毒连接塞回池里
+                // 否则（业务类错误，比如参数错）→ 归还，连接本身仍健康
+                match &r {
+                    Err(e2) if should_discard(e2) => {
+                        tracing::warn!(code = e2.code, key = %e2.key, "SAP 重试连接也失败，丢弃（不归还）");
+                        // 显式 drop conn2 触发 RfcCloseConnection；total 由 create_connection 加回去，
+                        // 这里同步减回去，保持计数平衡。
+                        drop(conn2);
+                        if let Ok(mut guard) = self.inner.lock() {
+                            guard.total = guard.total.saturating_sub(1);
+                            self.cv.notify_one();
+                        }
+                    }
+                    _ => self.release(conn2),
+                }
                 r
             }
             Err(e) => {
