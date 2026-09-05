@@ -34,7 +34,8 @@ quick-xml = "0.36"
 
 [profile.release]
 lto = true
-panic = "abort"
+# 不设 panic="abort"：保留 unwinding，handler 内的 panic 由 tokio 任务隔离
+# 兜住（只断当前连接），不会杀死整个网关进程。对长跑服务，可用性 > 二进制体积。
 codegen-units = 1
 opt-level = "z"
 strip = true
