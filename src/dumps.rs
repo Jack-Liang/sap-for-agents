@@ -148,7 +148,7 @@ fn dump_key_from(id_or_href: &str) -> String {
 }
 
 /// 元素限定名的本地部分（去掉命名空间前缀，如 `atom:entry` → `entry`）。
-fn local_name(qname: &[u8]) -> &str {
+pub(crate) fn xml_local_name_of(qname: &[u8]) -> &str {
     let start = qname
         .iter()
         .position(|&b| b == b':')
@@ -158,7 +158,7 @@ fn local_name(qname: &[u8]) -> &str {
 }
 
 /// XML 文本/属性值解码（UTF-8 宽松 + 实体反转义）。
-fn xml_decode(raw: &[u8]) -> String {
+pub(crate) fn xml_decode_of(raw: &[u8]) -> String {
     let lossy = String::from_utf8_lossy(raw).into_owned();
     quick_xml::escape::unescape(&lossy)
         .map(|c| c.into_owned())
@@ -201,8 +201,8 @@ pub fn parse_feed(xml: &str) -> Result<Vec<DumpEntry>, RfcError> {
         for a in e.attributes().flatten() {
             if !a.key.as_ref().starts_with(b"xmlns") {
                 out.push((
-                    local_name(a.key.as_ref()).to_string(),
-                    xml_decode(a.value.as_ref()),
+                    xml_local_name_of(a.key.as_ref()).to_string(),
+                    xml_decode_of(a.value.as_ref()),
                 ));
             }
         }
@@ -212,7 +212,7 @@ pub fn parse_feed(xml: &str) -> Result<Vec<DumpEntry>, RfcError> {
     loop {
         match reader.read_event() {
             Ok(Event::Start(e)) => {
-                let name = local_name(e.name().as_ref()).to_string();
+                let name = xml_local_name_of(e.name().as_ref()).to_string();
                 if !saw_feed && name == "feed" {
                     saw_feed = true;
                     continue;
@@ -246,7 +246,7 @@ pub fn parse_feed(xml: &str) -> Result<Vec<DumpEntry>, RfcError> {
                 }
             }
             Ok(Event::Empty(e)) => {
-                let name = local_name(e.name().as_ref()).to_string();
+                let name = xml_local_name_of(e.name().as_ref()).to_string();
                 if !in_entry {
                     continue;
                 }
@@ -270,11 +270,11 @@ pub fn parse_feed(xml: &str) -> Result<Vec<DumpEntry>, RfcError> {
             }
             Ok(Event::Text(t)) => {
                 if !capturing.is_empty() {
-                    text.push_str(&xml_decode(t.as_ref()));
+                    text.push_str(&xml_decode_of(t.as_ref()));
                 }
             }
             Ok(Event::End(e)) => {
-                let name = local_name(e.name().as_ref()).to_string();
+                let name = xml_local_name_of(e.name().as_ref()).to_string();
                 if !in_entry {
                     continue;
                 }

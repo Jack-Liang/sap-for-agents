@@ -42,6 +42,9 @@ curl -H "Authorization: Bearer <SAP_API_KEY>" http://127.0.0.1:3000/api/function
 | 想知道**什么在反复失败**（按错误类型 + 终止程序聚合） | `GET /api/dumps/grouped` |
 | 想看某个转储的调用栈/出错行/组件（免拉 45KB–1MB 的 ST22 正文） | `GET /api/dumps/{key}/detail` |
 | 想要原始的完整 ST22 正文（发生了什么/错误分析） | `GET /api/adt/runtime/dump/{key}/formatted` |
+| 想**修改** ABAP 代码（函数/类/程序） | `PUT /api/objects/{type}/{name}/source` |
+| AI 式编辑（唯一匹配查找替换 + 自动激活） | `POST /api/objects/{type}/{name}/replace` |
+| 语法检查（**不写库**，源码内嵌提交） | `POST /api/objects/{type}/{name}/syntax` |
 | 想读/写 ABAP 类源码等 ADT（Eclipse 工具链）资源 | `ANY /api/adt/{path}` |
 | **实际调用一个 SAP 函数** | `POST /api/rfc` |
 
@@ -203,6 +206,37 @@ curl http://127.0.0.1:3000/api/dumps/20260824012009%20a4h/detail
 
 `GET /api/functions/{name}/source?prologue=true`（同一「省往返」思路）：返回源码 + 依赖签名前言——扫描源码里的 `CALL FUNCTION 'X'`，逐个解析成紧凑签名块（`prologue.text`，ABAP 注释风格），一次调用同时拿到「代码 + 它调用的东西的契约」。读取失败的依赖保留 `FUNCTION X -- 接口读取失败` 占位行，缺口可见而非静默丢弃。
 
+### 9. 代码修改（写入编排）
+
+修改函数 / 类 / 程序。网关在一次 HTTP 请求内跑完 ADT 写序列：**建立 stateful 会话 → LOCK → PUT 源码 → UNLOCK → 激活**；lockHandle 绝不跨请求（ADT 锁绑定 ABAP 会话，跨请求的柄必然失效）。
+
+`{type}` 取 `prog`（程序/报表）、`class`、`func`（函数模块，组名自动经 RFC 搜索反解，也可显式传 `"group"`）。
+
+```bash
+# AI 式编辑（推荐）：唯一匹配查找替换 + 激活
+curl -X POST http://127.0.0.1:3000/api/objects/prog/ZMY_REPORT/replace \
+  -H "Content-Type: application/json" \
+  -d '{"old_string":"WRITE '\''old'\''.","new_string":"WRITE '\''new'\''."}'
+
+# 全量写源码
+curl -X PUT http://127.0.0.1:3000/api/objects/class/ZCL_FOO/source \
+  -H "Content-Type: application/json" \
+  -d '{"source":"CLASS zcl_foo DEFINITION ... ENDCLASS."}'
+
+# 语法检查（不写库：源码内嵌提交）
+curl -X POST http://127.0.0.1:3000/api/objects/prog/ZMY_REPORT/syntax \
+  -H "Content-Type: application/json" \
+  -d '{"source":"REPORT zmy_report.\nWRITE 1."}'
+```
+
+- `replace` 请求体：`old_string` / `new_string`（可选 `transport`、`activate`（默认 true）、`group`）。`old_string` 必须精确匹配**唯一一处**（0 处 → 先读当前源码；多处 → 带更多上下文行；`\r\n`/`\n` 差异自动归一化）。空 `old_string` 仅对空对象有效。
+- `PUT /source` 请求体：`source`（全量源码）+ 同上可选字段。
+- `syntax` 请求体：`source`。返回 `issues[]`：`severity`（E/W/…）、`line`、`offset`、`text`。
+- 响应里的 `activated.success` 是**逻辑结果**：激活失败时 HTTP 仍为 200，带 `activated.messages[]` / `problems[]`（"Line N: 文本"）——读它、改源码、重试。传输层错误（网络/会话）才走 4xx/5xx。
+- 锁冲突（他人正在编辑）→ 409 `OBJECT_LOCKED`，消息来自 SAP 原文。
+- **函数模块**：FM 源码的参数块（`FUNCTION 名.` 到 `EXCEPTIONS … .`）由参数元数据再生成——锚定在此区域的编辑会被**静默丢弃**，请把 `old_string` 锚定在函数**体**内；参数增删需元数据接口（尚未提供）。
+- 写入要求对象已存在（对象创建尚未提供）且 ADT 已启用；写入失败也会尽力 UNLOCK，不留孤儿锁。
+
 ## 关键约束（避坑）
 
 1. **参数名必须大写**：SAP 参数名区分大小写，JSON 里永远用大写（如 `USERNAME` 不是 `username`）。
@@ -216,6 +250,8 @@ curl http://127.0.0.1:3000/api/dumps/20260824012009%20a4h/detail
 9. **调用有超时**：单次 SAP 调用默认 60s 超时（`SAP_REQUEST_TIMEOUT_SECS` 可配），超时返回 `504`。`/api/rfc` 可在请求体传 `timeout_secs` per-request 覆盖（慢接口如批量 BAPI、大表查询可放宽）。
 10. **限流**：设了 `SAP_RATE_LIMIT_RPS` 时，`/api` 按调用方 IP 限速；超限返回 `429`（`key=RATE_LIMITED`）。默认不限流。
 11. **源码端点自动降级 ADT**：`/api/functions/{name}/source` 与 `/api/programs/{name}/source` 先走 RFC（`RPY_FUNCTIONMODULE_READ` / `RPY_PROGRAM_READ`），失败（NOT_FOUND 除外）自动改走 ADT 重读，响应的 `source_via` 字段标明来源（`rfc` / `adt`）。背景：源码行宽超 72 字符（现代 ABAP 常见）在部分系统上会让 RPY 路径直接报错。
+12. **激活失败不是 HTTP 错误**：写入端点在 SAP 拒绝激活时返回 200 + `activated.success=false` + `problems[]`——必须检查响应体里的 `activated` 字段。
+13. **函数模块的参数块归元数据管**：FM 源码里 `FUNCTION 头 … EXCEPTIONS x.` 这段是从参数元数据再生成的，锚定在这里的编辑会被 SAP 静默丢弃——编辑请锚定函数体；参数增删要走元数据接口（尚未提供）。
 
 ## 典型任务示例
 

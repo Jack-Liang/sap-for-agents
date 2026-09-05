@@ -319,6 +319,204 @@ pub(crate) async fn read_program_source(name: &str) -> Result<Vec<String>, RfcEr
     adt_get_text_lines(&rel).await
 }
 
+/// 内部通道响应（状态 + ETag + body + 响应 Cookie）。etag 为后续乐观锁预留。
+pub(crate) struct AdtRawResponse {
+    pub status: u16,
+    #[allow(dead_code)]
+    pub etag: Option<String>,
+    pub body: Bytes,
+    /// 响应 `set-cookie` 的 (name, value) 对——有状态编排（锁→写→解锁）
+    /// 靠回传 `sap-contextid` 等维持同一 ABAP 会话
+    pub cookies: Vec<(String, String)>,
+}
+
+/// 为有状态编排**建立专用 stateful 会话**并取 CSRF token。
+///
+/// 这是 ADT 写入序列的根：锁必须签发在一个 stateful 会话里（无状态请求的
+/// 服务端会话随响应即回收，签出的 lockHandle 生来无效 → PUT 报 423
+/// InvalidLockHandle）；且 token 必须与持有锁的会话同源（共享缓存的无状态
+/// token 配 stateful 会话会被 ICF 以「Service cannot be reached」拒绝）。
+/// 因此编排入口先做一次 `GET + Fetch + stateful`，token 与 `sap-contextid`
+/// 一并落进编排会话，全程专用、结束即弃。
+pub(crate) async fn establish_stateful(
+    rel_path: &str,
+) -> Result<(String, Vec<(String, String)>), RfcError> {
+    let cfg = ADT.get().ok_or_else(|| RfcError {
+        code: -1,
+        status: 503,
+        message: "ADT 代理未启用（设置 SAP_ADT_BASE_URL 后重启）".into(),
+        key: "ADT_DISABLED".into(),
+    })?;
+    let rel_path = validate_raw_path(rel_path)?;
+    let url = format!("{}/sap/bc/adt/{}", cfg.base_url, rel_path);
+    let resp = cfg
+        .client
+        .get(&url)
+        .header("Authorization", &cfg.basic)
+        .header("Accept", "*/*")
+        .header("X-CSRF-Token", "Fetch")
+        .header("X-sap-adt-sessiontype", "stateful")
+        .send()
+        .await
+        .map_err(|e| {
+            metrics::counter!("adt_calls_total", "method" => "GET", "result" => "err").increment(1);
+            adt_unreachable(e)
+        })?;
+    let token = resp
+        .headers()
+        .get("x-csrf-token")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    let cookies = resp
+        .headers()
+        .get_all("set-cookie")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .filter_map(|c| {
+            let pair = c.split(';').next()?.trim();
+            let (name, value) = pair.split_once('=')?;
+            Some((name.trim().to_string(), value.trim().to_string()))
+        })
+        .collect();
+    metrics::counter!("adt_calls_total", "method" => "GET", "result" => "ok").increment(1);
+    match token {
+        Some(t) if !t.is_empty() && t != "Fetch" => Ok((t, cookies)),
+        _ => Err(RfcError {
+            code: -1,
+            status: 502,
+            message: "建立 stateful 会话失败（响应缺少 X-CSRF-Token）".into(),
+            key: "ADT_CSRF_FAILED".into(),
+        }),
+    }
+}
+
+/// 内部**写**通道：供网关自身的编排端点（`/api/objects/**`）发任意方法的
+/// ADT 请求。写方法自动携带 CSRF token + 会话 Cookie（与代理共用缓存），
+/// 遇 403（token 过期）自动刷新重试一次。
+///
+/// ADT 的编辑锁存在 ABAP 会话（roll area）里，靠 `sap-contextid` cookie 关联——
+/// 所以有状态编排必须：每一步都带 `X-sap-adt-sessiontype: stateful` 头（经
+/// `extra_headers`），并把上一步响应的 set-cookie（`cookie_override`）回传，
+/// 否则 PUT 会得到 423 `InvalidLockHandle`（abap-adt-api / vsp 同样的教训）。
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn adt_request_raw(
+    method: Method,
+    rel_path: &str,
+    query: &[(&str, &str)],
+    body: Option<&[u8]>,
+    content_type: Option<&str>,
+    accept: &str,
+    extra_headers: &[(&str, &str)],
+    cookie_override: Option<&str>,
+    // 有状态编排专用 token（establish_stateful 签发）。给出时不再用共享
+    // 缓存、也不做 403 刷新重试——业务 403（如锁冲突）必须原样上抛。
+    csrf_token_override: Option<&str>,
+) -> Result<AdtRawResponse, RfcError> {
+    let cfg = ADT.get().ok_or_else(|| RfcError {
+        code: -1,
+        status: 503,
+        message: "ADT 代理未启用（设置 SAP_ADT_BASE_URL 后重启）".into(),
+        key: "ADT_DISABLED".into(),
+    })?;
+    let rel_path = validate_raw_path(rel_path)?;
+    let mut url = format!("{}/sap/bc/adt/{}", cfg.base_url, rel_path);
+    let mut sep = if url.contains('?') { '&' } else { '?' };
+    for (k, v) in query {
+        url.push(sep);
+        url.push_str(k);
+        url.push('=');
+        url.push_str(&encode_path_segment(v));
+        sep = '&';
+    }
+
+    let send = |csrf: Option<(String, Option<String>)>| {
+        let mut req = cfg
+            .client
+            .request(method.clone(), &url)
+            .header("Authorization", &cfg.basic)
+            .header("Accept", accept);
+        if let Some(ct) = content_type {
+            req = req.header("Content-Type", ct);
+        }
+        if let Some(b) = body {
+            req = req.body(b.to_vec());
+        }
+        for (k, v) in extra_headers {
+            req = req.header(*k, *v);
+        }
+        if let Some((token, cookie)) = csrf {
+            req = req.header("X-CSRF-Token", token);
+            // 编排会话的 Cookie 优先（含 sap-contextid），否则用共享缓存会话
+            let cookie = cookie_override
+                .map(str::to_string)
+                .or_else(|| cookie.clone());
+            if let Some(c) = cookie {
+                req = req.header("Cookie", c);
+            }
+        }
+        req
+    };
+
+    let write = is_write_method(&method);
+    // 编排专用 token 优先；否则写方法走共享缓存
+    let mut csrf = if let Some(t) = csrf_token_override {
+        Some((t.to_string(), cookie_override.map(str::to_string)))
+    } else if write {
+        csrf_token(&url, false).await?
+    } else {
+        None
+    };
+    let mut resp = send(csrf.clone()).send().await.map_err(|e| {
+        metrics::counter!("adt_calls_total", "method" => method.as_str().to_owned(), "result" => "err").increment(1);
+        adt_unreachable(e)
+    })?;
+
+    // 403 通常是 token 过期：刷新后重试一次（仅共享缓存的写方法；
+    // 编排专用 token 下 403 是业务错误——锁冲突等——必须原样上抛）
+    if resp.status() == StatusCode::FORBIDDEN
+        && write
+        && csrf_token_override.is_none()
+    {
+        tracing::debug!("ADT 内部写请求 403，刷新 CSRF token 后重试");
+        if let Ok(Some(new)) = csrf_token(&url, true).await {
+            csrf = Some(new);
+            resp = send(csrf.clone()).send().await.map_err(|e| {
+                metrics::counter!("adt_calls_total", "method" => method.as_str().to_owned(), "result" => "err").increment(1);
+                adt_unreachable(e)
+            })?;
+        }
+    }
+
+    let status = resp.status().as_u16();
+    let etag = resp
+        .headers()
+        .get("etag")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    let cookies = resp
+        .headers()
+        .get_all("set-cookie")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .filter_map(|c| {
+            let pair = c.split(';').next()?.trim();
+            let (name, value) = pair.split_once('=')?;
+            Some((name.trim().to_string(), value.trim().to_string()))
+        })
+        .collect();
+    let body = resp.bytes().await.map_err(|e| {
+        metrics::counter!("adt_calls_total", "method" => method.as_str().to_owned(), "result" => "err").increment(1);
+        adt_unreachable(e)
+    })?;
+    metrics::counter!("adt_calls_total", "method" => method.as_str().to_owned(), "result" => "ok").increment(1);
+    Ok(AdtRawResponse {
+        status,
+        etag,
+        body,
+        cookies,
+    })
+}
+
 /// `ANY /api/adt/{*path}` —— ADT REST 通用代理。
 ///
 /// 透传规则：

@@ -312,7 +312,7 @@ curl -H "Authorization: Bearer $SAP_API_KEY" \
 
 ### 3.3 面向 AI 的元数据 API
 
-11 个端点让 AI/Agent 自服务地发现函数、理解参数、查数据字典、读文档、看源码、读表数据、排查短转储。典型工作流：**搜索 → 查接口 → 查文档 → 看源码 → 调用**。给 AI 的完整操作指南见 [`AGENTS.md`](./AGENTS.md)。
+14 个端点让 AI/Agent 自服务地发现函数、理解参数、查数据字典、读文档、看源码、读表数据、排查短转储、**修改代码**。典型工作流：**搜索 → 查接口 → 查文档 → 看源码 → 调用**。给 AI 的完整操作指南见 [`AGENTS.md`](./AGENTS.md)。
 
 | 端点 | 用途 | 示例 |
 |------|------|------|
@@ -584,6 +584,7 @@ src/
 ├── server_rfc.rs     server 模式：注册到 Gateway + dispatch 回调 + webhook 转发
 ├── adt.rs            ADT REST 代理 /api/adt/**：透传到 /sap/bc/adt/**，Basic 认证 + CSRF token/会话管理（写方法遇 403 自动重试）
 ├── dumps.rs          ST22 结构化分析 /api/dumps**：Atom feed 解析、（错误类型×程序）聚合、/formatted 文本 → 头表/终止点/调用栈
+├── objects.rs        ABAP 对象写入编排 /api/objects**：专用 stateful ADT 会话、锁→写→解锁→激活、激活/语法检查结果解析、查找替换编辑
 ├── api.rs            请求/响应 DTO（serde）+ execute_invoke 执行核心 + 输入校验
 ├── executor.rs       execute_collect：注入元数据解析后委托 execute_invoke
 ├── connection.rs     RfcConnection：建连/关闭/取函数/拉参数元数据（unsafe impl Send）
@@ -628,6 +629,7 @@ src/
 | 命名空间函数 `/NS/NAME` | ✅ 已实现（校验放行 + 通配路由分发，v0.4.10 起） |
 | ADT REST 代理 | ✅ 已实现（`/api/adt/**` 透传 + 写方法 CSRF 自动处理，v0.4.11 起） |
 | ST22 结构化分析 | ✅ 已实现（`/api/dumps` 列表/聚合/详情，解析自 ADT——免去几十万字节原始文本，v0.5.0 起） |
+| ABAP 代码修改 | ✅ 已实现（prog/class/func 的 `PUT source` / `POST replace` / `POST syntax`——专用 stateful 会话内完整锁→写→激活编排，v0.6.0 起） |
 | 源码依赖前言 | ✅ 已实现（`/api/functions/:name/source?prologue=true` 内联 `CALL FUNCTION` 目标紧凑签名，v0.5.0 起） |
 | 按 IP 限流 | ✅ 已实现（可选 `SAP_RATE_LIMIT_RPS`，governor 键控限流器，超限 429） |
 | 单次 RFC 执行超时 | ✅ 已实现（`run_blocking_with_timeout` 用 `tokio::time::timeout` 包 `spawn_blocking`；默认 60s / `SAP_REQUEST_TIMEOUT_SECS`，单请求 `timeout_secs`，超时 504） |

@@ -42,6 +42,9 @@ curl -H "Authorization: Bearer <SAP_API_KEY>" http://127.0.0.1:3000/api/function
 | Want to know **what keeps failing** (dumps grouped by error type + program) | `GET /api/dumps/grouped` |
 | Want one dump's call stack / failing line / component (without the 45KB–1MB ST22 text) | `GET /api/dumps/{key}/detail` |
 | Want the raw full ST22 text (What happened/Error analysis) | `GET /api/adt/runtime/dump/{key}/formatted` |
+| Want to **modify** ABAP code (function / class / program) | `PUT /api/objects/{type}/{name}/source` |
+| Want AI-style editing (unique find-and-replace, verified) | `POST /api/objects/{type}/{name}/replace` |
+| Want to syntax-check source **without** writing it | `POST /api/objects/{type}/{name}/syntax` |
 | Want to read/write ABAP class sources and other ADT (Eclipse tooling) resources | `ANY /api/adt/{path}` |
 | **Actually invoke an SAP function** | `POST /api/rfc` |
 
@@ -203,6 +206,37 @@ curl http://127.0.0.1:3000/api/dumps/20260824012009%20a4h/detail
 
 `GET /api/functions/{name}/source?prologue=true` (also under this "save round trips" theme) returns the source plus a dependency prologue: every `CALL FUNCTION 'X'` target resolved to a compact signature block (`prologue.text`, ABAP-comment style), so one call gives you the code *and* the contracts of what it calls. Failures stay visible as `FUNCTION X -- 接口读取失败` lines rather than being dropped.
 
+### 9. Code modification (write orchestration)
+
+Edit functions / classes / programs. The gateway runs the full ADT write sequence — **establish stateful session → LOCK → PUT source → UNLOCK → activate** — inside one HTTP request; the lock handle never crosses requests (ADT locks are bound to the ABAP session, so a cross-request handle is dead on arrival).
+
+`{type}` is `prog` (program/report), `class`, or `func` (function module; the group is resolved automatically via RFC search, or pass `"group"` explicitly).
+
+```bash
+# AI-style editing (recommended): unique find-and-replace + activate
+curl -X POST http://127.0.0.1:3000/api/objects/prog/ZMY_REPORT/replace \
+  -H "Content-Type: application/json" \
+  -d '{"old_string":"WRITE 'old'.","new_string":"WRITE 'new'."}'
+
+# Full-source write
+curl -X PUT http://127.0.0.1:3000/api/objects/class/ZCL_FOO/source \
+  -H "Content-Type: application/json" \
+  -d '{"source":"CLASS zcl_foo DEFINITION ... ENDCLASS."}'
+
+# Syntax check WITHOUT writing (source is sent inline, nothing is stored)
+curl -X POST http://127.0.0.1:3000/api/objects/prog/ZMY_REPORT/syntax \
+  -H "Content-Type: application/json" \
+  -d '{"source":"REPORT zmy_report.\nWRITE 1."}'
+```
+
+- `replace` body: `old_string` / `new_string` (+ optional `transport`, `activate` (default true), `group`). `old_string` must match **exactly one** place (0 → read the current source first; >1 → include more context lines; `\r\n`/`\n` differences are normalized automatically). Empty `old_string` only works on an empty object.
+- `PUT /source` body: `source` (full text), plus the same optional fields.
+- `syntax` body: `source`. Returns `issues[]` with `severity` (E/W/…), `line`, `offset`, `text`.
+- Response `activated.success` is the **logical** result: an activation failure is HTTP 200 with `activated.messages[]` / `problems[]` ("Line N: text") — read them, fix the source, retry. Transport errors (network, session) are 4xx/5xx as usual.
+- Lock conflict (someone else editing) → 409 `OBJECT_LOCKED` with SAP's own message.
+- **Function modules**: in the FM source the parameter block (`FUNCTION name.` down to `EXCEPTIONS ... .`) is **regenerated from parameter metadata** — edits anchored there are silently dropped. Anchor `old_string` in the function **body**. Parameter changes need the metadata API (not built yet).
+- Writes need the object to exist (creation is not built yet) and ADT enabled; a failed write still attempts UNLOCK so no orphan lock is left behind.
+
 ## Key constraints (pitfalls to avoid)
 
 1. **Parameter names must be uppercase**: SAP parameter names are case-sensitive; in JSON always use uppercase (e.g. `USERNAME`, not `username`).
@@ -216,6 +250,8 @@ curl http://127.0.0.1:3000/api/dumps/20260824012009%20a4h/detail
 9. **Calls have timeouts**: a single SAP call times out after 60s by default (configurable via `SAP_REQUEST_TIMEOUT_SECS`); timeout returns `504`. `/api/rfc` accepts a per-request `timeout_secs` in the body to override it (relax it for slow endpoints like batch BAPIs or large table queries).
 10. **Rate limiting**: when `SAP_RATE_LIMIT_RPS` is set, `/api` is rate-limited per caller IP; exceeding the limit returns `429` (`key=RATE_LIMITED`). No rate limit by default.
 11. **Source endpoints fall back to ADT automatically**: `/api/functions/{name}/source` and `/api/programs/{name}/source` try the RFC path (`RPY_FUNCTIONMODULE_READ` / `RPY_PROGRAM_READ`) first; on failure (except NOT_FOUND) they re-read via ADT. The response's `source_via` field says which channel served it (`rfc` / `adt`). This matters because sources with lines wider than 72 chars (common in modern ABAP) fail the RPY path on some systems.
+12. **Activation failure is not an HTTP error**: write endpoints return 200 with `activated.success=false` + `problems[]` when SAP refuses to activate — always check `activated` in the response body.
+13. **FM parameter block is metadata-owned**: edits to the `FUNCTION ... EXCEPTIONS x.` header region of a function module's source are silently dropped by SAP; anchor edits in the function body.
 
 ## Typical task example
 

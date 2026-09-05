@@ -133,6 +133,7 @@ tailwind.config = {
     .method-get { background: rgba(6, 182, 212, 0.1); color: #06b6d4; border: 1px solid #06b6d4; }
     .method-post { background: rgba(129, 39, 207, 0.1); color: #8127cf; border: 1px solid #8127cf; }
     .method-any { background: rgba(217, 119, 6, 0.1); color: #d97706; border: 1px solid #d97706; }
+    .method-put { background: rgba(22, 163, 74, 0.1); color: #16a34a; border: 1px solid #16a34a; }
     .material-symbols-outlined { font-family: 'Material Symbols Outlined'; font-weight: normal; font-style: normal; line-height: 1; letter-spacing: normal; text-transform: none; display: inline-block; white-space: nowrap; word-wrap: normal; direction: ltr; -webkit-font-feature-settings: 'liga'; -webkit-font-smoothing: antialiased; }
 </style>
 </head>
@@ -172,7 +173,7 @@ tailwind.config = {
         <h1 class="font-display-lg text-display-lg text-on-surface mb-sm">sap-for-agents</h1>
         <p class="font-headline-md text-headline-md text-primary mb-md">SAP NWRFC → REST Gateway</p>
         <p class="font-body-lg text-body-lg text-on-surface-variant max-w-2xl">
-            One endpoint invokes any BAPI; 11 metadata endpoints (incl. ST22 dump analysis) let AI explore autonomously
+            One endpoint invokes any BAPI; 14 metadata endpoints (incl. ST22 dumps & code editing) let AI explore autonomously
         </p>
     </section>
 
@@ -287,6 +288,16 @@ tailwind.config = {
                     <span class="font-code-sm text-code-sm px-sm py-xs rounded method-get w-16 text-center">GET</span>
                     <code class="font-code-sm text-code-sm text-on-surface flex-grow">/api/dumps/{key}/detail</code>
                     <span class="font-body-sm text-body-sm text-on-surface-variant whitespace-nowrap">Dump stack / failing line</span>
+                </li>
+                            <li class="flex items-center gap-md py-sm border-b border-outline-variant/30 last:border-0">
+                    <span class="font-code-sm text-code-sm px-sm py-xs rounded method-put w-16 text-center">PUT</span>
+                    <code class="font-code-sm text-code-sm text-on-surface flex-grow">/api/objects/{type}/{name}/source</code>
+                    <span class="font-body-sm text-body-sm text-on-surface-variant whitespace-nowrap">Write source (lock→activate)</span>
+                </li>
+                <li class="flex items-center gap-md py-sm border-b border-outline-variant/30 last:border-0">
+                    <span class="font-code-sm text-code-sm px-sm py-xs rounded method-post w-16 text-center">POST</span>
+                    <code class="font-code-sm text-code-sm text-on-surface flex-grow">/api/objects/{type}/{name}/replace</code>
+                    <span class="font-body-sm text-body-sm text-on-surface-variant whitespace-nowrap">AI-style find-and-replace</span>
                 </li>
             </ul>
         </div>

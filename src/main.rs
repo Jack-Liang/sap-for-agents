@@ -10,6 +10,7 @@ mod executor;
 mod ffi;
 mod function;
 mod metadata;
+mod objects;
 mod pool;
 mod server;
 mod server_config;

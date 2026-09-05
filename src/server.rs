@@ -155,6 +155,11 @@ pub fn app(pool: SharedPool) -> Router {
         .route("/api/dumps", axum::routing::get(dumps_list_handler))
         .route("/api/dumps/grouped", axum::routing::get(dumps_grouped_handler))
         .route("/api/dumps/*key", axum::routing::get(dump_detail_handler))
+        // ABAP 对象写入编排（锁→写→解锁→激活一体；replace/syntax 见 dispatcher）
+        .route(
+            "/api/objects/*path",
+            axum::routing::put(object_write_handler).post(object_post_handler),
+        )
         // ADT REST 通用代理（dump 正文、类/程序源码等，任何方法透传）
         .route("/api/adt/*path", axum::routing::any(crate::adt::adt_proxy))
         .layer(axum::middleware::from_fn(crate::auth::require_api_key))
@@ -1001,6 +1006,246 @@ async fn dump_detail_handler(
     let key = key.strip_suffix("/detail").unwrap_or(&key);
     let detail = crate::dumps::fetch_detail(key).await?;
     Ok(Json(detail))
+}
+
+// ========================================================================
+// ABAP 对象写入（/api/objects/**，端点 ⑫~⑭）
+// ========================================================================
+
+/// 解析 `/api/objects/{type}/{name...}/{action}` 通配路径。
+/// name 可含 `/`（命名空间对象，如 `/UI5/CL_X`）；action 取最后一段。
+fn split_object_path(
+    path: &str,
+) -> Result<(crate::objects::ObjectType, String, &'static str), RfcError> {
+    let bad = |msg: &str| RfcError {
+        code: -1,
+        status: 400,
+        message: format!("对象路径非法（{}）: {}", msg, path),
+        key: "OBJECT_PATH_INVALID".into(),
+    };
+    let (type_seg, rest) = path.split_once('/').ok_or_else(|| bad("缺少类型段"))?;
+    let obj_type = crate::objects::ObjectType::parse(type_seg)
+        .ok_or_else(|| bad("类型须为 prog/class/func"))?;
+    let (name, action) = rest.rsplit_once('/').ok_or_else(|| bad("缺少动作段"))?;
+    let action = match action {
+        "source" => "source",
+        "replace" => "replace",
+        "syntax" => "syntax",
+        _ => return Err(bad("动作须为 source/replace/syntax")),
+    };
+    if name.is_empty() || name.len() > 60 || name.split('/').any(|s| s.is_empty() && s != name) {
+        // 允许整体以 / 开头（命名空间），但不允许内部空段（/UI5//X）
+        let has_empty_inner = name
+            .strip_prefix('/')
+            .map(|r| r.split('/').any(|s| s.is_empty()))
+            .unwrap_or_else(|| name.split('/').any(|s| s.is_empty()));
+        if name.is_empty() || name.len() > 60 || has_empty_inner {
+            return Err(bad("对象名为空/超长/含空段"));
+        }
+    }
+    if name.chars().any(|c| c.is_control()) || name.contains("..") {
+        return Err(bad("对象名含控制字符或 .."));
+    }
+    Ok((obj_type, name.to_string(), action))
+}
+
+/// 对象名宽松校验（类/程序名长于 FM 名上限，不走 validate_func_name）。
+fn validate_object_name(name: &str) -> Result<(), RfcError> {
+    if name.is_empty() || name.len() > 60 {
+        return Err(RfcError {
+            code: -1,
+            status: 400,
+            message: format!("对象名为空或超过 60 字符: {}", name),
+            key: "OBJECT_NAME_INVALID".into(),
+        });
+    }
+    Ok(())
+}
+
+/// 函数对象的组名解析：显式给出优先，否则经 RFC_FUNCTION_SEARCH 反解。
+async fn resolve_group_if_needed(
+    pool: &SharedPool,
+    obj_type: crate::objects::ObjectType,
+    name: &str,
+    group_hint: Option<String>,
+) -> Result<String, RfcError> {
+    use crate::objects::ObjectType;
+    if obj_type != ObjectType::Function {
+        return Ok(String::new());
+    }
+    if let Some(g) = group_hint.filter(|g| !g.trim().is_empty()) {
+        return Ok(g.trim().to_uppercase());
+    }
+    let lookup = name.to_string();
+    run_blocking(Arc::clone(pool), move |conn| {
+        crate::discovery::resolve_function_group(conn, &lookup)
+    })
+    .await
+}
+
+/// PUT /api/objects/{type}/{name}/source 的请求体。
+#[derive(serde::Deserialize)]
+struct ObjectWriteBody {
+    /// 全量源码（必填）
+    source: String,
+    /// 传输请求号（可选；未给时复用对象已绑定的请求）
+    #[serde(default)]
+    transport: Option<String>,
+    /// 写后是否激活（默认 true）
+    #[serde(default = "default_true")]
+    activate: bool,
+    /// 函数对象的组名（可选，缺省自动反解）
+    #[serde(default)]
+    group: Option<String>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// ⑫ `PUT /api/objects/{type}/{name}/source` —— 全量写源码。
+/// 网关内编排「锁 → PUT → 解锁 → 激活」，lockHandle 不出请求；
+/// 激活失败是逻辑结果（HTTP 200 + activation.messages），不是传输错误。
+async fn object_write_handler(
+    axum::extract::State(pool): axum::extract::State<SharedPool>,
+    axum::extract::Path(path): axum::extract::Path<String>,
+    req: Result<Json<ObjectWriteBody>, axum::extract::rejection::JsonRejection>,
+) -> Result<Json<serde_json::Value>, RfcError> {
+    let (obj_type, name, action) = split_object_path(&path)?;
+    if action != "source" {
+        return Err(RfcError {
+            code: -1,
+            status: 400,
+            message: format!("PUT 仅支持 /source；/{} 请用 POST", action),
+            key: "METHOD_ACTION_MISMATCH".into(),
+        });
+    }
+    validate_object_name(&name)?;
+    let Json(body) = req.map_err(|r| RfcError {
+        code: -1,
+        status: r.status().as_u16(),
+        message: r.body_text(),
+        key: "JSON_INVALID".into(),
+    })?;
+    if body.source.trim().is_empty() {
+        return Err(RfcError {
+            code: -1,
+            status: 400,
+            message: "source 不能为空".into(),
+            key: "SOURCE_EMPTY".into(),
+        });
+    }
+    let group = resolve_group_if_needed(&pool, obj_type, &name, body.group.clone()).await?;
+    let outcome = crate::objects::write_object_source(
+        obj_type,
+        &name,
+        &group,
+        &body.source,
+        body.transport.as_deref(),
+        body.activate,
+    )
+    .await?;
+    Ok(Json(serde_json::to_value(outcome).unwrap_or_default()))
+}
+
+/// POST /api/objects/{type}/{name}/replace 与 /syntax 的分发。
+async fn object_post_handler(
+    axum::extract::State(pool): axum::extract::State<SharedPool>,
+    axum::extract::Path(path): axum::extract::Path<String>,
+    req: Result<Json<serde_json::Value>, axum::extract::rejection::JsonRejection>,
+) -> Result<Json<serde_json::Value>, RfcError> {
+    let (obj_type, name, action) = split_object_path(&path)?;
+    validate_object_name(&name)?;
+    let Json(raw) = req.map_err(|r| RfcError {
+        code: -1,
+        status: r.status().as_u16(),
+        message: r.body_text(),
+        key: "JSON_INVALID".into(),
+    })?;
+    let group_hint = raw
+        .get("group")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let group = resolve_group_if_needed(&pool, obj_type, &name, group_hint).await?;
+
+    match action {
+        // ⑬ AI 编辑形态：唯一匹配查找替换后走写入编排
+        "replace" => {
+            let body: ObjectReplaceBody = serde_json::from_value(raw).map_err(|e| RfcError {
+                code: -1,
+                status: 400,
+                message: format!("请求体字段非法（old_string/new_string 必填）: {}", e),
+                key: "JSON_INVALID".into(),
+            })?;
+            let current = crate::objects::read_current_source(obj_type, &name, &group).await?;
+            let updated =
+                crate::objects::find_and_replace(&current, &body.old_string, &body.new_string)
+                    .map_err(|m| RfcError {
+                        code: -1,
+                        status: 400,
+                        message: m,
+                        key: "REPLACE_FAILED".into(),
+                    })?;
+            if updated == current {
+                return Err(RfcError {
+                    code: -1,
+                    status: 400,
+                    message: "替换后内容与原文相同".into(),
+                    key: "REPLACE_NO_CHANGE".into(),
+                });
+            }
+            let outcome = crate::objects::write_object_source(
+                obj_type,
+                &name,
+                &group,
+                &updated,
+                body.transport.as_deref(),
+                body.activate,
+            )
+            .await?;
+            let mut v = serde_json::to_value(&outcome).unwrap_or_default();
+            v["replaced"] = serde_json::json!(true);
+            Ok(Json(v))
+        }
+        // ⑭ 语法检查（不写库：源码内嵌提交）
+        "syntax" => {
+            let source = raw
+                .get("source")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| RfcError {
+                    code: -1,
+                    status: 400,
+                    message: "source 必填（要检查的源码全文）".into(),
+                    key: "SOURCE_MISSING".into(),
+                })?;
+            let base = obj_type.base_rel(&name, &group);
+            let issues = crate::objects::syntax_check(&base, source).await?;
+            Ok(Json(serde_json::json!({
+                "type": "syntax",
+                "name": name,
+                "count": issues.len(),
+                "issues": issues,
+            })))
+        }
+        _ => Err(RfcError {
+            code: -1,
+            status: 400,
+            message: "POST 仅支持 /replace 与 /syntax；全量写用 PUT /source".into(),
+            key: "METHOD_ACTION_MISMATCH".into(),
+        }),
+    }
+}
+
+/// POST /api/objects/{type}/{name}/replace 的请求体。
+/// （group 若给出，已在反序列化前从原始 JSON 提取，此处不再建模）
+#[derive(serde::Deserialize)]
+struct ObjectReplaceBody {
+    old_string: String,
+    new_string: String,
+    #[serde(default)]
+    transport: Option<String>,
+    #[serde(default = "default_true")]
+    activate: bool,
 }
 
 /// ⑤ GET /api/functions/:name/doc —— 查函数文档（短文本 + SE37 长文本 + 参数说明）

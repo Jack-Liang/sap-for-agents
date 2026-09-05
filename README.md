@@ -312,7 +312,7 @@ Fields you don't read (e.g. you didn't pass `table_outputs`) do **not** appear i
 
 ### 3.3 AI-facing metadata API
 
-11 endpoints let an AI/agent self-service discover functions, understand parameters, query the data dictionary, read docs, view source, read table data, and triage short dumps. Typical workflow: **search → inspect interface → read docs → view source → call**. The full operator guide for AI lives in [`AGENTS.md`](./AGENTS.md).
+14 endpoints let an AI/agent self-service discover functions, understand parameters, query the data dictionary, read docs, view source, read table data, triage short dumps, and **edit code**. Typical workflow: **search → inspect interface → read docs → view source → call**. The full operator guide for AI lives in [`AGENTS.md`](./AGENTS.md).
 
 | Endpoint | Purpose | Example |
 |------|------|------|
@@ -327,6 +327,9 @@ Fields you don't read (e.g. you didn't pass `table_outputs`) do **not** appear i
 | `GET /api/dumps` | Structured short-dump list (parsed from the ADT Atom feed) | `/api/dumps?limit=50` |
 | `GET /api/dumps/grouped` | Dumps grouped by (error type, terminated program) — what keeps failing | `/api/dumps/grouped` |
 | `GET /api/dumps/:key/detail` | One dump's parsed detail: header, termination point, call stack | `/api/dumps/<key>/detail` |
+| `PUT /api/objects/:type/:name/source` | Write full source (lock→put→unlock→activate orchestrated in one request) | `{"source":"REPORT z..."}` |
+| `POST /api/objects/:type/:name/replace` | AI-style unique find-and-replace + activate | `{"old_string":"...","new_string":"..."}` |
+| `POST /api/objects/:type/:name/syntax` | Syntax-check source without writing it | `{"source":"REPORT z..."}` |
 
 End-to-end example (list users):
 ```bash
@@ -342,6 +345,7 @@ curl -X POST http://127.0.0.1:3000/api/rfc -H "Content-Type: application/json" \
 > - `fixed_values` is especially useful for understanding the legal values of status-code / enum fields.
 > - The `/api/dumps*` endpoints need ADT enabled (`SAP_ADT_BASE_URL`); like the ADT proxy they return 503 `ADT_DISABLED` otherwise. Detail parsing matches English labels — on a non-English logon, fields come back empty rather than wrong (fall back to the raw `/api/adt/runtime/dump/{key}/formatted`). The list/grouped endpoints parse only the structured Atom feed and cost zero detail requests.
 > - Source endpoints (`/api/functions/:name/source`, `/api/programs/:name/source`) read via RPY RFCs first and automatically fall back to ADT on failure (except NOT_FOUND); the response's `source_via` field (`rfc`/`adt`) says which channel served it. Sources with lines wider than 72 chars fail the RPY path on some systems — the fallback covers that (since v0.5.1).
+> - Write endpoints (`/api/objects/**`) orchestrate the full ADT sequence (stateful session → lock → put → unlock → activate) inside one request; activation failure is a logical result (HTTP 200 + `activated.problems[]`), not a transport error. For function modules the parameter block in the source is metadata-owned — anchor edits in the function body. Object creation is not built yet (since v0.6.0).
 
 ---
 
@@ -583,6 +587,7 @@ src/
 ├── server_rfc.rs     Server mode: register with the Gateway + dispatch callbacks + webhook forwarding
 ├── adt.rs            ADT REST proxy /api/adt/**: passthrough to /sap/bc/adt/** with Basic auth + CSRF token/session handling (write methods retry once on 403)
 ├── dumps.rs          Structured ST22 analysis /api/dumps**: Atom feed parsing, (error type × program) grouping, /formatted text → header/termination point/call stack
+├── objects.rs        ABAP object write orchestration /api/objects**: dedicated stateful ADT session, lock→put→unlock→activate, activation/syntax result parsing, find-and-replace editing
 ├── api.rs            Request/response DTOs (serde) + execute_invoke execution core + input validation
 ├── executor.rs       execute_collect: injects metadata resolution then delegates to execute_invoke
 ├── connection.rs     RfcConnection: open/close/fetch function/pull parameter metadata (unsafe impl Send)
@@ -627,6 +632,7 @@ src/
 | Namespaced function modules `/NS/NAME` | ✅ Implemented (validation + wildcard route dispatch, since v0.4.10) |
 | ADT REST proxy | ✅ Implemented (`/api/adt/**` passthrough with automatic CSRF handling, since v0.4.11) |
 | Structured ST22 analysis | ✅ Implemented (`/api/dumps` list/grouped/detail parsed from ADT — no more multi-hundred-KB raw texts; since v0.5.0) |
+| ABAP code modification | ✅ Implemented (`PUT source` / `POST replace` / `POST syntax` for prog/class/func — full lock→write→activate orchestration with dedicated stateful session; since v0.6.0) |
 | Source dependency prologue | ✅ Implemented (`/api/functions/:name/source?prologue=true` inlines compact signatures of `CALL FUNCTION` targets; since v0.5.0) |
 | Per-IP rate limiting | ✅ Implemented (optional `SAP_RATE_LIMIT_RPS`, `governor`-keyed limiter, 429 on excess) |
 | Per-RFC execution timeout | ✅ Implemented (`run_blocking_with_timeout` wraps `spawn_blocking` with `tokio::time::timeout`; default 60s / `SAP_REQUEST_TIMEOUT_SECS`, per-request `timeout_secs`, 504 on timeout) |
