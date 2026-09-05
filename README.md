@@ -341,6 +341,7 @@ curl -X POST http://127.0.0.1:3000/api/rfc -H "Content-Type: application/json" \
 > - Long docs (endpoint 3) rely on `DOCU_GET`; on some systems where it isn't enabled, `long_text` is empty, but parameter descriptions still work.
 > - `fixed_values` is especially useful for understanding the legal values of status-code / enum fields.
 > - The `/api/dumps*` endpoints need ADT enabled (`SAP_ADT_BASE_URL`); like the ADT proxy they return 503 `ADT_DISABLED` otherwise. Detail parsing matches English labels — on a non-English logon, fields come back empty rather than wrong (fall back to the raw `/api/adt/runtime/dump/{key}/formatted`). The list/grouped endpoints parse only the structured Atom feed and cost zero detail requests.
+> - Source endpoints (`/api/functions/:name/source`, `/api/programs/:name/source`) read via RPY RFCs first and automatically fall back to ADT on failure (except NOT_FOUND); the response's `source_via` field (`rfc`/`adt`) says which channel served it. Sources with lines wider than 72 chars fail the RPY path on some systems — the fallback covers that (since v0.5.1).
 
 ---
 

@@ -341,6 +341,7 @@ curl -X POST http://127.0.0.1:3000/api/rfc -H "Content-Type: application/json" \
 > - 长文档(端点 3)依赖 `DOCU_GET`，个别系统未启用时 `long_text` 为空，但参数描述仍可用。
 > - `fixed_values` 对理解状态码/枚举字段的合法取值特别有用。
 > - `/api/dumps*` 端点需要启用 ADT（`SAP_ADT_BASE_URL`），否则与 ADT 代理一样返回 503 `ADT_DISABLED`。详情解析按英文标签匹配——非英文 logon 系统上字段返回空而非错值（需要原文走 `/api/adt/runtime/dump/{key}/formatted`）。列表/聚合端点只解析结构化 Atom feed，零详情请求。
+> - 源码端点（`/api/functions/:name/source`、`/api/programs/:name/source`）先走 RPY 系 RFC，失败（NOT_FOUND 除外）自动降级 ADT 重读；响应的 `source_via` 字段（`rfc`/`adt`）标明来源。行宽超 72 字符的源码在部分系统上会让 RPY 路径失败——降级即为此而设（v0.5.1 起）。
 
 ---
 

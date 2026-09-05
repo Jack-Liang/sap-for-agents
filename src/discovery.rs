@@ -300,9 +300,13 @@ fn text_lines_spec() -> Vec<FieldSpec> {
     ]
 }
 
-/// 读函数模块的 ABAP 源代码（内部调 `RPY_FUNCTIONMODULE_READ`，源码在 `SOURCE_EXTENDED` 表）。
-/// 用 SOURCE_EXTENDED（CHAR255）而非 SOURCE（CHAR72）：现代 SAP 代码行宽常超 72，
-/// 走窄表会触发 FL 180「Source wider than 72 char」直接失败。
+/// 读函数模块的 ABAP 源代码（内部调 `RPY_FUNCTIONMODULE_READ`，源码在 `SOURCE` 表）。
+///
+/// 注意：该 FM **只有窄表 SOURCE（CHAR72），没有 SOURCE_EXTENDED**——那是
+/// `RPY_PROGRAM_READ` 的参数（实测接口：向本 FM 传 SOURCE_EXTENDED 会得到
+/// RFC_INVALID_PARAMETER「field not found」）。因此源码行宽超 72 时 SAP 直接
+/// 报 FL 180「Source wider than 72 char」，本函数原样返回错误，由调用方
+/// （server 层）走 ADT 降级通道兜底——宽表方案对这个 FM 不存在。
 /// 返回源码行列表（每行一个字符串）。
 pub fn read_function_source(
     conn: &RfcConnection,
@@ -314,16 +318,13 @@ pub fn read_function_source(
             "FUNCTIONNAME".to_string(),
             ScalarValue::Chars(func_name.to_uppercase()),
         )]),
-        table_outputs: HashMap::from([(
-            "SOURCE_EXTENDED".to_string(),
-            source_line_spec(),
-        )]),
+        table_outputs: HashMap::from([("SOURCE".to_string(), source_line_spec())]),
         ..Default::default()
     };
     let resp = execute_collect(conn, &req)?;
     Ok(resp
         .tables
-        .get("SOURCE_EXTENDED")
+        .get("SOURCE")
         .cloned()
         .unwrap_or_default()
         .into_iter()
@@ -651,9 +652,80 @@ pub fn build_function_prologue(conn: &RfcConnection, deps: &[String]) -> Prologu
     }
 }
 
+// ========================================================================
+// 源码读取的 ADT 降级（RPY 系 RFC 在部分系统上普遍失败，如 FL 180
+// 「Source wider than 72 char」——现代 ABAP 源码行宽超 72 即中招；
+// ADT 通道返回原始行，无此限制）
+// ========================================================================
+
+/// 判定 RPY 源码读取错误是否值得走 ADT 降级。
+/// NOT_FOUND 类不降级——那是「对象不存在」的语义，降级只会得到另一个 404，
+/// 徒增一次往返还可能盖掉更具体的错误信息。
+pub fn should_fallback_to_adt(err: &RfcError) -> bool {
+    !(err.key.contains("NOT_FOUND") || err.status == 404)
+}
+
+/// 反解函数所属的函数组（ADT 的 FM 源码 URL 需要两级名字）。
+/// FM 名在 SAP 全局唯一，但其资源嵌在组下；这里用 `RFC_FUNCTION_SEARCH`
+/// 精确名搜索拿组名（vsp 的镜像做法：它用 ADT 搜索从结果 URI 里反解组名）。
+pub fn resolve_function_group(conn: &RfcConnection, func_name: &str) -> Result<String, RfcError> {
+    let target = func_name.trim().to_uppercase();
+    // 多取几条防模糊命中（如 Z_FOO 与 Z_FOO_X），本地精确匹配
+    let hits = search_functions(conn, &target, "", 10)?;
+    for h in &hits {
+        if h.name == target && !h.group.trim().is_empty() {
+            return Ok(h.group.trim().to_string());
+        }
+    }
+    Err(RfcError {
+        code: -1,
+        status: 404,
+        message: format!("无法反解函数 {} 的所属函数组（ADT 降级读需要组名）", func_name),
+        key: "FUNCTION_GROUP_NOT_FOUND".into(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fallback_decision_preserves_not_found_semantics() {
+        // NOT_FOUND 类（key 或 404 状态）不降级
+        assert!(!should_fallback_to_adt(&RfcError {
+            code: 5,
+            status: 404,
+            key: "FU_NOT_FOUND".into(),
+            message: String::new(),
+        }));
+        assert!(!should_fallback_to_adt(&RfcError {
+            code: 17,
+            status: 404,
+            key: "RFC_NOT_FOUND".into(),
+            message: String::new(),
+        }));
+        // 404 状态即使 key 不含 NOT_FOUND 也不降级
+        assert!(!should_fallback_to_adt(&RfcError {
+            code: 4,
+            status: 404,
+            key: "ERROR_MESSAGE".into(),
+            message: String::new(),
+        }));
+        // FL 180 等业务错误（key=ERROR_MESSAGE, 400）→ 降级
+        assert!(should_fallback_to_adt(&RfcError {
+            code: 4,
+            status: 400,
+            key: "ERROR_MESSAGE".into(),
+            message: "ID:FL Type:E Number:180 Source wider than 72 char".into(),
+        }));
+        // 5xx 也降级（SAP 端 RPY 异常等）
+        assert!(should_fallback_to_adt(&RfcError {
+            code: 3,
+            status: 500,
+            key: "RFC_ABAP_RUNTIME_FAILURE".into(),
+            message: String::new(),
+        }));
+    }
 
     #[test]
     fn scan_finds_quoted_call_function_targets() {

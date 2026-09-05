@@ -19,6 +19,7 @@
 //! - 行号 include 都为空/0 时视为「无源码位置」（如死在 SYSTEM-EXIT），
 //!   不记录，避免无关 dump 匹配到不存在的位置上。
 
+use crate::adt::encode_path_segment;
 use crate::error::RfcError;
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
@@ -783,20 +784,6 @@ pub async fn fetch_feed(from: Option<&str>, to: Option<&str>) -> Result<Vec<Dump
     }
     let xml = String::from_utf8_lossy(&body);
     parse_feed(&xml)
-}
-
-/// percent-encode 路径段：仅保留未保留字符，其余 %XX（大写十六进制）。
-fn encode_path_segment(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() * 3);
-    for b in s.bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(b as char)
-            }
-            _ => out.push_str(&format!("%{:02X}", b)),
-        }
-    }
-    out
 }
 
 /// 读单个转储的结构化详情（内部拉 `/formatted` 英文文本并解析）。

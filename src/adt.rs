@@ -257,6 +257,68 @@ pub(crate) async fn adt_get_raw(
     Ok((status, content_type, body))
 }
 
+/// percent-encode 路径段：仅保留未保留字符，其余 %XX（大写十六进制）。
+/// 供网关内部端点（dumps、源码降级读）拼 ADT URL 用。
+pub(crate) fn encode_path_segment(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() * 3);
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{:02X}", b)),
+        }
+    }
+    out
+}
+
+/// 内部读取 ADT 纯文本资源（源码等），按行返回（去 \r）。
+/// 404 → NOT_FOUND（保留调用方的 404 语义）；其余非 200 → 502。
+pub(crate) async fn adt_get_text_lines(rel_path: &str) -> Result<Vec<String>, RfcError> {
+    let (status, _ct, body) = adt_get_raw(rel_path, "*/*").await?;
+    match status {
+        200 => Ok(String::from_utf8_lossy(&body)
+            .split('\n')
+            .map(|l| l.trim_end_matches('\r').to_string())
+            .collect()),
+        404 => Err(RfcError {
+            code: -1,
+            status: 404,
+            message: format!("ADT 资源不存在: {}", rel_path),
+            key: "NOT_FOUND".into(),
+        }),
+        s => Err(RfcError {
+            code: -1,
+            status: 502,
+            message: format!("ADT 源码读取失败（ADT 返回 {}）", s),
+            key: "ADT_SOURCE_UNAVAILABLE".into(),
+        }),
+    }
+}
+
+/// 读函数模块源码（RFC 读取失败时的 ADT 降级通道）。
+/// 资源嵌在函数组下：`/sap/bc/adt/functions/groups/{组}/fmodules/{FM}/source/main`。
+/// 组名由调用方经 [`crate::discovery::resolve_function_group`] 反解（FM 名全局唯一，
+/// 但资源 URL 需要两级名字——vsp 同样先从搜索结果的 URI 里反解组名）。
+pub(crate) async fn read_fm_source(group: &str, name: &str) -> Result<Vec<String>, RfcError> {
+    let rel = format!(
+        "functions/groups/{}/fmodules/{}/source/main",
+        encode_path_segment(&group.trim().to_uppercase()),
+        encode_path_segment(&name.trim().to_uppercase())
+    );
+    adt_get_text_lines(&rel).await
+}
+
+/// 读程序源码（RFC 读取失败时的 ADT 降级通道）：
+/// `/sap/bc/adt/programs/programs/{名}/source/main`（报表/include 主程序）。
+pub(crate) async fn read_program_source(name: &str) -> Result<Vec<String>, RfcError> {
+    let rel = format!(
+        "programs/programs/{}/source/main",
+        encode_path_segment(&name.trim().to_uppercase())
+    );
+    adt_get_text_lines(&rel).await
+}
+
 /// `ANY /api/adt/{*path}` —— ADT REST 通用代理。
 ///
 /// 透传规则：

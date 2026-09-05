@@ -1,6 +1,6 @@
 [package]
 name = "sap_for_agents"
-version = "0.5.0"
+version = "0.5.1"
 license = "MIT"
 edition = "2021"
 repository = "https://github.com/Jack-Liang/sap-for-agents"

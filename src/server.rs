@@ -720,6 +720,11 @@ async fn ddic_field_handler(
 /// `?prologue=true` 时附带依赖签名前言：扫描源码里的 `CALL FUNCTION 'X'`，
 /// 逐个取其接口，内联成紧凑签名块（ABAP 注释风格，可直接粘贴到源码上方），
 /// 让调用方一次拿到「源码 + 依赖契约」，省去 N 次接口往返。
+///
+/// RFC 读取失败（非 NOT_FOUND，典型如 FL 180「Source wider than 72 char」）
+/// 自动降级 ADT 通道：`RFC_FUNCTION_SEARCH` 反解组名 →
+/// `/sap/bc/adt/functions/groups/{组}/fmodules/{名}/source/main`。
+/// 响应的 `source_via` 字段标明来源（`rfc` / `adt`）。
 async fn function_source_handler(
     axum::extract::State(pool): axum::extract::State<SharedPool>,
     axum::extract::Path(name): axum::extract::Path<String>,
@@ -727,47 +732,122 @@ async fn function_source_handler(
 ) -> Result<Json<serde_json::Value>, RfcError> {
     crate::api::validate_func_name(&name)?;
     let want_prologue = matches!(prologue.as_deref(), Some("true") | Some("1"));
+
     let lookup = name.clone();
-    let (lines, prologue_json) = run_blocking(pool, move |conn| {
-        let lines = crate::discovery::read_function_source(conn, &lookup)?;
-        if !want_prologue {
-            return Ok((lines, None));
+    let (lines, via) = match run_blocking(Arc::clone(&pool), move |conn| {
+        crate::discovery::read_function_source(conn, &lookup)
+    })
+    .await
+    {
+        Ok(lines) => (lines, "rfc"),
+        Err(rfc_err) => {
+            if !crate::discovery::should_fallback_to_adt(&rfc_err) {
+                return Err(rfc_err);
+            }
+            // 组名反解失败或 ADT 也读不到 → 保留原 RFC 错误（信息量更大）
+            let group = {
+                let lookup = name.clone();
+                match run_blocking(Arc::clone(&pool), move |conn| {
+                    crate::discovery::resolve_function_group(conn, &lookup)
+                })
+                .await
+                {
+                    Ok(g) => g,
+                    Err(e) => {
+                        tracing::warn!(key = %e.key, "ADT 降级：函数组反解失败，返回原 RFC 错误");
+                        return Err(rfc_err);
+                    }
+                }
+            };
+            tracing::info!(
+                key = %rfc_err.key,
+                status = rfc_err.status,
+                msg = %rfc_err.message,
+                group = %group,
+                "RPY 读函数源码失败，降级 ADT 通道"
+            );
+            match crate::adt::read_fm_source(&group, &name).await {
+                Ok(lines) => (lines, "adt"),
+                Err(e) => {
+                    tracing::warn!(key = %e.key, "ADT 降级读也失败，返回原 RFC 错误");
+                    return Err(rfc_err);
+                }
+            }
         }
-        let deps = crate::discovery::scan_called_functions(&lines, &lookup, 30);
+    };
+
+    // prologue 扫描是纯函数；接口读取走 C API（get_param_infos），不受 RPY 限制
+    let prologue_json = if want_prologue {
+        let deps = crate::discovery::scan_called_functions(&lines, &name, 30);
         let deps_found = deps.len();
-        let p = crate::discovery::build_function_prologue(conn, &deps);
-        let json = serde_json::json!({
+        let p = run_blocking(Arc::clone(&pool), move |conn| {
+            Ok(crate::discovery::build_function_prologue(conn, &deps))
+        })
+        .await?;
+        Some(serde_json::json!({
             "deps_found": deps_found,
             "resolved": p.resolved,
             "failed": p.failed,
             "text": p.text,
-        });
-        Ok((lines, Some(json)))
-    })
-    .await?;
+        }))
+    } else {
+        None
+    };
+
     let count = lines.len();
-    let mut body = serde_json::json!({"name": name, "count": count, "lines": lines});
+    let mut body = serde_json::json!({
+        "name": name,
+        "count": count,
+        "source_via": via,
+        "lines": lines,
+    });
     if let Some(p) = prologue_json {
         body["prologue"] = p;
     }
     Ok(Json(body))
 }
 
-/// ⑦ `GET /api/programs/:name/source` —— 读 ABAP 程序源代码（调 `RPY_PROGRAM_READ`，含 include/报表）
+/// ⑦ `GET /api/programs/:name/source` —— 读 ABAP 程序源代码（调 `RPY_PROGRAM_READ`，含 include/报表）。
+/// 与函数源码同理：RFC 失败（非 NOT_FOUND）自动降级 ADT
+/// `/sap/bc/adt/programs/programs/{名}/source/main`，`source_via` 标明来源。
 async fn program_source_handler(
     axum::extract::State(pool): axum::extract::State<SharedPool>,
     axum::extract::Path(name): axum::extract::Path<String>,
 ) -> Result<Json<serde_json::Value>, RfcError> {
     crate::api::validate_func_name(&name)?;
     let lookup = name.clone();
-    let lines = run_blocking(pool, move |conn| {
+    let (lines, via) = match run_blocking(Arc::clone(&pool), move |conn| {
         crate::discovery::read_program_source(conn, &lookup)
     })
-    .await?;
+    .await
+    {
+        Ok(lines) => (lines, "rfc"),
+        Err(rfc_err) => {
+            if !crate::discovery::should_fallback_to_adt(&rfc_err) {
+                return Err(rfc_err);
+            }
+            tracing::info!(
+                key = %rfc_err.key,
+                status = rfc_err.status,
+                msg = %rfc_err.message,
+                "RPY 读程序源码失败，降级 ADT 通道"
+            );
+            match crate::adt::read_program_source(&name).await {
+                Ok(lines) => (lines, "adt"),
+                Err(e) => {
+                    tracing::warn!(key = %e.key, "ADT 降级读也失败，返回原 RFC 错误");
+                    return Err(rfc_err);
+                }
+            }
+        }
+    };
     let count = lines.len();
-    Ok(Json(
-        serde_json::json!({"name": name, "count": count, "lines": lines}),
-    ))
+    Ok(Json(serde_json::json!({
+        "name": name,
+        "count": count,
+        "source_via": via,
+        "lines": lines,
+    })))
 }
 
 /// 读 SAP 透明表数据的请求体。
