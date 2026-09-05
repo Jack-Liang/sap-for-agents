@@ -132,6 +132,7 @@ tailwind.config = {
     /* Method tags: cyan (GET) / purple (POST) */
     .method-get { background: rgba(6, 182, 212, 0.1); color: #06b6d4; border: 1px solid #06b6d4; }
     .method-post { background: rgba(129, 39, 207, 0.1); color: #8127cf; border: 1px solid #8127cf; }
+    .method-any { background: rgba(217, 119, 6, 0.1); color: #d97706; border: 1px solid #d97706; }
     .material-symbols-outlined { font-family: 'Material Symbols Outlined'; font-weight: normal; font-style: normal; line-height: 1; letter-spacing: normal; text-transform: none; display: inline-block; white-space: nowrap; word-wrap: normal; direction: ltr; -webkit-font-feature-settings: 'liga'; -webkit-font-smoothing: antialiased; }
 </style>
 </head>
@@ -171,7 +172,7 @@ tailwind.config = {
         <h1 class="font-display-lg text-display-lg text-on-surface mb-sm">sap-for-agents</h1>
         <p class="font-headline-md text-headline-md text-primary mb-md">SAP NWRFC → REST Gateway</p>
         <p class="font-body-lg text-body-lg text-on-surface-variant max-w-2xl">
-            One endpoint invokes any BAPI; 8 metadata endpoints let AI explore autonomously
+            One endpoint invokes any BAPI; 11 metadata endpoints (incl. ST22 dump analysis) let AI explore autonomously
         </p>
     </section>
 
@@ -272,6 +273,21 @@ tailwind.config = {
                     <code class="font-code-sm text-code-sm text-on-surface flex-grow">/api/ddic/field/{table}/{field}</code>
                     <span class="font-body-sm text-body-sm text-on-surface-variant whitespace-nowrap">Inspect field semantics</span>
                 </li>
+                <li class="flex items-center gap-md py-sm border-b border-outline-variant/30 last:border-0">
+                    <span class="font-code-sm text-code-sm px-sm py-xs rounded method-get w-16 text-center">GET</span>
+                    <code class="font-code-sm text-code-sm text-on-surface flex-grow">/api/dumps</code>
+                    <span class="font-body-sm text-body-sm text-on-surface-variant whitespace-nowrap">List ABAP short dumps</span>
+                </li>
+                <li class="flex items-center gap-md py-sm border-b border-outline-variant/30 last:border-0">
+                    <span class="font-code-sm text-code-sm px-sm py-xs rounded method-get w-16 text-center">GET</span>
+                    <code class="font-code-sm text-code-sm text-on-surface flex-grow">/api/dumps/grouped</code>
+                    <span class="font-body-sm text-body-sm text-on-surface-variant whitespace-nowrap">What keeps failing</span>
+                </li>
+                <li class="flex items-center gap-md py-sm border-b border-outline-variant/30 last:border-0">
+                    <span class="font-code-sm text-code-sm px-sm py-xs rounded method-get w-16 text-center">GET</span>
+                    <code class="font-code-sm text-code-sm text-on-surface flex-grow">/api/dumps/{key}/detail</code>
+                    <span class="font-body-sm text-body-sm text-on-surface-variant whitespace-nowrap">Dump stack / failing line</span>
+                </li>
             </ul>
         </div>
 
@@ -287,6 +303,11 @@ tailwind.config = {
                     <span class="font-code-sm text-code-sm px-sm py-xs rounded method-post w-16 text-center">POST</span>
                     <code class="font-code-sm text-code-sm text-on-surface flex-grow">/api/rfc</code>
                     <span class="font-body-sm text-body-sm text-on-surface-variant whitespace-nowrap">General RFC invocation</span>
+                </div>
+                <div class="flex items-center gap-md py-sm border-t border-outline-variant/30">
+                    <span class="font-code-sm text-code-sm px-sm py-xs rounded method-any w-16 text-center">ANY</span>
+                    <code class="font-code-sm text-code-sm text-on-surface flex-grow">/api/adt/{path}</code>
+                    <span class="font-body-sm text-body-sm text-on-surface-variant whitespace-nowrap">ADT REST passthrough</span>
                 </div>
                 <p class="font-body-sm text-body-sm text-on-surface-variant italic mt-sm">
                     Supports per-request timeout override via <code class="font-code-sm">timeout_secs</code> in the body
