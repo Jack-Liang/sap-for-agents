@@ -8,7 +8,7 @@
 - **技术栈**：Rust（标准库 FFI 直连 `sapnwrfc.dll`）+ axum + tokio + serde
 - **零 SDK 依赖客户端**：调用方只要会发 HTTP POST
 - **通用接口**：一个端点 `/api/rfc` 描述任意 BAPI，无需为每个 BAPI 写代码
-- **面向 AI**：8 个元数据端点（搜函数/查接口/查文档/查数据字典/读透明表/看源码），Agent 能自服务探索。给 AI 的操作指南见 [`AGENTS.md`](./AGENTS.md)
+- **面向 AI**：15 个元数据端点（搜函数/查接口/查文档/看源码/读透明表/查数据字典/排查短转储/**修改 ABAP 代码**），Agent 能自服务探索与操作。给 AI 的操作指南见 [`AGENTS.md`](./AGENTS.md)
 
 > ⚠️ **风险提示**：本项目是一个**探索性、实验性项目**，主要用于学习、测试与本地开发场景。它未经生产环境的充分打磨，不保证稳定性与正确性，API 可能随时变更。它以所配置 `SAP_USER` 的完整权限开放 RFC 调用能力——使用前请自行评估风险（数据暴露、未授权调用、合规性等）并自行采取防护措施。对生产 SAP 系统使用本项目的风险由使用者自行承担，作者不对使用本项目造成的任何损失负责。
 
@@ -312,7 +312,7 @@ curl -H "Authorization: Bearer $SAP_API_KEY" \
 
 ### 3.3 面向 AI 的元数据 API
 
-14 个端点让 AI/Agent 自服务地发现函数、理解参数、查数据字典、读文档、看源码、读表数据、排查短转储、**修改代码**。典型工作流：**搜索 → 查接口 → 查文档 → 看源码 → 调用**。给 AI 的完整操作指南见 [`AGENTS.md`](./AGENTS.md)。
+15 个端点让 AI/Agent 自服务地发现函数、理解参数、查数据字典、读文档、看源码、读表数据、排查短转储、**修改代码**。典型工作流：**搜索 → 查接口 → 查文档 → 看源码 → 调用**。给 AI 的完整操作指南见 [`AGENTS.md`](./AGENTS.md)。
 
 | 端点 | 用途 | 示例 |
 |------|------|------|
@@ -327,6 +327,7 @@ curl -H "Authorization: Bearer $SAP_API_KEY" \
 | `GET /api/dumps` | 短转储结构化列表（解析自 ADT Atom feed） | `/api/dumps?limit=50` |
 | `GET /api/dumps/grouped` | 按（错误类型、终止程序）聚合——什么在反复失败 | `/api/dumps/grouped` |
 | `GET /api/dumps/:key/detail` | 单个转储的解析详情：头表/终止点/调用栈 | `/api/dumps/<key>/detail` |
+| `ANY /api/adt/:path` | ADT REST 通用代理（1:1 透传 `/sap/bc/adt/**`）：dump 正文、类源码等 Eclipse ADT 暴露的一切资源；写方法 CSRF 自动处理 | `/api/adt/runtime/dumps` |
 
 端到端示例（列出用户）：
 ```bash

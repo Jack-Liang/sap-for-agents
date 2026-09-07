@@ -7,7 +7,7 @@ Wraps the SAP NWRFC SDK into a long-running HTTP service that exposes any SAP RF
 - **Stack**: Rust (standard-library FFI linking directly to `sapnwrfc.dll`) + axum + tokio + serde
 - **Zero-SDK clients**: callers only need to send an HTTP POST
 - **Generic interface**: one endpoint, `/api/rfc`, describes any BAPI — no per-BAPI glue code
-- **AI-friendly**: 8 metadata endpoints (search functions / inspect interfaces / read docs / query the data dictionary / read transparent tables / view source) let agents explore self-service. The operator guide for AI lives in [`AGENTS.md`](./AGENTS.md)
+- **AI-friendly**: 15 metadata endpoints (search functions / inspect interfaces / read docs / view source / read transparent tables / query the data dictionary / triage short dumps / **edit ABAP code**) let agents explore and act self-service. The operator guide for AI lives in [`AGENTS.md`](./AGENTS.md)
 
 > ⚠️ **Risk disclaimer**: this is an **exploratory, experimental project**, primarily built for learning, testing, and local development scenarios. It has not been hardened for production use, offers no guarantee of stability or correctness, and its APIs may change at any time. It grants RFC access with the full privileges of the configured `SAP_USER` — before using it, you must evaluate the risks yourself (data exposure, unauthorized calls, compliance, etc.) and take your own precautions. Use it against production SAP systems at your own risk; the authors accept no liability for any loss arising from its use.
 
@@ -312,7 +312,7 @@ Fields you don't read (e.g. you didn't pass `table_outputs`) do **not** appear i
 
 ### 3.3 AI-facing metadata API
 
-14 endpoints let an AI/agent self-service discover functions, understand parameters, query the data dictionary, read docs, view source, read table data, triage short dumps, and **edit code**. Typical workflow: **search → inspect interface → read docs → view source → call**. The full operator guide for AI lives in [`AGENTS.md`](./AGENTS.md).
+15 endpoints let an AI/agent self-service discover functions, understand parameters, query the data dictionary, read docs, view source, read table data, triage short dumps, and **edit code**. Typical workflow: **search → inspect interface → read docs → view source → call**. The full operator guide for AI lives in [`AGENTS.md`](./AGENTS.md).
 
 | Endpoint | Purpose | Example |
 |------|------|------|
@@ -330,6 +330,7 @@ Fields you don't read (e.g. you didn't pass `table_outputs`) do **not** appear i
 | `PUT /api/objects/:type/:name/source` | Write full source (lock→put→unlock→activate orchestrated in one request) | `{"source":"REPORT z..."}` |
 | `POST /api/objects/:type/:name/replace` | AI-style unique find-and-replace + activate | `{"old_string":"...","new_string":"..."}` |
 | `POST /api/objects/:type/:name/syntax` | Syntax-check source without writing it | `{"source":"REPORT z..."}` |
+| `ANY /api/adt/:path` | Generic ADT REST proxy (`/sap/bc/adt/**` 1:1): dumps, class sources, anything Eclipse ADT exposes; CSRF handled for write methods | `/api/adt/runtime/dumps` |
 
 End-to-end example (list users):
 ```bash
