@@ -172,7 +172,7 @@ curl -X POST http://127.0.0.1:3000/api/rfc \
 | 并发 | 多连接池（默认 8，`SAP_POOL_SIZE` 可配），不同请求可并行执行 SAP 调用；池耗尽时 acquire 等待上限 120s |
 | 字符集 | 通过 UTF-16 桥接 SAP UC，UTF-8 输入输出 |
 | 平台 | Windows/Linux/macOS × x86_64/aarch64（`build.rs` 自动选 SDK 子目录） |
-| RFC 调用超时 | 连接池层有 acquire 超时（120s）；单次 RFC 调用暂无执行超时 |
+| RFC 调用超时 | 单次 SAP 调用有全局执行超时（默认 60s，`SAP_REQUEST_TIMEOUT_SECS`），`/api/rfc` 可用请求体 `timeout_secs` per-request 覆盖；超时返回 504。连接池层另有 acquire 超时（120s） |
 
 ---
 
@@ -204,7 +204,7 @@ curl -X POST http://127.0.0.1:3000/api/rfc \
 
 ### 认证（可选）
 
-设置环境变量 `SAP_API_KEY` 后，所有 `/api/*` 业务端点要求请求头 `Authorization: Bearer <token>`；未设置则免鉴权（本机默认）。探针 `/health`、`/ready` 与公开页 `/`、`/agents.md` 始终免鉴权。
+设置环境变量 `SAP_API_KEY` 后，所有 `/api/*` 业务端点要求请求头 `Authorization: Bearer <token>`；未设置则免鉴权（本机默认）。探针 `/health`、`/ready` 与公开页 `/`、`/agents.md`、`/openapi.json` 始终免鉴权。
 
 ```bash
 # 启用认证（生成一个长随机串）
@@ -328,6 +328,7 @@ curl -H "Authorization: Bearer $SAP_API_KEY" \
 | `GET /api/dumps/grouped` | 按（错误类型、终止程序）聚合——什么在反复失败 | `/api/dumps/grouped` |
 | `GET /api/dumps/:key/detail` | 单个转储的解析详情：头表/终止点/调用栈 | `/api/dumps/<key>/detail` |
 | `ANY /api/adt/:path` | ADT REST 通用代理（1:1 透传 `/sap/bc/adt/**`）：dump 正文、类源码等 Eclipse ADT 暴露的一切资源；写方法 CSRF 自动处理 | `/api/adt/runtime/dumps` |
+| `GET /openapi.json` | 导出整个网关的 OpenAPI 3.0 规范（机器可读：含全部端点 schema、认证方式、逐端点说明）——可直接喂给代码生成器、Postman 或 AI Agent 的工具注册表 | `/openapi.json` |
 
 端到端示例（列出用户）：
 ```bash

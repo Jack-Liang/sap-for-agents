@@ -171,7 +171,7 @@ curl -X POST http://127.0.0.1:3000/api/rfc \
 | Concurrency | Multi-connection pool (default 8, configurable via `SAP_POOL_SIZE`); SAP calls from different requests run in parallel; when the pool is exhausted, `acquire` waits up to 120s |
 | Character set | Bridges SAP UC via UTF-16; UTF-8 input and output |
 | Platforms | Windows/Linux/macOS × x86_64/aarch64 (`build.rs` auto-selects the SDK subdirectory) |
-| RFC call timeout | The connection-pool layer has an acquire timeout (120s); a single RFC call has no execution timeout yet |
+| RFC call timeout | A single SAP call has a global execution timeout (default 60s, `SAP_REQUEST_TIMEOUT_SECS`), overridable per-request via `timeout_secs` in `/api/rfc`; returns 504 on timeout. The connection pool also has an acquire timeout (120s) |
 
 ---
 
@@ -204,7 +204,7 @@ All configuration goes through environment variables, written to `.env` in the p
 
 ### Authentication (optional)
 
-Once `SAP_API_KEY` is set, every `/api/*` business endpoint requires the request header `Authorization: Bearer <token>`; without it the service is unauthenticated (the localhost default). The probes `/health`, `/ready`, and the public pages `/`, `/agents.md` are always open.
+Once `SAP_API_KEY` is set, every `/api/*` business endpoint requires the request header `Authorization: Bearer <token>`; without it the service is unauthenticated (the localhost default). The probes `/health`, `/ready`, and the public pages `/`, `/agents.md`, `/openapi.json` are always open.
 
 ```bash
 # Enable authentication (generate a long random string)
@@ -331,6 +331,7 @@ Fields you don't read (e.g. you didn't pass `table_outputs`) do **not** appear i
 | `POST /api/objects/:type/:name/replace` | AI-style unique find-and-replace + activate | `{"old_string":"...","new_string":"..."}` |
 | `POST /api/objects/:type/:name/syntax` | Syntax-check source without writing it | `{"source":"REPORT z..."}` |
 | `ANY /api/adt/:path` | Generic ADT REST proxy (`/sap/bc/adt/**` 1:1): dumps, class sources, anything Eclipse ADT exposes; CSRF handled for write methods | `/api/adt/runtime/dumps` |
+| `GET /openapi.json` | Machine-readable OpenAPI 3.0 spec of the whole gateway (schemas, auth, per-endpoint docs) — feed it to code generators, Postman, or an AI agent's tool registry | `/openapi.json` |
 
 End-to-end example (list users):
 ```bash

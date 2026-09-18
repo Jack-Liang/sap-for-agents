@@ -135,6 +135,8 @@ pub fn static_app<S: Clone + Send + Sync + 'static>() -> Router<S> {
     Router::new()
         .route("/", axum::routing::get(index_handler))
         .route("/agents.md", axum::routing::get(agents_handler))
+        // OpenAPI 规范导出：机器可读接口契约（免鉴权公开页，规范内不含敏感信息）
+        .route("/openapi.json", axum::routing::get(crate::openapi::openapi_handler))
         .route("/health", axum::routing::get(health_handler))
 }
 
@@ -260,6 +262,7 @@ pub async fn run(
     tracing::info!("✅ 服务就绪！");
     tracing::info!("   👉 浏览器打开:         http://{}", display_host);
     tracing::info!("   👉 给 AI/Agent 的文档: http://{}/agents.md", display_host);
+    tracing::info!("   👉 OpenAPI 规范:        http://{}/openapi.json", display_host);
     tracing::info!("   端点速览: POST /api/rfc | GET /api/functions/:name | POST /api/functions/search");
     tracing::info!("           GET /api/functions/:name/doc | GET /api/ddic/type/:name | GET /api/ddic/field/:t/:f");
     axum::serve(
@@ -1420,5 +1423,35 @@ mod tests {
         assert_eq!(resp.status(), axum::http::StatusCode::OK);
         let body = body_string(resp.into_body()).await;
         assert!(body.contains("http://127.0.0.1:3000"));
+    }
+
+    #[tokio::test]
+    async fn openapi_json_serves_spec_with_host_derived_server() {
+        let resp = static_app()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/openapi.json")
+                    .header("host", "192.168.1.5:9999")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let ct = resp
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(ct.contains("application/json"), "Content-Type 应为 JSON: {}", ct);
+        let body = body_string(resp.into_body()).await;
+        let spec: serde_json::Value = serde_json::from_str(&body).expect("body 应为合法 JSON");
+        assert_eq!(spec["openapi"], "3.0.3");
+        // servers 按请求 Host 头推导
+        assert_eq!(spec["servers"][0]["url"], "http://192.168.1.5:9999");
+        // 核心端点在规范里
+        assert!(spec["paths"]["/api/rfc"].is_object());
+        assert!(spec["paths"]["/api/functions/search"].is_object());
     }
 }

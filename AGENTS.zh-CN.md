@@ -22,7 +22,7 @@ curl -H "Authorization: Bearer <SAP_API_KEY>" http://127.0.0.1:3000/api/function
 ```
 
 - 未带 / 错 token → `401 {"code":401,"message":"..."}`。
-- 探针 `/health`、`/ready` 与公开页 `/`、`/agents.md` **始终免鉴权**（不需要 token）。
+- 探针 `/health`、`/ready` 与公开页 `/`、`/agents.md`、`/openapi.json` **始终免鉴权**（不需要 token）。
 - 是否启用由部署方决定。本机默认环境通常免鉴权——你可先不带 token 试，收到 401 再向部署方索取。
 
 ## 你能做什么
@@ -47,6 +47,7 @@ curl -H "Authorization: Bearer <SAP_API_KEY>" http://127.0.0.1:3000/api/function
 | 语法检查（**不写库**，源码内嵌提交） | `POST /api/objects/{type}/{name}/syntax` |
 | 想读/写 ABAP 类源码等 ADT（Eclipse 工具链）资源 | `ANY /api/adt/{path}` |
 | **实际调用一个 SAP 函数** | `POST /api/rfc` |
+| **想要本网关的机器可读 OpenAPI 规范**（含 schema、认证、逐端点说明） | `GET /openapi.json` |
 
 ## 标准操作流程
 
