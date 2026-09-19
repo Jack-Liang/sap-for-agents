@@ -50,6 +50,9 @@ curl -H "Authorization: Bearer <SAP_API_KEY>" http://127.0.0.1:3000/api/function
 | Want to invoke a function **without** filling `func_name` (typed endpoint) | `POST /api/functions/{name}/invoke` |
 | Want a machine-readable OpenAPI spec of this gateway | `GET /openapi.json` (public) |
 | Want a spec with **typed operations per BAPI** (params/types/fields expanded) | `GET /api/openapi?functions=BAPI_X,BAPI_Y` |
+| Want to know **who calls a function** before editing it (where-used) | `GET /api/functions/{name}/where-used` |
+| You are an MCP client (Claude etc.) — mount the gateway as an MCP tool server | `POST /mcp` (Streamable HTTP, stateless) |
+| Human-friendly interactive API docs | `GET /docs` (Redoc rendering of the spec) |
 
 ## Standard workflow
 

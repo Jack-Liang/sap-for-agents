@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>sap-for-agents — API Reference</title>
+<meta name="description" content="Interactive API reference (OpenAPI 3.0.3) for the sap-for-agents SAP NWRFC→REST gateway">
+<style>
+  body { margin: 0; font-family: -apple-system, system-ui, sans-serif; }
+  #fallback { display: none; padding: 48px 24px; max-width: 720px; margin: 0 auto;
+              color: #1f2328; line-height: 1.6; }
+  #fallback code { background: #f6f8fa; padding: 2px 6px; border-radius: 4px; }
+  .hint { font-size: 14px; color: #57606a; }
+</style>
+<script>
+// 内网/离线环境加载不了 CDN 时给出可用的降级提示（规范本身始终可用）
+window.addEventListener('load', function () {
+  setTimeout(function () {
+    var ok = document.querySelector('redoc') && document.querySelector('redoc').shadowRoot;
+    if (!ok || !document.querySelector('redoc').shadowRoot?.querySelector('div')) {
+      document.getElementById('fallback').style.display = 'block';
+    }
+  }, 4000);
+});
+</script>
+<script src="https://cdn.redoc.ly/redoc/latest/bundles/redoc.standalone.js"></script>
+</head>
+<body>
+<redoc spec-url="/openapi.json"></redoc>
+<noscript>
+  <div id="fallback">
+    <h2>API Reference</h2>
+    <p class="hint">This page renders the OpenAPI spec with JavaScript. Get the raw spec directly:</p>
+    <p><code>curl http://127.0.0.1:3000/openapi.json</code></p>
+  </div>
+</noscript>
+<div id="fallback">
+  <h2>API Reference</h2>
+  <p>The interactive renderer (Redoc CDN) could not be loaded — this environment may be offline.</p>
+  <p>The machine-readable spec is always available locally:</p>
+  <p><code>curl http://127.0.0.1:3000/openapi.json</code></p>
+  <p class="hint">Tip: paste the spec into <a href="https://editor.swagger.io">editor.swagger.io</a> or
+     generate a client with <code>openapi-generator</code>. Per-BAPI typed specs:
+     <code>GET /api/openapi?functions=BAPI_USER_GETLIST</code></p>
+</div>
+</body>
+</html>

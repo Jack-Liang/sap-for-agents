@@ -10,12 +10,13 @@
 
 use crate::api::{FieldSpec, InvokeRequest, ScalarValue};
 use crate::connection::RfcConnection;
+use serde::Serialize;
 use crate::error::RfcError;
 use crate::executor::execute_collect;
 use std::collections::HashMap;
 
 /// 搜索结果条目：一个可远程调用的函数模块
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct FunctionEntry {
     pub name: String,
     /// 函数组（可能为空）
@@ -99,14 +100,14 @@ fn function_table_spec() -> Vec<FieldSpec> {
 }
 
 /// DDIC 字段的固定值（域的值范围，如状态码 → 描述）
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct FixedValue {
     pub value: String,
     pub text: String,
 }
 
 /// 单个 DDIC 字段的语义元数据（来自 DDIF_FIELDINFO_GET 的 DFIES 结构）
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct FieldSemantics {
     pub field: String,
     /// 数据元素（Roll Name）
@@ -217,7 +218,7 @@ fn fixed_values_spec() -> Vec<FieldSpec> {
 }
 
 /// 函数模块的文档（短文本 + SE37 长文本）
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct FunctionDoc {
     #[allow(dead_code)]
     pub name: String,
@@ -481,6 +482,7 @@ pub fn read_table(
 // ========================================================================
 
 /// prologue 构建结果。
+#[derive(serde::Serialize)]
 pub struct PrologueSummary {
     /// 成功取到接口的
     pub resolved: usize,
@@ -488,6 +490,93 @@ pub struct PrologueSummary {
     pub failed: usize,
     /// ABAP 注释风格的签名块，可直接粘贴到源码上方
     pub text: String,
+}
+
+/// where-used 单条使用关系（REPOSITORY_ENVIRONMENT_SET_RFC 的 ENVIRONMENT 行）。
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct WhereUsedEntry {
+    /// 使用者类型（PROG / FUGR / FUNC / ...）
+    #[serde(rename = "type")]
+    pub usage_type: String,
+    /// 使用者对象名
+    pub object: String,
+    /// 使用者的宿主对象（如函数组主程序）
+    pub enclosing_object: String,
+    /// 开发包
+    pub devclass: String,
+    /// 调用类型（如 PERFORM / CALL FUNCTION / 3 = 动态调用等，语义依 SAP 版本）
+    pub call_type: String,
+}
+
+/// 查询函数模块被谁使用（where-used list）。
+///
+/// 基于 `REPOSITORY_ENVIRONMENT_SET_RFC`（经典环境引擎的 RFC 化变体；
+/// `RS_EU_CROSSREF` 在 ABAP Cloud Trial 等精简系统上不存在）。结果依赖
+/// SAP 端使用索引（WBCROSSGT）——索引未建立的系统（如试用版）会返回空，
+/// 由调用方负责向用户解释（响应附 note）。
+///
+/// OBJ_TYPE 的正确取值（'FUNC' vs 'FF'）在不同版本存在分歧：先按 'FUNC'
+/// 查，空结果再按 'FF' 兜底一次（有索引的系统第一次即命中，代价为零）。
+pub fn read_where_used(
+    conn: &RfcConnection,
+    func_name: &str,
+    max_results: usize,
+) -> Result<Vec<WhereUsedEntry>, RfcError> {
+    fn query(conn: &RfcConnection, name: &str, obj_type: &str, max: usize) -> Result<Vec<WhereUsedEntry>, RfcError> {
+        let req = InvokeRequest {
+            func_name: "REPOSITORY_ENVIRONMENT_SET_RFC".to_string(),
+            inputs: HashMap::from([
+                ("OBJECT_NAME".to_string(), ScalarValue::Chars(name.to_uppercase())),
+                ("OBJ_TYPE".to_string(), ScalarValue::Chars(obj_type.to_string())),
+            ]),
+            // 只关心「谁在用」：程序与函数组（类在环境引擎里也归 PROG）
+            struct_inputs: HashMap::from([(
+                "ENVIRONMENT_TYPES".to_string(),
+                HashMap::from([
+                    ("PROG".to_string(), ScalarValue::Chars("X".to_string())),
+                    ("FUGR".to_string(), ScalarValue::Chars("X".to_string())),
+                ]),
+            )]),
+            table_outputs: HashMap::from([(
+                "ENVIRONMENT".to_string(),
+                vec![
+                    crate::api::FieldSpec { name: "TYPE".to_string(), max_len: Some(15), auto: false },
+                    crate::api::FieldSpec { name: "OBJECT".to_string(), max_len: Some(180), auto: false },
+                    crate::api::FieldSpec { name: "ENCL_OBJ".to_string(), max_len: Some(40), auto: false },
+                    crate::api::FieldSpec { name: "DEVCLASS".to_string(), max_len: Some(30), auto: false },
+                    crate::api::FieldSpec { name: "CALL_TYPE".to_string(), max_len: Some(15), auto: false },
+                ],
+            )]),
+            ..Default::default()
+        };
+        let resp = crate::executor::execute_collect(conn, &req)?;
+        let rows = resp.tables.get("ENVIRONMENT").cloned().unwrap_or_default();
+        Ok(rows
+            .into_iter()
+            .take(max)
+            .map(|row| {
+                fn sv(v: Option<&crate::api::ScalarValue>) -> String {
+                    match v {
+                        Some(crate::api::ScalarValue::Chars(s)) => s.clone(),
+                        _ => String::new(),
+                    }
+                }
+                WhereUsedEntry {
+                    usage_type: sv(row.get("TYPE")),
+                    object: sv(row.get("OBJECT")),
+                    enclosing_object: sv(row.get("ENCL_OBJ")),
+                    devclass: sv(row.get("DEVCLASS")),
+                    call_type: sv(row.get("CALL_TYPE")),
+                }
+            })
+            .collect())
+    }
+
+    let out = query(conn, func_name, "FUNC", max_results)?;
+    if !out.is_empty() {
+        return Ok(out);
+    }
+    query(conn, func_name, "FF", max_results)
 }
 
 /// 扫描 ABAP 源码行里的 `CALL FUNCTION 'X'` 目标（FM 依赖）。

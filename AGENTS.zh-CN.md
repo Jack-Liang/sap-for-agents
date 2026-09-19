@@ -50,6 +50,9 @@ curl -H "Authorization: Bearer <SAP_API_KEY>" http://127.0.0.1:3000/api/function
 | 想调用函数但**免填** `func_name`（类型化端点） | `POST /api/functions/{name}/invoke` |
 | 想要本网关的机器可读 OpenAPI 规范 | `GET /openapi.json`（公开免鉴权） |
 | 想要**按 BAPI 生成类型化 operation** 的规范（参数/类型/字段全展开） | `GET /api/openapi?functions=BAPI_X,BAPI_Y` |
+| 改函数前想知道**谁在调用它**（where-used 引用查询） | `GET /api/functions/{name}/where-used` |
+| 你是 MCP 客户端（Claude 等）——把网关挂载为 MCP 工具服务器 | `POST /mcp`（Streamable HTTP 无状态） |
+| 人类友好的交互式 API 文档 | `GET /docs`（Redoc 渲染规范） |
 
 ## 标准操作流程
 

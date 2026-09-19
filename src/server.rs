@@ -147,7 +147,7 @@ fn timeout_error(timeout: Duration) -> RfcError {
 /// 超时返回 504。注意：超时后 `spawn_blocking` 线程无法取消，FFI 会跑到 SAP 响应才归还
 /// 连接（NWRFC 固有限制，靠协议层超时兜底）。FFI 与连接池内部状态都被限制在阻塞闭包中，
 /// 绝不跨 await 点，保证 future 干净 Send。
-async fn run_blocking_with_timeout<F, R>(
+pub(crate) async fn run_blocking_with_timeout<F, R>(
     pool: SharedPool,
     timeout: Duration,
     f: F,
@@ -175,7 +175,7 @@ where
 }
 
 /// 用全局默认超时执行（元数据查询等无需 per-request 超时的端点用这个）。
-async fn run_blocking<F, R>(pool: SharedPool, f: F) -> Result<R, RfcError>
+pub(crate) async fn run_blocking<F, R>(pool: SharedPool, f: F) -> Result<R, RfcError>
 where
     F: FnMut(&RfcConnection) -> Result<R, RfcError> + Send + 'static,
     R: Send + 'static,
@@ -194,6 +194,8 @@ pub fn static_app<S: Clone + Send + Sync + 'static>() -> Router<S> {
             "/openapi.json",
             axum::routing::get(crate::openapi::openapi_handler),
         )
+        // /docs：Redoc 交互式文档（渲染 /openapi.json；离线时降级为提示页）
+        .route("/docs", axum::routing::get(docs_handler))
         .route("/health", axum::routing::get(health_handler))
 }
 
@@ -205,6 +207,9 @@ pub fn app(pool: SharedPool) -> Router {
         .route("/api/functions/search", post(search_functions_handler))
         // 动态 OpenAPI 规范：?functions=A,B 按接口元数据生成类型化 operation
         .route("/api/openapi", axum::routing::get(openapi_dynamic_handler))
+        // MCP 服务器（JSON-RPC over Streamable HTTP，无状态模式）：
+        // 与 /api/* 同一套鉴权/限流；写编排刻意不进工具面（见 mcp.rs 模块注释）
+        .route("/mcp", axum::routing::post(crate::mcp::mcp_handler))
         // 函数名可能带 /NS/ 命名空间前缀（如 /SDF/X），路径参数无法匹配多段路径，
         // 统一用通配路由捕获后按尾部 /doc、/source 分发（见 function_route_dispatcher）。
         .route(
@@ -238,6 +243,14 @@ pub fn app(pool: SharedPool) -> Router {
         .fallback(fallback_handler)
         .layer(axum::middleware::from_fn(unify_method_not_allowed))
         .with_state(pool)
+}
+
+/// GET /docs —— Redoc 交互式文档（公开页，渲染 /openapi.json）。
+async fn docs_handler() -> impl axum::response::IntoResponse {
+    (
+        [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        include_str!("docs.html"),
+    )
 }
 
 /// 兜底 404：路由不存在时统一返回 JSON 错误体（而非 axum 默认的空 body）。
@@ -326,6 +339,7 @@ pub async fn run(
     tracing::info!("   👉 浏览器打开:         http://{}", display_host);
     tracing::info!("   👉 给 AI/Agent 的文档: http://{}/agents.md", display_host);
     tracing::info!("   👉 OpenAPI 规范:       http://{}/openapi.json", display_host);
+    tracing::info!("   👉 交互式文档:         http://{}/docs", display_host);
     tracing::info!("   端点速览: POST /api/rfc | GET /api/functions/:name | POST /api/functions/search");
     tracing::info!("           GET /api/functions/:name/doc | GET /api/ddic/type/:name | GET /api/ddic/field/:t/:f");
     axum::serve(
@@ -770,9 +784,43 @@ async fn function_route_dispatcher(
             .await
             .into_response();
     }
+    if let Some(base) = name.strip_suffix("/where-used").filter(|b| !b.is_empty()) {
+        return function_where_used_handler(State(pool), Path(base.to_string()), Query(q))
+            .await
+            .into_response();
+    }
     function_interface_handler(State(pool), Path(name))
         .await
         .into_response()
+}
+
+/// ⑮ GET /api/functions/:name/where-used —— 查函数被谁使用（环境/使用索引）。
+///
+/// 基于 REPOSITORY_ENVIRONMENT_SET_RFC；结果依赖 SAP 端使用索引（WBCROSSGT）。
+/// 索引未建立的系统（ABAP Cloud Trial 等）返回空列表并附 note 说明——不是错误。
+async fn function_where_used_handler(
+    axum::extract::State(pool): axum::extract::State<SharedPool>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+    axum::extract::Query(q): axum::extract::Query<LangQuery>,
+) -> Result<Json<serde_json::Value>, RfcError> {
+    crate::api::validate_func_name(&name)?;
+    let max = q.max.unwrap_or(200).min(2000);
+    let resp_name = name.clone();
+    let usages = run_blocking(pool, move |conn| {
+        crate::discovery::read_where_used(conn, &name, max)
+    })
+    .await?;
+    let mut body = serde_json::json!({
+        "name": resp_name,
+        "count": usages.len(),
+        "usages": usages,
+    });
+    if usages.is_empty() {
+        body["note"] = serde_json::json!(
+            "No usages found. Either truly unused, or the SAP usage index (WBCROSSGT) is not built on this system — common on ABAP trial/cloud systems; on-prem systems with SE80/SE37 where-used working will return real rows."
+        );
+    }
+    Ok(Json(body))
 }
 
 /// ① GET /api/functions/:name —— 查函数完整接口（参数/类型/方向/嵌套字段）
@@ -791,7 +839,7 @@ async fn function_interface_handler(
 }
 
 /// 拉取函数参数元数据并展开嵌套字段（接口端点与动态 OpenAPI 生成共用）。
-fn collect_function_params(
+pub(crate) fn collect_function_params(
     conn: &crate::connection::RfcConnection,
     name: &str,
 ) -> Result<Vec<FunctionParam>, RfcError> {
@@ -892,6 +940,9 @@ struct LangQuery {
     /// /source 端点专用：是否附依赖签名前言（"true"/"1"）
     #[serde(default)]
     prologue: Option<String>,
+    /// /where-used 端点专用：最多返回条数（默认 200，上限 2000）
+    #[serde(default)]
+    max: Option<usize>,
 }
 /// ④ GET /api/ddic/field/:table/:field —— 查字段的语义元数据（数据元素/域/固定值）
 async fn ddic_field_handler(
@@ -1253,7 +1304,7 @@ fn split_object_path(
 }
 
 /// 对象名宽松校验（类/程序名长于 FM 名上限，不走 validate_func_name）。
-fn validate_object_name(name: &str) -> Result<(), RfcError> {
+pub(crate) fn validate_object_name(name: &str) -> Result<(), RfcError> {
     if name.is_empty() || name.len() > 60 {
         return Err(RfcError {
             code: -1,
@@ -1266,7 +1317,7 @@ fn validate_object_name(name: &str) -> Result<(), RfcError> {
 }
 
 /// 函数对象的组名解析：显式给出优先，否则经 RFC_FUNCTION_SEARCH 反解。
-async fn resolve_group_if_needed(
+pub(crate) async fn resolve_group_if_needed(
     pool: &SharedPool,
     obj_type: crate::objects::ObjectType,
     name: &str,

@@ -965,3 +965,171 @@ fn function_invoke_path_overrides_body_func_name() {
     let body: serde_json::Value = resp.json().unwrap();
     assert_eq!(body["func"], "RFC_PING");
 }
+
+// ========================================================================
+// MCP 服务器（POST /mcp，JSON-RPC over Streamable HTTP 无状态模式）
+// ========================================================================
+
+#[test]
+#[ignore]
+fn mcp_initialize_negotiates_protocol() {
+    let _s = start_server();
+    let resp = http_client()
+        .post(format!("{}/mcp", _s.base_url))
+        .json(&serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": { "protocolVersion": "2025-03-26", "capabilities": {}, "clientInfo": {"name": "test"} }
+        }))
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().unwrap();
+    assert_eq!(body["jsonrpc"], "2.0");
+    assert_eq!(body["id"], 1);
+    assert_eq!(body["result"]["protocolVersion"], "2025-03-26");
+    assert_eq!(body["result"]["serverInfo"]["name"], "sap-for-agents");
+    assert!(body["result"]["capabilities"]["tools"].is_object());
+}
+
+#[test]
+#[ignore]
+fn mcp_tools_list_returns_manifest() {
+    let _s = start_server();
+    let resp = http_client()
+        .post(format!("{}/mcp", _s.base_url))
+        .json(&serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}))
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().unwrap();
+    let tools = body["result"]["tools"].as_array().expect("tools 数组");
+    let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+    for must in ["search_functions", "get_function_interface", "invoke_rfc", "syntax_check"] {
+        assert!(names.contains(&must), "缺工具 {must}");
+    }
+}
+
+#[test]
+#[ignore]
+fn mcp_tools_call_invoke_roundtrip() {
+    let _s = start_server();
+    // initialize → initialized（通知 202）→ tools/call invoke_rfc 回显
+    let _ = http_client()
+        .post(format!("{}/mcp", _s.base_url))
+        .json(&serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": "2025-03-26", "capabilities": {}, "clientInfo": {"name": "t"}}
+        }))
+        .send()
+        .unwrap();
+    let resp = http_client()
+        .post(format!("{}/mcp", _s.base_url))
+        .json(&serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"}))
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 202, "通知应回 202");
+
+    let resp = http_client()
+        .post(format!("{}/mcp", _s.base_url))
+        .json(&serde_json::json!({
+            "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+            "params": { "name": "invoke_rfc", "arguments": {
+                "func_name": "STFC_CONNECTION",
+                "inputs": {"REQUTEXT": "via mcp"},
+                "string_outputs": {"ECHOTEXT": 135}
+            }}
+        }))
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().unwrap();
+    assert_eq!(body["result"]["isError"], false);
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    let payload: serde_json::Value = serde_json::from_str(text).unwrap();
+    assert_eq!(payload["scalars"]["ECHOTEXT"], "via mcp");
+}
+
+#[test]
+#[ignore]
+fn mcp_tools_call_metadata_and_errors() {
+    let _s = start_server();
+    // 元数据工具
+    let resp = http_client()
+        .post(format!("{}/mcp", _s.base_url))
+        .json(&serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": { "name": "search_functions", "arguments": {"pattern": "STFC_*", "max_results": 3} }
+        }))
+        .send()
+        .unwrap();
+    let body: serde_json::Value = resp.json().unwrap();
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    let payload: serde_json::Value = serde_json::from_str(text).unwrap();
+    assert!(payload["count"].as_u64().unwrap() >= 1);
+    // 工具级失败：isError=true 而非 JSON-RPC error
+    let resp = http_client()
+        .post(format!("{}/mcp", _s.base_url))
+        .json(&serde_json::json!({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": { "name": "get_function_interface", "arguments": {"name": "Z_NOT_EXIST_999"} }
+        }))
+        .send()
+        .unwrap();
+    let body: serde_json::Value = resp.json().unwrap();
+    assert_eq!(body["result"]["isError"], true, "工具失败应为 isError");
+    assert!(body.get("error").is_none(), "工具失败不是协议错误");
+    // 未知方法 → JSON-RPC -32601
+    let resp = http_client()
+        .post(format!("{}/mcp", _s.base_url))
+        .json(&serde_json::json!({"jsonrpc": "2.0", "id": 3, "method": "bogus/method"}))
+        .send()
+        .unwrap();
+    let body: serde_json::Value = resp.json().unwrap();
+    assert_eq!(body["error"]["code"], -32601);
+}
+
+#[test]
+#[ignore]
+fn where_used_returns_structure_even_without_index() {
+    let _s = start_server();
+    let resp = http_client()
+        .get(format!("{}/api/functions/BAPI_TRANSACTION_COMMIT/where-used", _s.base_url))
+        .send()
+        .unwrap();
+    // 有索引的系统返回真实使用者；无索引的 trial 返回空 + note——都是 200
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().unwrap();
+    assert_eq!(body["name"], "BAPI_TRANSACTION_COMMIT");
+    let usages = body["usages"].as_array().expect("usages 数组");
+    assert_eq!(body["count"].as_u64().unwrap(), usages.len() as u64);
+    if usages.is_empty() {
+        assert!(
+            body["note"].as_str().unwrap_or("").contains("index"),
+            "空结果应附索引说明 note"
+        );
+    } else {
+        // 有真实结果时每条有 type/object 字段
+        assert!(usages[0]["type"].is_string());
+        assert!(usages[0]["object"].is_string());
+    }
+}
+
+#[test]
+#[ignore]
+fn mcp_where_used_tool_available() {
+    let _s = start_server();
+    let resp = http_client()
+        .post(format!("{}/mcp", _s.base_url))
+        .json(&serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": { "name": "where_used", "arguments": {"name": "BAPI_TRANSACTION_COMMIT", "max": 50} }
+        }))
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().unwrap();
+    assert_eq!(body["result"]["isError"], false);
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    let payload: serde_json::Value = serde_json::from_str(text).unwrap();
+    assert!(payload["count"].is_u64());
+}

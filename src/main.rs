@@ -12,6 +12,7 @@ mod function;
 mod metadata;
 mod objects;
 mod openapi;
+mod mcp;
 mod pool;
 mod server;
 mod server_config;
@@ -83,6 +84,19 @@ async fn run_client() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
     tracing::info!(listen = cfg.listen_addr, "client 配置加载完成");
+
+    // macOS：SAP SDK 的 ICU 依赖是裸名引用，rpath 救不了——直跑二进制且未设
+    // DYLD_LIBRARY_PATH 时 SDK 会以晦涩的 255 退出。提前 dlopen 探测给友好指引。
+    #[cfg(target_os = "macos")]
+    if let Err(e) = probe_macos_icu() {
+        eprintln!();
+        eprintln!("❌ SAP SDK 的 ICU 库加载失败: {}", e);
+        eprintln!("   macOS 上 libsapnwrfc.dylib 以裸名引用 ICU（rpath 不生效）。两种解法：");
+        eprintln!("   1. 用启动脚本:  ./start.sh   (自动设置库路径)");
+        eprintln!("   2. 直跑二进制前设置:  export DYLD_LIBRARY_PATH=<项目>/nwrfcsdk/lib/darwin-aarch64");
+        eprintln!("   （详见 README §Quick Start）");
+        std::process::exit(255);
+    }
 
     let pool = RfcConnectionPool::with_max_size(
         cfg.conn_params,
@@ -211,4 +225,56 @@ fn print_config_guide(err: &str, dotenv_not_found: bool) {
         eprintln!("  完整字段说明见 README.md §3 配置。");
     }
     eprintln!();
+}
+
+/// macOS 启动期 ICU 探测：dlopen 依次尝试 SDK 目录与系统搜索路径。
+/// 任何一个能打开即通过（SDK 运行时会按同样顺序解析）。
+#[cfg(target_os = "macos")]
+fn probe_macos_icu() -> Result<(), String> {
+    let libs = ["libicuuc57.dylib", "libicudata57.dylib", "libicui18n57.dylib"]
+        .map(String::from);
+    // 与 build.rs 同款目录约定：nwrfcsdk/lib/darwin-<arch>
+    let arch = match std::env::var("SAP_SDK_DIR") {
+        Ok(dir) => format!("{}/lib/darwin-{}", dir, std::env::consts::ARCH),
+        Err(_) => format!("./nwrfcsdk/lib/darwin-{}", std::env::consts::ARCH),
+    };
+    for lib in &libs {
+        let direct = format!("{}/{}", arch, lib);
+        // 先试 SDK 目录，再试默认搜索（dlopen NULL 不需要，直接全名）
+        let tried: Vec<std::ffi::CString> = [direct.clone(), lib.clone()]
+            .iter()
+            .map(|p| std::ffi::CString::new(p.as_str()).unwrap())
+            .collect();
+        // RTLD_LAZY | RTLD_LOCAL（2 | 256，macOS 常量）；dlopen 绑定在 unsafe 内完成
+        let ok = tried.iter().any(|p| {
+            let h = libc_dlopen(p.as_ptr(), 0x02 | 0x100);
+            if !h.is_null() {
+                libc_dlclose(h);
+                true
+            } else {
+                false
+            }
+        });
+        if !ok {
+            return Err(format!("{} (tried: {:?})", lib, tried));
+        }
+    }
+    Ok(())
+}
+
+/// dlopen 极简绑定（仅启动探测用；不引 libc crate）
+#[cfg(target_os = "macos")]
+fn libc_dlopen(path: *const std::ffi::c_char, mode: std::ffi::c_int) -> *mut std::ffi::c_void {
+    extern "C" {
+        fn dlopen(path: *const std::ffi::c_char, mode: std::ffi::c_int) -> *mut std::ffi::c_void;
+    }
+    unsafe { dlopen(path, mode) }
+}
+
+#[cfg(target_os = "macos")]
+fn libc_dlclose(handle: *mut std::ffi::c_void) -> std::ffi::c_int {
+    extern "C" {
+        fn dlclose(handle: *mut std::ffi::c_void) -> std::ffi::c_int;
+    }
+    unsafe { dlclose(handle) }
 }
