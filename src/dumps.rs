@@ -148,21 +148,16 @@ fn dump_key_from(id_or_href: &str) -> String {
 }
 
 /// 元素限定名的本地部分（去掉命名空间前缀，如 `atom:entry` → `entry`）。
-pub(crate) fn xml_local_name_of(qname: &[u8]) -> &str {
-    let start = qname
-        .iter()
-        .position(|&b| b == b':')
-        .map(|i| i + 1)
-        .unwrap_or(0);
-    std::str::from_utf8(&qname[start..]).unwrap_or("")
+/// quick-xml ≥0.42 文本 API 统一为 `&str`（QName 即 str 包装）。
+pub(crate) fn xml_local_name_of(qname: &str) -> &str {
+    qname.split_once(':').map(|(_, local)| local).unwrap_or(qname)
 }
 
 /// XML 文本/属性值解码（UTF-8 宽松 + 实体反转义）。
-pub(crate) fn xml_decode_of(raw: &[u8]) -> String {
-    let lossy = String::from_utf8_lossy(raw).into_owned();
-    quick_xml::escape::unescape(&lossy)
+pub(crate) fn xml_decode_of(raw: &str) -> String {
+    quick_xml::escape::unescape(raw)
         .map(|c| c.into_owned())
-        .unwrap_or(lossy)
+        .unwrap_or_else(|_| raw.to_string())
 }
 
 /// 解析 Atom feed。仅依赖结构化字段（category/author/published），
@@ -199,7 +194,7 @@ pub fn parse_feed(xml: &str) -> Result<Vec<DumpEntry>, RfcError> {
         // (key, value) 属性对；命名空间声明跳过
         let mut out = Vec::new();
         for a in e.attributes().flatten() {
-            if !a.key.as_ref().starts_with(b"xmlns") {
+            if !a.key.as_ref().starts_with("xmlns") {
                 out.push((
                     xml_local_name_of(a.key.as_ref()).to_string(),
                     xml_decode_of(a.value.as_ref()),
@@ -271,6 +266,18 @@ pub fn parse_feed(xml: &str) -> Result<Vec<DumpEntry>, RfcError> {
             Ok(Event::Text(t)) => {
                 if !capturing.is_empty() {
                     text.push_str(&xml_decode_of(t.as_ref()));
+                }
+            }
+            // quick-xml ≥0.42：实体引用（&amp; 等）从文本中拆出为独立事件，
+            // 重组为 &...; 后走同一解码路径；未知实体解码失败时保持字面
+            //（与 0.36 整段解码的宽松回退行为一致）
+            Ok(Event::GeneralRef(r)) => {
+                if !capturing.is_empty() {
+                    let mut ent = String::with_capacity(r.as_ref().len() + 2);
+                    ent.push('&');
+                    ent.push_str(r.as_ref());
+                    ent.push(';');
+                    text.push_str(&xml_decode_of(&ent));
                 }
             }
             Ok(Event::End(e)) => {
