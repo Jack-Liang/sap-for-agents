@@ -32,10 +32,22 @@ struct AdtConfig {
     base_url: String,
     /// 预组装的 `Basic xxx` Authorization 头
     basic: String,
+    /// 登录用户（对象创建 XML 的 adtcore:responsible 用；大写）
+    user: String,
     client: reqwest::Client,
 }
 
 static ADT: OnceLock<AdtConfig> = OnceLock::new();
+
+/// ADT 登录用户名（对象创建 XML 的 responsible 字段）；未启用时 None。
+pub(crate) fn adt_user() -> Option<String> {
+    ADT.get().map(|c| c.user.clone())
+}
+
+/// ADT 代理是否启用（`SAP_ADT_BASE_URL` 非空）。供 `/api/version` 能力自描述。
+pub(crate) fn is_enabled() -> bool {
+    ADT.get().is_some()
+}
 
 /// CSRF token 缓存：写操作共用一个会话 token，过期或 403 后刷新
 struct CsrfToken {
@@ -65,6 +77,7 @@ pub fn init(base_url: Option<String>, user: &str, passwd: &str, timeout: Duratio
         let _ = ADT.set(AdtConfig {
             base_url: base,
             basic,
+            user: user.trim().to_uppercase(),
             client,
         });
     } else {
@@ -133,7 +146,10 @@ fn validate_raw_path(raw: &str) -> Result<&str, RfcError> {
 
 /// 取缓存的 CSRF token（未失效直接用）。token 从 `url` 自身签发：
 /// 对该 URL 发 GET + Fetch 头，ICF 对已认证请求都会返回 token（含 404 资源）。
-async fn csrf_token(url: &str, force_refresh: bool) -> Result<Option<(String, Option<String>)>, RfcError> {
+async fn csrf_token(
+    url: &str,
+    force_refresh: bool,
+) -> Result<Option<(String, Option<String>)>, RfcError> {
     let cfg = ADT.get().expect("init 已确保配置存在");
     let cache = CSRF.get_or_init(|| Mutex::new(None));
     if !force_refresh {
@@ -210,7 +226,10 @@ fn adt_unreachable(e: reqwest::Error) -> RfcError {
 
 /// 是否为写方法（ADT 代理的 CSRF 处理与只读模式的写拦截共用）。
 pub(crate) fn is_write_method(m: &Method) -> bool {
-    matches!(*m, Method::POST | Method::PUT | Method::DELETE | Method::PATCH)
+    matches!(
+        *m,
+        Method::POST | Method::PUT | Method::DELETE | Method::PATCH
+    )
 }
 
 /// 内部 GET 通道：供网关自身的结构化端点（`/api/dumps/**`）复用 ADT 配置、
@@ -474,10 +493,7 @@ pub(crate) async fn adt_request_raw(
 
     // 403 通常是 token 过期：刷新后重试一次（仅共享缓存的写方法；
     // 编排专用 token 下 403 是业务错误——锁冲突等——必须原样上抛）
-    if resp.status() == StatusCode::FORBIDDEN
-        && write
-        && csrf_token_override.is_none()
-    {
+    if resp.status() == StatusCode::FORBIDDEN && write && csrf_token_override.is_none() {
         tracing::debug!("ADT 内部写请求 403，刷新 CSRF token 后重试");
         if let Ok(Some(new)) = csrf_token(&url, true).await {
             csrf = Some(new);
@@ -509,7 +525,8 @@ pub(crate) async fn adt_request_raw(
         metrics::counter!("adt_calls_total", "method" => method.as_str().to_owned(), "result" => "err").increment(1);
         adt_unreachable(e)
     })?;
-    metrics::counter!("adt_calls_total", "method" => method.as_str().to_owned(), "result" => "ok").increment(1);
+    metrics::counter!("adt_calls_total", "method" => method.as_str().to_owned(), "result" => "ok")
+        .increment(1);
     Ok(AdtRawResponse {
         status,
         etag,
@@ -623,10 +640,7 @@ pub async fn adt_proxy(
     for h in ["content-type", "etag", "last-modified"] {
         if let Some(v) = resp.headers().get(h) {
             // 已知安全的少量透传头，构建失败视为网关内部错误
-            builder = builder.header(
-                HeaderName::from_static(h),
-                v.clone(),
-            );
+            builder = builder.header(HeaderName::from_static(h), v.clone());
         }
     }
     let body = resp.bytes().await.map_err(|e| {

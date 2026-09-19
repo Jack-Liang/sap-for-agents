@@ -175,6 +175,40 @@ impl RfcConnection {
         f.invoke()?;
         Ok(())
     }
+
+    /// 读取对端 SAP 系统信息（sysid / release / host / OS）。
+    /// 调用标准远程函数 `RFC_SYSTEM_INFO`（自 R/3 起全系统可用），读其
+    /// EXPORT 结构 `RFCSI_EXPORT`（DDIC 结构 RFCSI）。供 `/api/version`
+    /// 的 SAP 块使用——结果在网关生命周期内不变，调用方负责缓存。
+    pub fn system_info(&self) -> Result<RemoteSystemInfo, RfcError> {
+        let mut f = self.get_function("RFC_SYSTEM_INFO")?;
+        f.invoke()?;
+        let rsci = f.get_structure("RFCSI_EXPORT")?;
+        Ok(RemoteSystemInfo {
+            sysid: rsci.get_chars("RFCSYSID", 8)?,
+            release: rsci.get_chars("RFCSAPRL", 4)?,
+            host: rsci.get_chars("RFCHOST", 32)?,
+            os: rsci.get_chars("RFCOPSYS", 10)?,
+            destination: rsci.get_chars("RFCDEST", 32)?,
+        })
+    }
+}
+
+/// 对端 SAP 系统静态信息（RFCSI 结构的有用子集）。
+/// 字段长度为 RFCSI 的 DDIC 长度，仅作初始缓冲；更长值会自适应重读。
+#[derive(Debug, Clone)]
+pub struct RemoteSystemInfo {
+    /// 系统 ID（如 A4H）
+    pub sysid: String,
+    /// SAP Release（如 "753" / "816"；注意只反映 Basis/S4 内核版本，
+    /// 不直接区分 ECC 与 S/4HANA——判定 S/4 可查 CVERS 表的 S4CORE 组件）
+    pub release: String,
+    /// 应用服务器主机名
+    pub host: String,
+    /// 操作系统（如 "Linux"）
+    pub os: String,
+    /// RFC 目标名（如 "vhcala4hci_A4H_00"）
+    pub destination: String,
 }
 
 /// 单个参数的元数据（Rust 化后的 RFC_PARAMETER_DESC 子集）

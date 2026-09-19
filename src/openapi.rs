@@ -162,6 +162,28 @@ const SPEC_JSON: &str = r##"{
         }
       }
     },
+    "/api/version": {
+      "get": {
+        "tags": [
+          "ops"
+        ],
+        "summary": "Gateway version + capability self-description (public, does not fail on SAP outage)",
+        "description": "Gateway version/git commit, capability switches (auth, read_only, adt, rate_limit_rps) and SAP system info (sysid, release, host, os, client). Call this first in a new session instead of probing 401/403/503/429 by trial. SAP info is fetched lazily on first call and cached for the process lifetime; when SAP is unreachable, `sap` is null and `sap_error` carries the reason (still HTTP 200).",
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "Version and capabilities (sap block may be null)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/VersionInfo"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/rfc": {
       "post": {
         "tags": [
@@ -807,12 +829,12 @@ const SPEC_JSON: &str = r##"{
       }
     },
     "/api/objects/{type}/{name}/source": {
-      "put": {
+      "get": {
         "tags": [
           "objects"
         ],
-        "summary": "Write an object's full source (lock → put → unlock → activate, orchestrated)",
-        "description": "type ∈ prog|class|func; name may contain / (namespaced objects, e.g. /UI5/CL_X — OpenAPI cannot express multi-segment path params). Activation failure is a logical result (HTTP 200 + activated.messages), not a transport error. For func objects the function group is auto-resolved when not given.",
+        "summary": "Read an object's source (ADT channel, original casing)",
+        "description": "type ∈ prog|incl|class|intf|func|fugr|cds (package has no source). For func the group is auto-resolved when not given. Returns lines[] plus the joined source string.",
         "parameters": [
           {
             "name": "type",
@@ -822,8 +844,69 @@ const SPEC_JSON: &str = r##"{
               "type": "string",
               "enum": [
                 "prog",
+                "incl",
                 "class",
-                "func"
+                "intf",
+                "func",
+                "fugr",
+                "cds"
+              ]
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Source lines",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "type": { "type": "string" },
+                    "name": { "type": "string" },
+                    "lines": { "type": "array", "items": { "type": "string" } },
+                    "source": { "type": "string" },
+                    "source_via": { "type": "string", "enum": ["adt"] }
+                  }
+                }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/Error" },
+          "401": { "$ref": "#/components/responses/Error" },
+          "404": { "$ref": "#/components/responses/Error" },
+          "502": { "$ref": "#/components/responses/Error" }
+        }
+      },
+      "put": {
+        "tags": [
+          "objects"
+        ],
+        "summary": "Write an object's full source (lock → put → unlock → activate, orchestrated)",
+        "description": "type ∈ prog|incl|class|intf|func|fugr|cds; name may contain / (namespaced objects, e.g. /UI5/CL_X — OpenAPI cannot express multi-segment path params). Activation failure is a logical result (HTTP 200 + activated.messages), not a transport error. For func objects the function group is auto-resolved when not given; FM parameter signatures are part of the source (inline in the FUNCTION statement; classic *\" comment blocks are converted automatically); rfc_enabled:true additionally marks the module remote-enabled.",
+        "parameters": [
+          {
+            "name": "type",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "prog",
+                "incl",
+                "class",
+                "intf",
+                "func",
+                "fugr",
+                "cds"
               ]
             }
           },
@@ -888,8 +971,12 @@ const SPEC_JSON: &str = r##"{
               "type": "string",
               "enum": [
                 "prog",
+                "incl",
                 "class",
-                "func"
+                "intf",
+                "func",
+                "fugr",
+                "cds"
               ]
             }
           },
@@ -954,8 +1041,12 @@ const SPEC_JSON: &str = r##"{
               "type": "string",
               "enum": [
                 "prog",
+                "incl",
                 "class",
-                "func"
+                "intf",
+                "func",
+                "fugr",
+                "cds"
               ]
             }
           },
@@ -1035,6 +1126,182 @@ const SPEC_JSON: &str = r##"{
         }
       }
     },
+    "/api/objects/{type}/{name}/create": {
+      "post": {
+        "tags": [
+          "objects"
+        ],
+        "summary": "Create an object shell (ADT-first; prog/func fall back to RFC)",
+        "description": "type ∈ prog|incl|class|intf|func|fugr|cds|package. Creates the object via the standard ADT objectcreation XML (Eclipse/vsp/abapfs contract); prog/func fall back to the RFC RPY insert path when ADT fails. func auto-creates its function group when missing. package: devclass = parent package, software_component optional (candidates ZLOCAL→LOCAL→HOME). Optional `source` writes+activates the first version in one call; rfc_enabled marks a func remote-enabled.",
+        "parameters": [
+          {
+            "name": "type",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "prog",
+                "incl",
+                "class",
+                "intf",
+                "func",
+                "fugr",
+                "cds",
+                "package"
+              ]
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "description"
+                ],
+                "properties": {
+                  "description": {
+                    "type": "string",
+                    "description": "Object title / short text (required by SAP)"
+                  },
+                  "devclass": {
+                    "type": "string",
+                    "description": "Package (default $TMP); for package type: parent package"
+                  },
+                  "transport": {
+                    "type": "string"
+                  },
+                  "software_component": {
+                    "type": "string",
+                    "description": "package only: software component"
+                  },
+                  "source": {
+                    "type": "string",
+                    "description": "Optional first source (written + activated in one call)"
+                  },
+                  "activate": {
+                    "type": "boolean",
+                    "default": true
+                  },
+                  "rfc_enabled": {
+                    "type": "boolean",
+                    "description": "func only: mark remote-enabled after the first write"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "created=true (+write when source given)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "created": { "type": "boolean" },
+                    "type": { "type": "string" },
+                    "name": { "type": "string" },
+                    "write": { "$ref": "#/components/schemas/WriteOutcome" }
+                  }
+                }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/Error" },
+          "401": { "$ref": "#/components/responses/Error" },
+          "409": { "$ref": "#/components/responses/Error" },
+          "502": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/api/objects/{type}/{name}": {
+      "delete": {
+        "tags": [
+          "objects"
+        ],
+        "summary": "Delete an object (lock → DELETE → done)",
+        "description": "type ∈ prog|incl|class|intf|func|fugr|cds|package. Deleting a fugr removes its function modules too. Query params: group (func only), transport. Irreversible.",
+        "parameters": [
+          {
+            "name": "type",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "prog",
+                "incl",
+                "class",
+                "intf",
+                "func",
+                "fugr",
+                "cds",
+                "package"
+              ]
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "group",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Function group (func only; auto-resolved when omitted)"
+          },
+          {
+            "name": "transport",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "deleted=true",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "type": { "type": "string" },
+                    "name": { "type": "string" },
+                    "deleted": { "type": "boolean" }
+                  }
+                }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/Error" },
+          "401": { "$ref": "#/components/responses/Error" },
+          "409": { "$ref": "#/components/responses/Error" },
+          "502": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
     "/api/adt/{path}": {
       "get": {
         "tags": [
@@ -1084,6 +1351,88 @@ const SPEC_JSON: &str = r##"{
           "status": {
             "type": "string",
             "example": "ok"
+          },
+          "version": {
+            "type": "string",
+            "description": "Gateway version (same as /api/version, convenience for pollers)"
+          }
+        }
+      },
+      "VersionInfo": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "example": "sap-for-agents"
+          },
+          "version": {
+            "type": "string",
+            "example": "0.10.0"
+          },
+          "commit": {
+            "type": "string",
+            "description": "Git short commit the binary was built from; '-dirty' suffix when the working tree had uncommitted changes, 'unknown' when built without git",
+            "example": "0fa6d6b"
+          },
+          "capabilities": {
+            "type": "object",
+            "description": "Deployment switches that change agent behavior",
+            "properties": {
+              "auth": {
+                "type": "boolean",
+                "description": "true = SAP_API_KEY is set; /api/* requires Bearer token (this endpoint excepted)"
+              },
+              "read_only": {
+                "type": "boolean",
+                "description": "true = SAP_READ_ONLY; gateway write endpoints return 403 READ_ONLY"
+              },
+              "adt": {
+                "type": "boolean",
+                "description": "true = ADT proxy (/api/adt/**, /api/dumps*) enabled"
+              },
+              "rate_limit_rps": {
+                "type": "integer",
+                "nullable": true,
+                "description": "Per-IP requests/second cap; null = unlimited"
+              }
+            }
+          },
+          "sap": {
+            "nullable": true,
+            "type": "object",
+            "description": "Target SAP system info, cached from the first successful fetch; null when SAP is currently unreachable",
+            "properties": {
+              "sysid": {
+                "type": "string",
+                "example": "A4H"
+              },
+              "release": {
+                "type": "string",
+                "description": "SAP release (RFCSI SAPRL, e.g. 753/816). Reflects the kernel/Basis level only — to distinguish ECC vs S/4HANA, check the CVERS table for the S4CORE component (POST /api/table/read)",
+                "example": "816"
+              },
+              "host": {
+                "type": "string",
+                "description": "Application server hostname"
+              },
+              "os": {
+                "type": "string",
+                "example": "Linux"
+              },
+              "destination": {
+                "type": "string",
+                "description": "RFC destination name (e.g. vhcala4hci_A4H_00)"
+              },
+              "client": {
+                "type": "string",
+                "description": "Login client (SAP_CLIENT config)",
+                "example": "001"
+              }
+            }
+          },
+          "sap_error": {
+            "type": "string",
+            "description": "Present when sap is null: why the SAP info fetch failed (retryable on next call)"
           }
         }
       },
@@ -1964,6 +2313,11 @@ const SPEC_JSON: &str = r##"{
             "type": "string",
             "nullable": true,
             "description": "Function group (func objects only); omitted = auto-resolved via RFC_FUNCTION_SEARCH"
+          },
+          "rfc_enabled": {
+            "type": "boolean",
+            "default": false,
+            "description": "func only: mark the function module remote-enabled (processingType=rfc) under the same lock"
           }
         }
       },
@@ -1993,6 +2347,11 @@ const SPEC_JSON: &str = r##"{
             "type": "string",
             "nullable": true,
             "description": "Function group hint (func objects only)"
+          },
+          "rfc_enabled": {
+            "type": "boolean",
+            "default": false,
+            "description": "func only: mark remote-enabled after the write"
           }
         }
       },
@@ -2141,7 +2500,9 @@ const SPEC_JSON: &str = r##"{
 "##;
 
 /// GET /openapi.json —— 返回 OpenAPI 3.0.3 规范（免鉴权，公开页）。
-pub async fn openapi_handler(req: axum::http::Request<axum::body::Body>) -> axum::response::Response {
+pub async fn openapi_handler(
+    req: axum::http::Request<axum::body::Body>,
+) -> axum::response::Response {
     // 与 index_handler 同策略：从 Host 头推导访问地址（servers 字段）
     let host = req
         .headers()
@@ -2176,6 +2537,11 @@ pub fn build_spec(base_url: &str, auth_enabled: bool) -> Value {
                 if !path.starts_with("/api/") {
                     continue;
                 }
+                // /api/version 刻意公开：Agent 需要在拿到 token 之前知道
+                // capabilities.auth（要不要 token）；SPEC_JSON 里已声明 security: []
+                if path == "/api/version" {
+                    continue;
+                }
                 if let Some(ops) = item.as_object_mut() {
                     for (_method, op) in ops.iter_mut() {
                         op["security"] = json!([{ "bearerAuth": [] }]);
@@ -2205,9 +2571,7 @@ fn schema_type_for(type_name: &str) -> &'static str {
 }
 
 /// 字段列表 → (properties, required)。required 只收 SAP 标记为必填的输入字段。
-fn field_defs_to_properties(
-    fields: &[FieldDef],
-) -> (serde_json::Map<String, Value>, Vec<String>) {
+fn field_defs_to_properties(fields: &[FieldDef]) -> (serde_json::Map<String, Value>, Vec<String>) {
     let mut props = serde_json::Map::new();
     let mut required = Vec::new();
     for f in fields {
@@ -2267,7 +2631,9 @@ fn param_schema(p: &FunctionParam) -> Value {
 /// enum/示例形式提示。agent 拿到 operation 即等于拿到该 BAPI 的调用说明。
 pub fn function_operation(name: &str, params: &[FunctionParam]) -> (String, Value) {
     let is_input = |p: &FunctionParam| p.direction == "IMPORT" || p.direction == "CHANGING";
-    let is_output = |p: &FunctionParam| p.direction == "EXPORT" || p.direction == "CHANGING" || p.direction == "TABLES";
+    let is_output = |p: &FunctionParam| {
+        p.direction == "EXPORT" || p.direction == "CHANGING" || p.direction == "TABLES"
+    };
 
     // 输入分组
     let mut inputs_props = serde_json::Map::new();
@@ -2394,8 +2760,8 @@ pub fn function_operation(name: &str, params: &[FunctionParam]) -> (String, Valu
             "summary": format!("Invoke {name} (typed; func name comes from the path)"),
             "description": format!(
                 "Typed operation generated from the DDIC interface metadata of {name}. \
-The body is structurally identical to POST /api/rfc (func_name is injected from the path; \
-a func_name key in the body is ignored). Inspect GET /api/functions/{name} for the full interface."
+    The body is structurally identical to POST /api/rfc (func_name is injected from the path; \
+    a func_name key in the body is ignored). Inspect GET /api/functions/{name} for the full interface."
             ),
             "requestBody": {
                 "required": true,
@@ -2430,7 +2796,7 @@ pub fn function_operation_failed(name: &str, err_msg: &str) -> (String, Value) {
             "operationId": format!("call_{name}"),
             "summary": format!("Invoke {name} (interface metadata unavailable)"),
             "description": format!("Interface metadata could not be read: {err_msg}. \
-The operation itself still works — inspect GET /api/functions/{name} and call it via POST /api/rfc."),
+    The operation itself still works — inspect GET /api/functions/{name} and call it via POST /api/rfc."),
             "responses": {
                 "200": { "description": "Invocation result", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/InvokeResponse" } } } },
                 "default": { "$ref": "#/components/responses/Error" }
@@ -2457,6 +2823,7 @@ mod tests {
             "/ready",
             "/metrics",
             "/agents.md",
+            "/api/version",
             "/api/rfc",
             "/api/functions/search",
             "/api/functions/{name}",
@@ -2472,6 +2839,8 @@ mod tests {
             "/api/objects/{type}/{name}/source",
             "/api/objects/{type}/{name}/replace",
             "/api/objects/{type}/{name}/syntax",
+            "/api/objects/{type}/{name}/create",
+            "/api/objects/{type}/{name}",
             "/api/adt/{path}",
         ] {
             assert!(paths.contains_key(p), "缺少端点 {p}");
@@ -2479,13 +2848,34 @@ mod tests {
         // 组件 schema 齐全
         let schemas = spec["components"]["schemas"].as_object().unwrap();
         for s in [
-            "ScalarValue", "TypedScalar", "MaxLen", "FieldSpec", "FieldDef",
-            "InvokeRequest", "InvokeResponse", "SearchRequest", "SearchResponse",
-            "FunctionInterface", "FunctionParam", "FunctionDocResponse", "SourceResponse",
-            "DdicTypeResponse", "FieldSemanticsResponse", "TableReadRequest", "TableReadResponse",
-            "DumpEntry", "DumpGroup", "DumpFrame", "DumpDetail",
-            "ObjectWriteBody", "ObjectReplaceBody", "ActivationOutcome", "WriteOutcome",
-            "SyntaxIssue", "ErrorBody",
+            "ScalarValue",
+            "TypedScalar",
+            "MaxLen",
+            "VersionInfo",
+            "FieldSpec",
+            "FieldDef",
+            "InvokeRequest",
+            "InvokeResponse",
+            "SearchRequest",
+            "SearchResponse",
+            "FunctionInterface",
+            "FunctionParam",
+            "FunctionDocResponse",
+            "SourceResponse",
+            "DdicTypeResponse",
+            "FieldSemanticsResponse",
+            "TableReadRequest",
+            "TableReadResponse",
+            "DumpEntry",
+            "DumpGroup",
+            "DumpFrame",
+            "DumpDetail",
+            "ObjectWriteBody",
+            "ObjectReplaceBody",
+            "ActivationOutcome",
+            "WriteOutcome",
+            "SyntaxIssue",
+            "ErrorBody",
         ] {
             assert!(schemas.contains_key(s), "缺少 schema {s}");
         }
@@ -2520,6 +2910,9 @@ mod tests {
         assert!(spec["paths"]["/health"]["get"]["security"].is_null());
         assert!(spec["paths"]["/agents.md"]["get"]["security"].is_null());
         assert!(spec["paths"]["/metrics"]["get"]["security"].is_null());
+        // /api/version 虽在 /api/* 下，但刻意公开（Agent 需在拿到 token 前
+        // 知道 capabilities.auth）——显式 security: [] 而非缺省
+        assert_eq!(spec["paths"]["/api/version"]["get"]["security"], json!([]));
     }
 
     #[test]
@@ -2535,15 +2928,18 @@ mod tests {
                 .chars()
                 .take_while(|c| *c != '"' && *c != '\\')
                 .collect();
-            assert!(
-                schemas.contains_key(&name),
-                "引用了不存在的 schema: {name}"
-            );
+            assert!(schemas.contains_key(&name), "引用了不存在的 schema: {name}");
         }
     }
 
     /// 构造测试用 FunctionParam（含嵌套结构/表字段）
-    fn fp(name: &str, type_name: &'static str, direction: &'static str, optional: bool, fields: Option<Vec<FieldDef>>) -> FunctionParam {
+    fn fp(
+        name: &str,
+        type_name: &'static str,
+        direction: &'static str,
+        optional: bool,
+        fields: Option<Vec<FieldDef>>,
+    ) -> FunctionParam {
         FunctionParam {
             name: name.into(),
             type_name,
@@ -2569,13 +2965,15 @@ mod tests {
         let post = &op["post"];
         assert_eq!(post["operationId"], "call_STFC_CONNECTION");
         // 输入标量：必填 REQUTEXT、可选 MAX_ROW（整数类型）
-        let inputs = &post["requestBody"]["content"]["application/json"]["schema"]["properties"]["inputs"];
+        let inputs =
+            &post["requestBody"]["content"]["application/json"]["schema"]["properties"]["inputs"];
         assert_eq!(inputs["properties"]["REQUTEXT"]["type"], "string");
         assert_eq!(inputs["properties"]["REQUTEXT"]["maxLength"], 255);
         assert_eq!(inputs["properties"]["MAX_ROW"]["type"], "integer");
         assert_eq!(inputs["required"][0], "REQUTEXT");
         // 输出标量进 auto_outputs enum
-        let auto = &post["requestBody"]["content"]["application/json"]["schema"]["properties"]["auto_outputs"];
+        let auto = &post["requestBody"]["content"]["application/json"]["schema"]["properties"]
+            ["auto_outputs"];
         assert_eq!(auto["items"]["enum"][0], "ECHOTEXT");
         // func_name 不出现在请求体（由路径注入）
         let text = post.to_string();
@@ -2606,8 +3004,11 @@ mod tests {
         assert!(text.contains("table_outputs"));
         assert!(text.contains("read_return"));
         // TABLE 行字段展开为数组元素对象
-        assert!(op["post"]["requestBody"]["content"]["application/json"]["schema"]["properties"]
-            ["table_outputs"]["example"]["USERLIST"][0]["name"] == "<field>");
+        assert!(
+            op["post"]["requestBody"]["content"]["application/json"]["schema"]["properties"]
+                ["table_outputs"]["example"]["USERLIST"][0]["name"]
+                == "<field>"
+        );
     }
 
     #[test]

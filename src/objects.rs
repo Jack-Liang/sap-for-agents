@@ -83,39 +83,154 @@ const STATEFUL: &[(&str, &str)] = &[("X-sap-adt-sessiontype", "stateful")];
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ObjectType {
     Program,
+    Include,
     Class,
+    Interface,
     Function,
+    FunctionGroup,
+    CdsView,
+    Package,
 }
 
 impl ObjectType {
-    /// 路径段里的类型别名（prog/program、class/clas、func/function/fugr）。
+    /// 路径段里的类型别名（vsp/abapfs 的类型注册表口径）。
+    /// 注意：fugr 归函数组（FUGR/F），func 才是函数模块（FUGR/FF）。
     pub fn parse(s: &str) -> Option<Self> {
         match s.to_ascii_lowercase().as_str() {
             "prog" | "program" | "report" => Some(Self::Program),
+            "incl" | "include" => Some(Self::Include),
             "class" | "clas" => Some(Self::Class),
-            "func" | "function" | "fugr" => Some(Self::Function),
+            "intf" | "interface" => Some(Self::Interface),
+            "func" | "function" | "fm" => Some(Self::Function),
+            "fugr" | "fgroup" | "group" => Some(Self::FunctionGroup),
+            "cds" | "ddls" => Some(Self::CdsView),
+            "package" | "pkg" | "devclass" => Some(Self::Package),
             _ => None,
         }
     }
 
-    /// 对象基础资源（不含 /source/main 后缀，锁/解锁用这个）。
+    /// API 使用的规范类型名（响应 `type` 字段 / MCP 枚举）。
+    pub fn api_name(&self) -> &'static str {
+        match self {
+            Self::Program => "prog",
+            Self::Include => "incl",
+            Self::Class => "class",
+            Self::Interface => "intf",
+            Self::Function => "func",
+            Self::FunctionGroup => "fugr",
+            Self::CdsView => "cds",
+            Self::Package => "package",
+        }
+    }
+
+    /// ADT 类型 ID（adtcore:type）。
+    fn adt_type_id(&self) -> &'static str {
+        match self {
+            Self::Program => "PROG/P",
+            Self::Include => "PROG/I",
+            Self::Class => "CLAS/OC",
+            Self::Interface => "INTF/OI",
+            Self::Function => "FUGR/FF",
+            Self::FunctionGroup => "FUGR/F",
+            Self::CdsView => "DDLS/DF",
+            Self::Package => "DEVC/K",
+        }
+    }
+
+    /// 是否有源码资源（package 无源码，只有元数据）。
+    pub fn has_source(&self) -> bool {
+        !matches!(self, Self::Package)
+    }
+
+    /// 是否需要函数组（仅函数模块：URL 嵌在组下）。
+    pub fn needs_group(&self) -> bool {
+        matches!(self, Self::Function)
+    }
+
+    /// URL 段大小写：CDS 家族用小写（vsp/abapfs 双实证），其余大写。
+    fn url_name(&self, name: &str) -> String {
+        let n = name.trim();
+        let cased: String = if matches!(self, Self::CdsView) {
+            n.to_lowercase()
+        } else {
+            n.to_uppercase()
+        };
+        encode_path_segment(&cased)
+    }
+
+    /// 对象基础资源（不含 /source/main 后缀，锁/解锁/删除用这个）。
     /// `group` 仅 Function 需要（调用方已反解）。
     pub fn base_rel(&self, name: &str, group: &str) -> String {
-        let name = encode_path_segment(&name.trim().to_uppercase());
         match self {
-            Self::Program => format!("programs/programs/{}", name),
-            Self::Class => format!("oo/classes/{}", name),
+            Self::Program => format!("programs/programs/{}", self.url_name(name)),
+            Self::Include => format!("programs/includes/{}", self.url_name(name)),
+            Self::Class => format!("oo/classes/{}", self.url_name(name)),
+            Self::Interface => format!("oo/interfaces/{}", self.url_name(name)),
             Self::Function => format!(
                 "functions/groups/{}/fmodules/{}",
                 encode_path_segment(&group.trim().to_uppercase()),
-                name
+                self.url_name(name)
             ),
+            Self::FunctionGroup => format!("functions/groups/{}", self.url_name(name)),
+            Self::CdsView => format!("ddic/ddl/sources/{}", self.url_name(name)),
+            Self::Package => format!("packages/{}", self.url_name(name)),
         }
     }
 
     /// 源码资源（写/读/语法检查的 artifact 地址）。
     pub fn source_rel(&self, name: &str, group: &str) -> String {
         format!("{}/source/main", self.base_rel(name, group))
+    }
+
+    /// 创建集合资源（POST 目标）+ XML 根元素与命名空间。
+    /// Function 的父级是函数组（containerRef），其余是包（packageRef）。
+    fn creation(&self, group: &str) -> (String, &'static str, &'static str) {
+        match self {
+            Self::Program => (
+                "programs/programs".into(),
+                "program:abapProgram",
+                "http://www.sap.com/adt/programs/programs",
+            ),
+            Self::Include => (
+                "programs/includes".into(),
+                "include:abapInclude",
+                "http://www.sap.com/adt/programs/includes",
+            ),
+            Self::Class => (
+                "oo/classes".into(),
+                "class:abapClass",
+                "http://www.sap.com/adt/oo/classes",
+            ),
+            Self::Interface => (
+                "oo/interfaces".into(),
+                "intf:abapInterface",
+                "http://www.sap.com/adt/oo/interfaces",
+            ),
+            Self::Function => (
+                format!(
+                    "functions/groups/{}/fmodules",
+                    encode_path_segment(&group.trim().to_uppercase())
+                ),
+                "fmodule:abapFunctionModule",
+                "http://www.sap.com/adt/functions/fmodules",
+            ),
+            Self::FunctionGroup => (
+                "functions/groups".into(),
+                "group:abapFunctionGroup",
+                "http://www.sap.com/adt/functions/groups",
+            ),
+            Self::CdsView => (
+                "ddic/ddl/sources".into(),
+                "ddl:ddlSource",
+                "http://www.sap.com/adt/ddic/ddlsources",
+            ),
+            // Package 走专用富 payload（见 create_package_body），不用通用模板
+            Self::Package => (
+                "packages".into(),
+                "pack:package",
+                "http://www.sap.com/adt/packages",
+            ),
+        }
     }
 }
 
@@ -232,10 +347,7 @@ fn uri_fragment_line(uri: &str) -> u32 {
         return 0;
     };
     let rest = &uri[i + "#start=".len()..];
-    let digits: String = rest
-        .chars()
-        .take_while(|c| c.is_ascii_digit())
-        .collect();
+    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
     digits.parse().unwrap_or(0)
 }
 
@@ -503,15 +615,19 @@ fn parse_activation_result(body: &str) -> ActivationOutcome {
         });
     }
     // 未激活对象：object > ref 的 uri
-    for r in elems.iter().filter(|e| e.name == "ref" && e.parent_is("object")) {
+    for r in elems
+        .iter()
+        .filter(|e| e.name == "ref" && e.parent_is("object"))
+    {
         if let Some(uri) = r.attr("uri") {
             out.inactive.push(uri.to_string());
         }
     }
 
-    let has_error = out.messages.iter().any(|m| {
-        m.severity.contains('E') || m.severity.contains('A') || m.severity.contains('X')
-    });
+    let has_error = out
+        .messages
+        .iter()
+        .any(|m| m.severity.contains('E') || m.severity.contains('A') || m.severity.contains('X'));
     out.success = out.activation_executed && !has_error;
 
     if !out.success {
@@ -542,7 +658,8 @@ fn parse_activation_result(body: &str) -> ActivationOutcome {
             })
             .collect();
         if out.problems.is_empty() {
-            out.problems.push("激活被拒绝且 SAP 未说明原因；对象仍处于未激活状态".into());
+            out.problems
+                .push("激活被拒绝且 SAP 未说明原因；对象仍处于未激活状态".into());
         }
     }
     out
@@ -586,7 +703,9 @@ async fn activate_object(base: &str, name: &str) -> Result<ActivationOutcome, Rf
             key: "ADT_ACTIVATE_FAILED".into(),
         });
     }
-    Ok(parse_activation_result(&String::from_utf8_lossy(&resp.body)))
+    Ok(parse_activation_result(&String::from_utf8_lossy(
+        &resp.body,
+    )))
 }
 
 // ========================================================================
@@ -679,6 +798,9 @@ pub struct WriteOutcome {
     pub written: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub transport_used: Option<String>,
+    /// 是否已把函数模块设为 remote-enabled（rfc_enabled:true 时出现）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rfc_enabled: Option<bool>,
     pub activated: Option<ActivationOutcome>,
     /// 编排过程中的非致命警告（如解锁失败——锁会随会话过期，但应可见）
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -694,15 +816,256 @@ pub struct WriteOutcome {
 pub struct CreateSpec {
     /// 对象短描述（title）——SAP 必填
     pub description: String,
-    /// 开发包（默认 $TMP；生产包需配合 transport）
+    /// 开发包（默认 $TMP；生产包需配合 transport）。Package 类型时表示父包（superPackage）
     pub devclass: String,
     /// 传输请求号（可选）
     pub transport: Option<String>,
+    /// 仅 Package：软件组件（缺省按 ZLOCAL→LOCAL→HOME 逐个试）
+    pub software_component: Option<String>,
 }
 
-/// 创建对象壳。成功后对象存在（可能为空源码），随后的 PUT/replace 走既有
-/// 写入编排。prog/func 走 RPY insert（实测可用、无 schema 猜谜）；class 走
-/// ADT 标准创建（POST oo/classes，v5 schema——Eclipse 同款契约）。
+/// ADT 创建是否「已存在」类错误（唯一不回退 RFC 的 4xx：重试也无意义）。
+fn is_already_exists(msg: &str) -> bool {
+    msg.contains("already exist")
+        || msg.contains("already exists")
+        || msg.contains("does already exist")
+}
+
+/// 通用创建 body（vsp/abapfs 同款契约）：adtcore 属性 + packageRef / containerRef。
+/// `group` 仅 Function 用（containerRef 指向所属函数组）。
+fn create_body_simple(
+    obj_type: ObjectType,
+    name: &str,
+    group: &str,
+    spec: &CreateSpec,
+    responsible: Option<&str>,
+) -> String {
+    let (_, root, ns) = obj_type.creation(group);
+    // 根元素名带类型专属前缀（group:/class:/fmodule:…），命名空间声明必须用同一前缀
+    let prefix = root.split(':').next().unwrap_or("adtcore");
+    let resp = responsible
+        .map(|u| format!(" adtcore:responsible=\"{}\"", xml_attr_escape(u)))
+        .unwrap_or_default();
+    let parent = if obj_type == ObjectType::Function {
+        // containerRef 带组名 + 组 URI（vsp 实证形态；URI 里的组名为小写）
+        format!(
+            "<adtcore:containerRef adtcore:name=\"{}\" adtcore:type=\"FUGR/F\" \
+             adtcore:uri=\"/sap/bc/adt/functions/groups/{}\"/>",
+            xml_attr_escape(group.trim().to_uppercase().as_str()),
+            encode_path_segment(&group.trim().to_lowercase())
+        )
+    } else {
+        format!(
+            "<adtcore:packageRef adtcore:name=\"{}\"/>",
+            xml_attr_escape(devclass_or_tmp(spec).as_str())
+        )
+    };
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+<{root} xmlns:{prefix}=\"{ns}\" xmlns:adtcore=\"http://www.sap.com/adt/core\" \
+adtcore:description=\"{desc}\" adtcore:name=\"{name}\" adtcore:type=\"{tid}\"{resp}>\
+{parent}\
+</{root}>",
+        root = root,
+        prefix = prefix,
+        ns = ns,
+        desc = xml_attr_escape(spec.description.trim()),
+        name = xml_attr_escape(name.trim()),
+        tid = obj_type.adt_type_id(),
+        resp = resp,
+        parent = parent,
+    )
+}
+
+/// Package 富 payload（vsp 实证：attributes/superPackage/transport 完整结构）。
+fn create_package_body(
+    name: &str,
+    spec: &CreateSpec,
+    swc: &str,
+    responsible: Option<&str>,
+) -> String {
+    let resp = responsible
+        .map(|u| format!(" adtcore:responsible=\"{}\"", xml_attr_escape(u)))
+        .unwrap_or_default();
+    let super_pkg = if spec.devclass.trim().is_empty() {
+        "<pack:superPackage/>".to_string()
+    } else {
+        format!(
+            "<pack:superPackage adtcore:name=\"{}\" adtcore:type=\"DEVC/K\"/>",
+            xml_attr_escape(spec.devclass.trim())
+        )
+    };
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+<pack:package xmlns:pack=\"http://www.sap.com/adt/packages\" \
+xmlns:adtcore=\"http://www.sap.com/adt/core\" \
+adtcore:description=\"{desc}\" adtcore:name=\"{name}\" adtcore:type=\"DEVC/K\"{resp}>\
+<pack:attributes pack:packageType=\"development\"/>\
+{super_pkg}\
+<pack:applicationComponent/>\
+<pack:transport><pack:softwareComponent pack:name=\"{swc}\"/><pack:transportLayer pack:name=\"\"/></pack:transport>\
+<pack:translation/><pack:useAccesses/><pack:packageInterfaces/><pack:subPackages/>\
+</pack:package>",
+        desc = xml_attr_escape(spec.description.trim()),
+        name = xml_attr_escape(name.trim()),
+        super_pkg = super_pkg,
+        swc = xml_attr_escape(swc),
+    )
+}
+
+// 辅助：默认开发包（$TMP）
+fn devclass_or_tmp(spec: &CreateSpec) -> String {
+    let d = spec.devclass.trim();
+    if d.is_empty() {
+        "$TMP".into()
+    } else {
+        d.to_uppercase()
+    }
+}
+
+/// ADT 创建单次 POST。返回 Err 时 message 已含 SAP 的说法。
+async fn create_post_adt(rel: &str, body: &str, transport: Option<&str>) -> Result<(), RfcError> {
+    let mut query: Vec<(&str, &str)> = Vec::new();
+    if let Some(t) = transport.filter(|t| !t.trim().is_empty()) {
+        query.push(("corrNr", t));
+    }
+    let resp = adt_request_raw(
+        axum::http::Method::POST,
+        rel,
+        &query,
+        Some(body.as_bytes()),
+        Some("application/*"),
+        "*/*",
+        &[], // 无额外头；CSRF 由网关自动处理
+        None,
+        None,
+    )
+    .await?;
+    if (200..300).contains(&resp.status) {
+        return Ok(());
+    }
+    let body_text = String::from_utf8_lossy(&resp.body).to_string();
+    let (status, message, key) = if body_text.contains("exc:exception") {
+        let e = adt_exception_error(&body_text, "ADT 创建对象失败");
+        (e.status, e.message, e.key)
+    } else {
+        (
+            502u16,
+            format!(
+                "ADT 创建失败（{}）: {}",
+                resp.status,
+                truncate(&body_text, 300)
+            ),
+            "CREATE_FAILED".to_string(),
+        )
+    };
+    Err(RfcError {
+        code: -1,
+        status,
+        message,
+        key,
+    })
+}
+
+/// ADT 标准创建（Eclipse/vsp/abapfs 同款 objectcreation XML POST）。
+/// 适用于所有类型；Function 在组缺失时自动经 ADT 建组后重试一次。
+async fn create_object_adt(
+    obj_type: ObjectType,
+    name: &str,
+    group: &str,
+    spec: &CreateSpec,
+    responsible: Option<&str>,
+) -> Result<(), RfcError> {
+    let transport = spec.transport.as_deref();
+    if obj_type == ObjectType::Package {
+        // 软件组件因系统而异（A4H 认 ZLOCAL、BTP trial 认 LOCAL…）——逐个候选试，
+        // 全部落败返回最后一个错误（vsp/本网关真机双实证）
+        let mut candidates: Vec<String> = Vec::new();
+        if let Some(swc) = spec
+            .software_component
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+        {
+            candidates.push(swc.trim().to_string());
+        }
+        for fallback in ["ZLOCAL", "LOCAL", "HOME"] {
+            if !candidates.iter().any(|c| c.eq_ignore_ascii_case(fallback)) {
+                candidates.push(fallback.to_string());
+            }
+        }
+        let mut last: Option<RfcError> = None;
+        for swc in &candidates {
+            let body = create_package_body(name, spec, swc, responsible);
+            match create_post_adt("packages", &body, transport).await {
+                Ok(()) => return Ok(()),
+                Err(e) if is_already_exists(&e.message) => return Err(e),
+                Err(e) => last = Some(e),
+            }
+        }
+        return Err(last.unwrap_or_else(|| RfcError {
+            code: -1,
+            status: 502,
+            message: "ADT 创建包失败（无可用软件组件候选）".into(),
+            key: "CREATE_FAILED".into(),
+        }));
+    }
+
+    // Function：组不存在 → 先经 ADT 建组再重试。组的包候选：显式 → $TMP → ZLOCAL
+    // （A4H $TMP 可用；ABAP Cloud Trial 常要求 ZLOCAL。ADT 建组在该环境同样有效——
+    //  这是 RFC RS_FUNCTION_POOL_INSERT「返回成功却不写 TADIR」限制的正解）
+    if obj_type == ObjectType::Function {
+        let (rel, _, _) = obj_type.creation(group);
+        let body = create_body_simple(obj_type, name, group, spec, responsible);
+        let first = create_post_adt(&rel, &body, transport).await;
+        let group_missing = match &first {
+            Err(e) => e.key == "ADT_ExceptionResourceNotFound" || e.message.contains("not exist"),
+            Ok(()) => false,
+        };
+        if !group_missing {
+            return first;
+        }
+        for dev in dedup_candidates(&devclass_or_tmp(spec), &["ZLOCAL"]) {
+            let gspec = CreateSpec {
+                description: format!("function group {}", group.trim().to_uppercase()),
+                devclass: dev,
+                transport: spec.transport.clone(),
+                software_component: None,
+            };
+            let (grel, _, _) = ObjectType::FunctionGroup.creation("");
+            let gbody =
+                create_body_simple(ObjectType::FunctionGroup, group, "", &gspec, responsible);
+            match create_post_adt(&grel, &gbody, transport).await {
+                // 建组成（或组其实已在——并发场景）即跳出；失败换下一个包候选
+                Ok(()) => break,
+                Err(ref e2) if is_already_exists(&e2.message) => break,
+                Err(_) => continue,
+            }
+        }
+        // 组就位（或建组失败——FM 重试自己会给准确错误）后重试一次
+        return create_post_adt(&rel, &body, transport).await;
+    }
+
+    let (rel, _, _) = obj_type.creation(group);
+    let body = create_body_simple(obj_type, name, group, spec, responsible);
+    create_post_adt(&rel, &body, transport).await
+}
+
+/// 去重的包候选列表（首项显式给出，后接 fallback）。
+fn dedup_candidates(explicit: &str, fallbacks: &[&str]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    if !explicit.trim().is_empty() {
+        out.push(explicit.trim().to_uppercase());
+    }
+    for f in fallbacks {
+        if !out.iter().any(|c| c.eq_ignore_ascii_case(f)) {
+            out.push(f.to_string());
+        }
+    }
+    out
+}
+
+/// 创建对象（对外入口）：**ADT-first**，prog/func 在 ADT 不可用/失败时回退 RFC RPY 路径。
+/// prog/func 的 RFC 路径（实测可用、无 schema 猜谜）保留为兜底；其余类型只有 ADT 通道。
 pub async fn create_object(
     pool: &std::sync::Arc<crate::pool::RfcConnectionPool>,
     obj_type: ObjectType,
@@ -718,33 +1081,95 @@ pub async fn create_object(
             key: "CREATE_DESC_REQUIRED".into(),
         });
     }
+    if obj_type.needs_group() && group.trim().is_empty() {
+        return Err(RfcError {
+            code: -1,
+            status: 400,
+            message: "func 创建需要 group（函数组），或传 group_hint 由网关反解".into(),
+            key: "CREATE_GROUP_REQUIRED".into(),
+        });
+    }
+    let responsible = crate::adt::adt_user();
+    let adt_result = create_object_adt(obj_type, name, group, spec, responsible.as_deref()).await;
+    match adt_result {
+        Ok(()) => Ok(()),
+        // 已存在：重试任何路径都无意义，直接给 409
+        Err(e) if is_already_exists(&e.message) => Err(RfcError {
+            code: -1,
+            status: 409,
+            message: e.message,
+            key: "OBJECT_EXISTS".into(),
+        }),
+        // prog/func：ADT 失败回退 RFC（老系统 ADT 服务缺失 / RPY 在该系统更宽容）
+        Err(e) if matches!(obj_type, ObjectType::Program | ObjectType::Function) => {
+            match create_object_rfc(pool, obj_type, name, group, spec).await {
+                Ok(()) => Ok(()),
+                Err(_) => Err(e), // RFC 也失败：ADT 的错误信息通常更标准，回抛 ADT 错误
+            }
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// RFC 通道创建（prog=RPY_PROGRAM_INSERT、func=RPY_FUNCTIONMODULE_INSERT + 自动建组）。
+/// 仅作为 ADT 通道的回退；逻辑与历史版本一致（含 ABAP Cloud Trial 的 TADIR 自检）。
+async fn create_object_rfc(
+    pool: &std::sync::Arc<crate::pool::RfcConnectionPool>,
+    obj_type: ObjectType,
+    name: &str,
+    group: &str,
+    spec: &CreateSpec,
+) -> Result<(), RfcError> {
     match obj_type {
         ObjectType::Program => {
             let pname = name.to_uppercase();
             let title = spec.description.clone();
-            let devclass = if spec.devclass.trim().is_empty() {
-                "$TMP".to_string()
-            } else {
-                spec.devclass.trim().to_uppercase()
-            };
+            let devclass = devclass_or_tmp(spec);
             let transport = spec.transport.clone().unwrap_or_default();
             crate::server::run_blocking(std::sync::Arc::clone(pool), move |conn| {
                 let req = crate::api::InvokeRequest {
                     func_name: "RPY_PROGRAM_INSERT".to_string(),
                     inputs: HashMap::from([
-                        ("PROGRAM_NAME".to_string(), ScalarValue::Chars(pname.clone())),
-                        ("PROGRAM_TYPE".to_string(), ScalarValue::Chars("1".to_string())),
-                        ("TITLE_STRING".to_string(), ScalarValue::Chars(title.clone())),
-                        ("DEVELOPMENT_CLASS".to_string(), ScalarValue::Chars(devclass.clone())),
+                        (
+                            "PROGRAM_NAME".to_string(),
+                            ScalarValue::Chars(pname.clone()),
+                        ),
+                        (
+                            "PROGRAM_TYPE".to_string(),
+                            ScalarValue::Chars("1".to_string()),
+                        ),
+                        (
+                            "TITLE_STRING".to_string(),
+                            ScalarValue::Chars(title.clone()),
+                        ),
+                        (
+                            "DEVELOPMENT_CLASS".to_string(),
+                            ScalarValue::Chars(devclass.clone()),
+                        ),
                         // 免交互 + 直接保存
-                        ("SUPPRESS_DIALOG".to_string(), ScalarValue::Chars("X".to_string())),
-                        ("SAVE_INACTIVE".to_string(), ScalarValue::Chars(" ".to_string())),
+                        (
+                            "SUPPRESS_DIALOG".to_string(),
+                            ScalarValue::Chars("X".to_string()),
+                        ),
+                        (
+                            "SAVE_INACTIVE".to_string(),
+                            ScalarValue::Chars(" ".to_string()),
+                        ),
                         ("TEMPORARY".to_string(), ScalarValue::Chars(" ".to_string())),
                         ("STATUS".to_string(), ScalarValue::Chars("A".to_string())),
-                        ("APPLICATION".to_string(), ScalarValue::Chars(" ".to_string())),
-                        ("AUTHORIZATION_GROUP".to_string(), ScalarValue::Chars(" ".to_string())),
+                        (
+                            "APPLICATION".to_string(),
+                            ScalarValue::Chars(" ".to_string()),
+                        ),
+                        (
+                            "AUTHORIZATION_GROUP".to_string(),
+                            ScalarValue::Chars(" ".to_string()),
+                        ),
                         ("EDIT_LOCK".to_string(), ScalarValue::Chars(" ".to_string())),
-                        ("TRANSPORT_NUMBER".to_string(), ScalarValue::Chars(transport.clone())),
+                        (
+                            "TRANSPORT_NUMBER".to_string(),
+                            ScalarValue::Chars(transport.clone()),
+                        ),
                     ]),
                     ..Default::default()
                 };
@@ -756,30 +1181,21 @@ pub async fn create_object(
             .await
         }
         ObjectType::Function => {
-            if group.trim().is_empty() {
-                return Err(RfcError {
-                    code: -1,
-                    status: 400,
-                    message: "func 创建需要 group（函数组），或传 group_hint 由网关反解".into(),
-                    key: "CREATE_GROUP_REQUIRED".into(),
-                });
-            }
             let fname = name.to_uppercase();
             let fgroup = group.trim().to_uppercase();
             let short = spec.description.clone();
             let transport = spec.transport.clone().unwrap_or_default();
-            let devclass = if spec.devclass.trim().is_empty() {
-                "$TMP".to_string()
-            } else {
-                spec.devclass.trim().to_uppercase()
-            };
+            let devclass = devclass_or_tmp(spec);
             let fm_insert = |fname: String, fgroup: String, short: String, transport: String| {
                 move |conn: &crate::connection::RfcConnection| -> Result<(), RfcError> {
                     let req = InvokeRequest {
                         func_name: "RPY_FUNCTIONMODULE_INSERT".to_string(),
                         inputs: HashMap::from([
                             ("FUNCNAME".to_string(), ScalarValue::Chars(fname.clone())),
-                            ("FUNCTION_POOL".to_string(), ScalarValue::Chars(fgroup.clone())),
+                            (
+                                "FUNCTION_POOL".to_string(),
+                                ScalarValue::Chars(fgroup.clone()),
+                            ),
                             ("SHORT_TEXT".to_string(), ScalarValue::Chars(short.clone())),
                             ("CORRNUM".to_string(), ScalarValue::Chars(transport.clone())),
                         ]),
@@ -791,15 +1207,17 @@ pub async fn create_object(
             };
             match crate::server::run_blocking(
                 std::sync::Arc::clone(pool),
-                fm_insert(fname.clone(), fgroup.clone(), short.clone(), transport.clone()),
+                fm_insert(
+                    fname.clone(),
+                    fgroup.clone(),
+                    short.clone(),
+                    transport.clone(),
+                ),
             )
             .await
             {
                 Ok(()) => Ok(()),
                 // 组不存在 → 自动建组（RS_FUNCTION_POOL_INSERT）后重试一次。
-                // 包按序尝试：显式传入 → ZLOCAL（ABAP Cloud Trial 的本地包，
-                // 该环境禁止 $TMP 的 FUGR："cannot be created without a package"）
-                // → $TMP（on-prem 常规默认）。
                 Err(e) if e.key.contains("INVALID_FUNCTION_POOL") || e.message.contains("652") => {
                     let pool_insert = |g: String, desc: String, dev: String, tr: String| {
                         move |conn: &crate::connection::RfcConnection| -> Result<(), RfcError> {
@@ -810,12 +1228,27 @@ pub async fn create_object(
                                     ("SHORT_TEXT".to_string(), ScalarValue::Chars(desc.clone())),
                                     ("DEVCLASS".to_string(), ScalarValue::Chars(dev.clone())),
                                     ("CORRNUM".to_string(), ScalarValue::Chars(tr.clone())),
-                                    ("SUPPRESS_CORR_CHECK".to_string(), ScalarValue::Chars("X".to_string())),
-                                    ("SUPPRESS_LANGUAGE_CHECK".to_string(), ScalarValue::Chars("X".to_string())),
-                                    ("AUTHORITY_CHECK".to_string(), ScalarValue::Chars(" ".to_string())),
+                                    (
+                                        "SUPPRESS_CORR_CHECK".to_string(),
+                                        ScalarValue::Chars("X".to_string()),
+                                    ),
+                                    (
+                                        "SUPPRESS_LANGUAGE_CHECK".to_string(),
+                                        ScalarValue::Chars("X".to_string()),
+                                    ),
+                                    (
+                                        "AUTHORITY_CHECK".to_string(),
+                                        ScalarValue::Chars(" ".to_string()),
+                                    ),
                                     ("NAMESPACE".to_string(), ScalarValue::Chars(" ".to_string())),
-                                    ("RESPONSIBLE".to_string(), ScalarValue::Chars(" ".to_string())),
-                                    ("UNICODE_CHECKS".to_string(), ScalarValue::Chars(" ".to_string())),
+                                    (
+                                        "RESPONSIBLE".to_string(),
+                                        ScalarValue::Chars(" ".to_string()),
+                                    ),
+                                    (
+                                        "UNICODE_CHECKS".to_string(),
+                                        ScalarValue::Chars(" ".to_string()),
+                                    ),
                                 ]),
                                 ..Default::default()
                             };
@@ -865,21 +1298,21 @@ pub async fn create_object(
                     // 给出可操作的错误而不是静默假成功。
                     if r.is_ok() {
                         let g_chk = fgroup.clone();
-                        let registered = crate::server::run_blocking(
-                            std::sync::Arc::clone(pool),
-                            move |conn| {
+                        let registered =
+                            crate::server::run_blocking(std::sync::Arc::clone(pool), move |conn| {
                                 let rows = crate::discovery::read_table(
-                                    conn, "TADIR",
+                                    conn,
+                                    "TADIR",
                                     &["OBJECT".to_string(), "OBJ_NAME".to_string()],
                                     &[format!("OBJECT = 'FUGR' AND OBJ_NAME = '{}'", g_chk)],
-                                    1, '\u{1}',
+                                    1,
+                                    '\u{1}',
                                 )
                                 .unwrap_or_default();
                                 Ok::<bool, RfcError>(!rows.is_empty())
-                            },
-                        )
-                        .await
-                        .unwrap_or(true);
+                            })
+                            .await
+                            .unwrap_or(true);
                         if !registered {
                             return Err(RfcError {
                                 code: -1,
@@ -897,47 +1330,16 @@ pub async fn create_object(
                 Err(e) => Err(e),
             }
         }
-        ObjectType::Class => {
-            // ADT 标准创建（Eclipse 同款）：POST oo/classes?name=Z...&package=...
-            let rel = "oo/classes";
-            let query: Vec<(&str, &str)> = vec![
-                ("name", name),
-                ("package", if spec.devclass.trim().is_empty() { "$TMP" } else { spec.devclass.trim() }),
-            ];
-            // body 按该服务读取实例反推的 schema：abapClass root + adtcore: 前缀属性
-            // （这台 ABAP Cloud Trial 实测：无前缀属性 → "could not be converted"；
-            //   adtcore 属性 → 进到对象校验层。on-prem 标准版为 class:class。）
-            let body = format!(
-                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
-<class:abapClass xmlns:class=\"http://www.sap.com/adt/oo/classes\" \
- xmlns:adtcore=\"http://www.sap.com/adt/core\" adtcore:name=\"{name}\" \
- adtcore:description=\"{}\" class:final=\"true\" class:visibility=\"public\"/>",
-                xml_escape(&spec.description)
-            );
-            let resp = adt_request_raw(
-                axum::http::Method::POST,
-                rel,
-                &query,
-                Some(body.as_bytes()),
-                Some("application/vnd.sap.adt.oo.classes.v5+xml"),
-                "*/*",
-                &[], // 无额外头；CSRF 由网关自动处理
-                None,
-                None,
-            )
-            .await?;
-            if !(200..300).contains(&resp.status) {
-                return Err(RfcError {
-                    code: -1,
-                    status: 502,
-                    message: format!("ADT 创建失败: {}", String::from_utf8_lossy(&resp.body)),
-                    key: "CREATE_FAILED".into(),
-                });
-            }
-            Ok(())
-        }
+        _ => Err(RfcError {
+            code: -1,
+            status: 502,
+            message: "该对象类型无 RFC 创建通道（仅 ADT）".into(),
+            key: "CREATE_NO_RFC_FALLBACK".into(),
+        }),
     }
 }
+
+// （CreateSpec 直接手工构造，无需 clone helper）
 
 /// 写入（可选对象不存在时先建壳）：PUT source 语义的共享入口。
 /// `create_desc` 为 Some 时启用自动创建（描述即 title）。
@@ -947,6 +1349,8 @@ pub struct WriteOpts<'a> {
     pub activate: bool,
     /// Some(description) 启用「对象不存在时自动创建」
     pub create_desc: Option<&'a str>,
+    /// 函数模块写入后设为 remote-enabled（processingType=rfc，元数据 PUT）
+    pub rfc_enabled: bool,
 }
 
 pub async fn write_object_maybe_create(
@@ -957,17 +1361,42 @@ pub async fn write_object_maybe_create(
     source: &str,
     opts: &WriteOpts<'_>,
 ) -> Result<WriteOutcome, RfcError> {
-    let WriteOpts { transport, activate, create_desc } = *opts;
-    match write_object_source(obj_type, name, group, source, transport, activate).await {
+    let WriteOpts {
+        transport,
+        activate,
+        create_desc,
+        rfc_enabled,
+    } = *opts;
+    match write_object_source(
+        obj_type,
+        name,
+        group,
+        source,
+        transport,
+        activate,
+        rfc_enabled,
+    )
+    .await
+    {
         Ok(o) => Ok(o),
         Err(e) if create_desc.is_some() && is_object_not_exist(&e) => {
             let spec = CreateSpec {
                 description: create_desc.unwrap_or_default().to_string(),
                 devclass: String::new(),
                 transport: transport.map(str::to_string),
+                software_component: None,
             };
             create_object(pool, obj_type, name, group, &spec).await?;
-            write_object_source(obj_type, name, group, source, transport, activate).await
+            write_object_source(
+                obj_type,
+                name,
+                group,
+                source,
+                transport,
+                activate,
+                rfc_enabled,
+            )
+            .await
         }
         Err(e) => Err(e),
     }
@@ -984,7 +1413,12 @@ pub async fn replace_object_maybe_create(
     new_string: &str,
     opts: &WriteOpts<'_>,
 ) -> Result<serde_json::Value, RfcError> {
-    let WriteOpts { transport, activate, create_desc } = *opts;
+    let WriteOpts {
+        transport,
+        activate,
+        create_desc,
+        rfc_enabled,
+    } = *opts;
     let current = match read_current_source(obj_type, name, group).await {
         Ok(c) => c,
         Err(e) if create_desc.is_some() && is_object_not_exist(&e) => {
@@ -992,6 +1426,7 @@ pub async fn replace_object_maybe_create(
                 description: create_desc.unwrap_or_default().to_string(),
                 devclass: String::new(),
                 transport: transport.map(str::to_string),
+                software_component: None,
             };
             create_object(pool, obj_type, name, group, &spec).await?;
             String::new()
@@ -1012,7 +1447,16 @@ pub async fn replace_object_maybe_create(
             key: "REPLACE_NO_CHANGE".into(),
         });
     }
-    let outcome = write_object_source(obj_type, name, group, &updated, transport, activate).await?;
+    let outcome = write_object_source(
+        obj_type,
+        name,
+        group,
+        &updated,
+        transport,
+        activate,
+        rfc_enabled,
+    )
+    .await?;
     let mut v = serde_json::to_value(&outcome).unwrap_or_default();
     v["replaced"] = serde_json::json!(true);
     Ok(v)
@@ -1024,21 +1468,19 @@ pub fn is_object_not_exist(err: &RfcError) -> bool {
         || err.message.contains("does not exist")
 }
 
-/// XML 属性转义（创建 body 用）。
-fn xml_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-}
-
-/// 编排写入：锁 → PUT 源码 → 解锁 → 激活。
+/// 编排写入：锁 → PUT 源码 →（可选）rfc 元数据 PUT → 解锁 → 激活。
 ///
 /// - `transport`: 调用方指定的传输请求号；未指定时复用对象已绑定的
 ///   CORRNR（vsp issue #144：已捕获对象不传会收到假 409）；
+/// - `rfc_enabled`: 仅 Function；在同一把锁下 PUT 模块元数据把
+///   processingType 置为 rfc（描述先读回再带上——PUT 是整文档替换，vsp 实证）；
+/// - 函数模块源码先做 SEDI 规范化（经典 `*" 注释块`签名 → FUNCTION 语句内联，
+///   见 [`normalize_function_source`]），否则新版 ADT 以 400
+///   "Parameter comment blocks are not allowed" 拒收；
 /// - 激活是逻辑结果不是传输错误：失败时 Ok(WriteOutcome{activated:
 ///   Some(失败详情)})，由调用方决定如何呈现；
 /// - PUT 失败会尽力解锁后返回错误，避免泄漏孤儿锁。
+#[allow(clippy::too_many_arguments)]
 pub async fn write_object_source(
     obj_type: ObjectType,
     name: &str,
@@ -1046,14 +1488,27 @@ pub async fn write_object_source(
     source: &str,
     transport: Option<&str>,
     activate: bool,
+    rfc_enabled: bool,
 ) -> Result<WriteOutcome, RfcError> {
-    let type_name = match obj_type {
-        ObjectType::Program => "prog",
-        ObjectType::Class => "class",
-        ObjectType::Function => "func",
-    };
+    if !obj_type.has_source() {
+        return Err(RfcError {
+            code: -1,
+            status: 400,
+            message: "该对象类型无源码资源（package 只有元数据）".into(),
+            key: "NO_SOURCE_RESOURCE".into(),
+        });
+    }
+    let type_name = obj_type.api_name();
     let base = obj_type.base_rel(name, group);
     let source_rel = obj_type.source_rel(name, group);
+    // FM 源码规范化：经典注释块签名在这台 SEDI 系统会被拒收
+    let source_owned: String;
+    let source = if obj_type == ObjectType::Function {
+        source_owned = normalize_function_source(source);
+        &source_owned
+    } else {
+        source
+    };
     let mut warnings = Vec::new();
 
     // ⓪ 建立专用 stateful 会话：锁的签发、token 的签发必须同源，
@@ -1134,6 +1589,27 @@ pub async fn write_object_source(
         });
     }
 
+    // ②' 同一把锁下把 FM 设为 remote-enabled（元数据 PUT；源码已落库，
+    //     失败不回滚只降级为警告 + rfc_enabled:false）
+    let mut rfc_result: Option<bool> = None;
+    if rfc_enabled && obj_type == ObjectType::Function {
+        match fm_set_rfc_enabled(
+            &base,
+            &group_or_name(obj_type, name, group),
+            &mut sess,
+            &lock.lock_handle,
+            transport_used.as_deref(),
+        )
+        .await
+        {
+            Ok(()) => rfc_result = Some(true),
+            Err(w) => {
+                warnings.push(format!("设置 remote-enabled 失败: {}", w));
+                rfc_result = Some(false);
+            }
+        }
+    }
+
     // ③ 先解锁再激活（SAP 要求：不解锁时对象自身 ENQUEUE 以 403 拒绝激活）
     if let Err(w) = unlock_object(&base, &lock.lock_handle, &mut sess).await {
         warnings.push(w);
@@ -1151,11 +1627,234 @@ pub async fn write_object_source(
     Ok(WriteOutcome {
         obj_type: type_name.to_string(),
         name: name.trim().to_uppercase(),
-        group: (obj_type == ObjectType::Function).then(|| group.to_uppercase()),
+        group: obj_type.needs_group().then(|| group.to_uppercase()),
         source_url: source_rel,
         written: true,
         transport_used,
+        rfc_enabled: rfc_result,
         activated,
+        warnings,
+    })
+}
+
+/// FM 元数据 PUT 需要组名：group 参数为空时（不该发生）退回对象名占位。
+fn group_or_name(_obj_type: ObjectType, _name: &str, group: &str) -> String {
+    group.trim().to_uppercase()
+}
+
+/// 把函数模块设为 remote-enabled（processingType=rfc）。
+/// 与源码 PUT 同锁执行：GET 元数据（带出描述/组件引用）→ PUT 整文档。
+/// 元数据 PUT 是**整文档替换**——不带 description 会把对象描述清空（vsp 实证坑）。
+async fn fm_set_rfc_enabled(
+    fm_base_rel: &str,
+    group: &str,
+    sess: &mut WriteSession,
+    lock_handle: &str,
+    transport: Option<&str>,
+) -> Result<(), String> {
+    // 读当前元数据（v3 契约；stateful 会话内）
+    let get_resp = adt_request_raw(
+        axum::http::Method::GET,
+        fm_base_rel,
+        &[],
+        None,
+        None,
+        "application/vnd.sap.adt.functions.fmodules.v3+xml",
+        STATEFUL,
+        sess.cookie_header().as_deref(),
+        Some(sess.token.as_str()),
+    )
+    .await
+    .map_err(|e| e.message)?;
+    sess.absorb(&get_resp);
+    if get_resp.status != 200 {
+        return Err(format!("元数据读取返回 {}", get_resp.status));
+    }
+    let meta = String::from_utf8_lossy(&get_resp.body).to_string();
+    let elems = walk_xml(&meta);
+    let root = elems.iter().find(|e| e.name == "abapFunctionModule");
+    let attr = |k: &str| -> String { root.and_then(|e| e.attr(k)).unwrap_or("").to_string() };
+    // 已是 rfc → 幂等跳过
+    if attr("processingType") == "rfc" {
+        return Ok(());
+    }
+    let container_uri = elems
+        .iter()
+        .find(|e| e.name == "containerRef")
+        .and_then(|e| e.attr("uri"))
+        .unwrap_or("")
+        .to_string();
+    let release_state = attr("releaseState");
+    let rfc_scope = attr("rfcScope");
+    let rfc_version = attr("rfcVersion");
+    let mut extra = String::new();
+    if !release_state.is_empty() {
+        extra.push_str(&format!(
+            " fmodule:releaseState=\"{}\"",
+            xml_attr_escape(&release_state)
+        ));
+    }
+    if !rfc_scope.is_empty() {
+        extra.push_str(&format!(
+            " fmodule:rfcScope=\"{}\"",
+            xml_attr_escape(&rfc_scope)
+        ));
+    }
+    if !rfc_version.is_empty() {
+        extra.push_str(&format!(
+            " fmodule:rfcVersion=\"{}\"",
+            xml_attr_escape(&rfc_version)
+        ));
+    }
+    let fm_name = attr("name");
+    let fm_name = if fm_name.is_empty() {
+        fm_base_rel.rsplit('/').next().unwrap_or("").to_string()
+    } else {
+        fm_name
+    };
+    let desc = attr("description");
+    let body = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+<fmodule:abapFunctionModule xmlns:fmodule=\"http://www.sap.com/adt/functions/fmodules\" \
+xmlns:adtcore=\"http://www.sap.com/adt/core\" \
+adtcore:description=\"{desc}\" adtcore:name=\"{name}\" adtcore:type=\"FUGR/FF\" \
+fmodule:processingType=\"rfc\"{extra}>\
+<adtcore:containerRef adtcore:name=\"{group}\" adtcore:type=\"FUGR/F\" adtcore:uri=\"{uri}\"/>\
+</fmodule:abapFunctionModule>",
+        desc = xml_attr_escape(&desc),
+        name = xml_attr_escape(&fm_name),
+        extra = extra,
+        group = xml_attr_escape(group),
+        uri = xml_attr_escape(&container_uri),
+    );
+    let mut query: Vec<(&str, &str)> = vec![("lockHandle", lock_handle)];
+    if let Some(t) = transport.filter(|t| !t.trim().is_empty()) {
+        query.push(("corrNr", t));
+    }
+    let put_resp = adt_request_raw(
+        axum::http::Method::PUT,
+        fm_base_rel,
+        &query,
+        Some(body.as_bytes()),
+        Some("application/vnd.sap.adt.functions.fmodules.v3+xml"),
+        "*/*",
+        STATEFUL,
+        sess.cookie_header().as_deref(),
+        Some(sess.token.as_str()),
+    )
+    .await
+    .map_err(|e| e.message)?;
+    sess.absorb(&put_resp);
+    if (200..300).contains(&put_resp.status) {
+        Ok(())
+    } else {
+        Err(format!(
+            "ADT 返回 {}: {}",
+            put_resp.status,
+            truncate(&String::from_utf8_lossy(&put_resp.body), 200)
+        ))
+    }
+}
+
+// ========================================================================
+// 对象删除（DELETE {base}?lockHandle；删除会消耗锁柄，无需解锁）
+// ========================================================================
+
+#[derive(Debug, serde::Serialize)]
+pub struct DeleteOutcome {
+    #[serde(rename = "type")]
+    pub obj_type: String,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+    pub deleted: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transport_used: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
+}
+
+/// 删除对象：锁 → DELETE → 弃会话。删除成功即消耗锁柄（vsp 实证：不再 UNLOCK）；
+/// DELETE 失败则尽力解锁，避免孤儿锁。
+pub async fn delete_object(
+    obj_type: ObjectType,
+    name: &str,
+    group: &str,
+    transport: Option<&str>,
+) -> Result<DeleteOutcome, RfcError> {
+    let base = obj_type.base_rel(name, group);
+    let mut warnings = Vec::new();
+    let mut sess = WriteSession::establish(&base).await?;
+    let lock = lock_object(&base, &mut sess).await?;
+    let transport_used = transport
+        .map(str::to_string)
+        .filter(|t| !t.trim().is_empty())
+        .or_else(|| {
+            let c = lock.corrnr.trim();
+            (!c.is_empty()).then(|| c.to_string())
+        });
+
+    let mut query: Vec<(&str, &str)> = vec![("lockHandle", lock.lock_handle.as_str())];
+    if let Some(t) = transport_used.as_deref() {
+        query.push(("corrNr", t));
+    }
+    let resp = match adt_request_raw(
+        axum::http::Method::DELETE,
+        &base,
+        &query,
+        None,
+        None,
+        "*/*",
+        STATEFUL,
+        sess.cookie_header().as_deref(),
+        Some(sess.token.as_str()),
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            if let Err(w) = unlock_object(&base, &lock.lock_handle, &mut sess).await {
+                warnings.push(w);
+            }
+            drop_session(&base, &sess).await;
+            return Err(RfcError {
+                code: -1,
+                status: 502,
+                message: format!("删除失败: {}", e.message),
+                key: "ADT_DELETE_FAILED".into(),
+            });
+        }
+    };
+    sess.absorb(&resp);
+    if !(200..300).contains(&resp.status) {
+        // 删除失败：释放锁（对象还在，锁不该留）
+        if let Err(w) = unlock_object(&base, &lock.lock_handle, &mut sess).await {
+            warnings.push(w);
+        }
+        drop_session(&base, &sess).await;
+        let body = String::from_utf8_lossy(&resp.body);
+        if body.contains("exc:exception") {
+            return Err(adt_exception_error(&body, "删除对象失败"));
+        }
+        return Err(RfcError {
+            code: -1,
+            status: 502,
+            message: format!(
+                "删除对象失败（ADT 返回 {}）: {}",
+                resp.status,
+                truncate(&body, 300)
+            ),
+            key: "ADT_DELETE_FAILED".into(),
+        });
+    }
+    // 成功：DELETE 已消耗锁柄，直接结束会话
+    drop_session(&base, &sess).await;
+    Ok(DeleteOutcome {
+        obj_type: obj_type.api_name().to_string(),
+        name: name.trim().to_uppercase(),
+        group: obj_type.needs_group().then(|| group.to_uppercase()),
+        deleted: true,
+        transport_used,
         warnings,
     })
 }
@@ -1165,6 +1864,208 @@ fn truncate(s: &str, max: usize) -> String {
         Some((i, _)) => format!("{}…", &s[..i]),
         None => s.to_string(),
     }
+}
+
+// ========================================================================
+// FM 源码 SEDI 规范化（经典注释块签名 → FUNCTION 语句内联）
+// ========================================================================
+
+/// 函数模块签名段关键字（SEDI 认可的顺序）。
+const FM_SIG_SECTIONS: [&str; 6] = [
+    "IMPORTING",
+    "EXPORTING",
+    "CHANGING",
+    "TABLES",
+    "RAISING",
+    "EXCEPTIONS",
+];
+
+/// 把函数模块源码规范化为 SEDI（源码编辑器）形态。
+///
+/// 背景（A4H 7.5x 真机实证）：新版 ADT 写路径**拒绝**经典参数注释块
+/// （400 "Parameter comment blocks are not allowed"），签名必须内联在
+/// FUNCTION 语句里：`FUNCTION f IMPORTING VALUE(x) TYPE t EXPORTING ... .`。
+/// 而 RFC 读路径（RPY_FUNCTIONMODULE_READ）返回的恰是经典形态——Agent
+/// 读回再写就必然炸。本函数把两种历史形态转换为内联形态：
+///
+/// 1. `FUNCTION f.` + `*" IMPORTING ...` 注释块（RFC 读回形态）；
+/// 2. `FUNCTION f.` + 独立 `IMPORTING ... .` 语句（手写疏漏形态）；
+/// 3. 已内联 → 原样返回。
+pub fn normalize_function_source(source: &str) -> String {
+    let lines: Vec<&str> = source
+        .split('\n')
+        .map(|l| l.trim_end_matches('\r'))
+        .collect();
+    // 找 FUNCTION 语句起始行
+    let Some(func_idx) = lines.iter().position(|l| {
+        let t = l.trim_start();
+        t.len() >= 9 && t[..9].eq_ignore_ascii_case("FUNCTION ")
+    }) else {
+        return source.to_string();
+    };
+
+    // 判定 FUNCTION 语句是否已带内联签名：语句内的段关键字出现在句点终结符之前
+    let mut stmt_end: Option<usize> = None; // 终结行索引（含句点）
+    let mut inline_sig = false;
+    let mut depth = 0usize; // 括号深度（VALUE(x) 里的内容不算终结）
+    'scan: for (i, line) in lines.iter().enumerate().skip(func_idx) {
+        let bytes = line.as_bytes();
+        let mut j = 0;
+        while j < bytes.len() {
+            match bytes[j] {
+                b'(' => depth += 1,
+                b')' => depth = depth.saturating_sub(1),
+                b'.' if depth == 0
+                    && (j + 1 >= bytes.len() || bytes[j + 1].is_ascii_whitespace()) =>
+                {
+                    stmt_end = Some(i);
+                    break 'scan;
+                }
+                _ => {}
+            }
+            j += 1;
+        }
+        // 行内是否含段关键字（同一语句延续中）
+        let mut word = String::new();
+        for &b in bytes {
+            if b.is_ascii_alphabetic() {
+                word.push(b.to_ascii_uppercase() as char);
+            } else {
+                if FM_SIG_SECTIONS.contains(&word.as_str()) {
+                    inline_sig = true;
+                }
+                word.clear();
+            }
+        }
+        if FM_SIG_SECTIONS.contains(&word.as_str()) {
+            inline_sig = true;
+        }
+    }
+    let Some(end) = stmt_end else {
+        return source.to_string(); // 找不到 FUNCTION 语句终结，无法安全处理
+    };
+    if inline_sig {
+        return source.to_string(); // 已内联
+    }
+
+    // `FUNCTION f.` 之后收集参数定义：注释块（*" 前缀）或独立签名语句
+    let mut sections: Vec<(String, Vec<String>)> = Vec::new();
+    let consume_until: usize; // body 起始行（两个分支都会赋值）
+    let after: Vec<&str> = lines[end + 1..].to_vec();
+    let is_sig_kw = |w: &str| FM_SIG_SECTIONS.iter().any(|k| w.eq_ignore_ascii_case(k));
+
+    // 形态 1：*" 注释块
+    let comment_lines: Vec<&str> = after
+        .iter()
+        .take_while(|l| {
+            let t = l.trim_start();
+            t.starts_with("*\"") || t.is_empty()
+        })
+        .cloned()
+        .collect();
+    if comment_lines.iter().any(|l| {
+        let t = l.trim_start().trim_start_matches("*\"").trim();
+        // 块里出现段关键字才视为参数注释块（排除纯分隔线/标题）
+        t.split_whitespace().next().map(&is_sig_kw).unwrap_or(false)
+    }) {
+        for l in &comment_lines {
+            let t = l.trim_start().trim_start_matches("*\"").trim();
+            if t.is_empty() {
+                continue;
+            }
+            let first = t.split_whitespace().next().unwrap_or("");
+            if is_sig_kw(first) {
+                sections.push((first.to_ascii_uppercase(), Vec::new()));
+            } else if !sections.is_empty() {
+                // 段内条目；跳过 "----- 分隔线与 "*"*"Local Interface: 标题
+                if t.starts_with('"') || t.starts_with('-') || t.starts_with('*') {
+                    continue;
+                }
+                sections.last_mut().unwrap().1.push(t.to_string());
+            }
+        }
+        consume_until = end + 1 + comment_lines.len();
+    } else {
+        // 形态 2：独立签名语句（IMPORTING/... 行起始，句点行终止）
+        let mut sig_end: Option<usize> = None;
+        let mut started = false;
+        for (i, l) in after.iter().enumerate() {
+            let t = l.trim();
+            if t.is_empty() {
+                continue;
+            }
+            let first = t.split_whitespace().next().unwrap_or("");
+            if !started {
+                if is_sig_kw(first) {
+                    started = true;
+                } else {
+                    break; // FUNCTION 行后直接是 body：无签名，无需转换
+                }
+            }
+            if is_sig_kw(first) {
+                // 段关键字行；同行剩余 token 是首个条目（IMPORTING VALUE(x) TYPE t 形态）
+                let rest = t
+                    .trim_end_matches('.')
+                    .split_whitespace()
+                    .skip(1)
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                sections.push((first.to_ascii_uppercase(), Vec::new()));
+                if !rest.is_empty() {
+                    sections.last_mut().unwrap().1.push(rest);
+                }
+            } else if let Some(sec) = sections.last_mut() {
+                sec.1.push(t.trim_end_matches('.').to_string());
+            }
+            if t.ends_with('.') {
+                sig_end = Some(i);
+                break;
+            }
+        }
+        if let Some(se) = sig_end {
+            consume_until = end + 1 + se + 1;
+        } else {
+            return source.to_string(); // 形态不完整：原样返回，让 SAP 的报错说话
+        }
+    }
+
+    if sections.is_empty() {
+        return source.to_string();
+    }
+
+    // 重建：FUNCTION 语句（无句点结尾的名字行）+ 段缩进块，末段以句点收尾
+    let func_line = lines[func_idx]
+        .trim()
+        .trim_end_matches('.')
+        .trim_end()
+        .to_string();
+    let mut out: Vec<String> = Vec::with_capacity(lines.len());
+    out.extend(lines[..func_idx].iter().map(|s| s.to_string()));
+    out.push(func_line);
+    for (kw, entries) in &sections {
+        out.push(format!("  {}", kw));
+        for e in entries {
+            out.push(format!("    {}", e));
+        }
+    }
+    // 末段句点：追加到最后一个条目行尾（或段关键字行尾——空段）
+    if let Some(last) = out.last_mut() {
+        last.push('.');
+    } else {
+        return source.to_string();
+    }
+    // body：空一行后接剩余行
+    let rest = &lines[consume_until.min(lines.len())..];
+    if rest.iter().any(|l| !l.trim().is_empty()) {
+        out.push(String::new());
+        out.extend(rest.iter().map(|s| s.to_string()));
+    }
+    let mut result = out.join("\n");
+    // 去掉 body 前导多余空行（保留一个分隔）
+    while result.contains("\n\n\n\n") {
+        result = result.replace("\n\n\n\n", "\n\n\n");
+    }
+    result
 }
 
 // ========================================================================
@@ -1218,13 +2119,21 @@ pub fn find_and_replace(content: &str, old: &str, new: &str) -> Result<String, S
     };
     // 阶梯 1：EOL 归一化后的精确匹配
     if let Some(updated) = apply(&norm_old_full) {
-        return Ok(if crlf { restored_crlf(&updated) } else { updated });
+        return Ok(if crlf {
+            restored_crlf(&updated)
+        } else {
+            updated
+        });
     }
     // 阶梯 2：末尾 \n 修剪（锚点是最后一行时，调用方常多带一个换行）
     let old_trim = norm_old_full.trim_end_matches('\n');
     if !old_trim.is_empty() && old_trim != norm_old_full {
         if let Some(updated) = apply(old_trim) {
-            return Ok(if crlf { restored_crlf(&updated) } else { updated });
+            return Ok(if crlf {
+                restored_crlf(&updated)
+            } else {
+                updated
+            });
         }
     }
     // 阶梯 3：大小写不敏感唯一匹配——Agent 按大写化视图做锚点、SAP 存的却是
@@ -1247,7 +2156,11 @@ pub fn find_and_replace(content: &str, old: &str, new: &str) -> Result<String, S
                 updated.push_str(&norm_content[..idx]);
                 updated.push_str(&norm_new);
                 updated.push_str(&norm_content[idx + lc_old.len()..]);
-                return Ok(if crlf { restored_crlf(&updated) } else { updated });
+                return Ok(if crlf {
+                    restored_crlf(&updated)
+                } else {
+                    updated
+                });
             }
             if n > 1 {
                 return Err(format!(
@@ -1290,8 +2203,19 @@ mod tests {
     fn object_type_parses_aliases_and_builds_urls() {
         assert_eq!(ObjectType::parse("prog"), Some(ObjectType::Program));
         assert_eq!(ObjectType::parse("REPORT"), Some(ObjectType::Program));
+        assert_eq!(ObjectType::parse("incl"), Some(ObjectType::Include));
+        assert_eq!(ObjectType::parse("Include"), Some(ObjectType::Include));
         assert_eq!(ObjectType::parse("class"), Some(ObjectType::Class));
-        assert_eq!(ObjectType::parse("FUGR"), Some(ObjectType::Function));
+        assert_eq!(ObjectType::parse("intf"), Some(ObjectType::Interface));
+        assert_eq!(ObjectType::parse("INTERFACE"), Some(ObjectType::Interface));
+        assert_eq!(ObjectType::parse("func"), Some(ObjectType::Function));
+        // fugr 现在指向函数组（FUGR/F），不再是函数模块
+        assert_eq!(ObjectType::parse("fugr"), Some(ObjectType::FunctionGroup));
+        assert_eq!(ObjectType::parse("fm"), Some(ObjectType::Function));
+        assert_eq!(ObjectType::parse("cds"), Some(ObjectType::CdsView));
+        assert_eq!(ObjectType::parse("ddls"), Some(ObjectType::CdsView));
+        assert_eq!(ObjectType::parse("package"), Some(ObjectType::Package));
+        assert_eq!(ObjectType::parse("pkg"), Some(ObjectType::Package));
         assert_eq!(ObjectType::parse("table"), None);
 
         assert_eq!(
@@ -1299,9 +2223,29 @@ mod tests {
             "programs/programs/ZTEST"
         );
         assert_eq!(
+            ObjectType::Include.base_rel("ztest_incl", ""),
+            "programs/includes/ZTEST_INCL"
+        );
+        assert_eq!(
             ObjectType::Class.source_rel("zcl_foo", ""),
             "oo/classes/ZCL_FOO/source/main"
         );
+        assert_eq!(
+            ObjectType::Interface.source_rel("zif_foo", ""),
+            "oo/interfaces/ZIF_FOO/source/main"
+        );
+        // CDS 家族 URL 用小写（vsp/abapfs 双实证）
+        assert_eq!(
+            ObjectType::CdsView.source_rel("ZCDS_Foo", ""),
+            "ddic/ddl/sources/zcds_foo/source/main"
+        );
+        assert_eq!(
+            ObjectType::FunctionGroup.base_rel("zgroup", ""),
+            "functions/groups/ZGROUP"
+        );
+        assert_eq!(ObjectType::Package.base_rel("zpkg", ""), "packages/ZPKG");
+        assert!(!ObjectType::Package.has_source());
+        assert!(ObjectType::CdsView.has_source());
         // 命名空间名：/ 编码为 %2F
         assert_eq!(
             ObjectType::Class.base_rel("/ui5/cl_repository_load", ""),
@@ -1310,6 +2254,67 @@ mod tests {
         assert_eq!(
             ObjectType::Function.base_rel("z_fm", "zgroup"),
             "functions/groups/ZGROUP/fmodules/Z_FM"
+        );
+    }
+
+    #[test]
+    fn create_body_simple_uses_package_and_container_ref() {
+        let spec = CreateSpec {
+            description: "hello & <world>".into(),
+            devclass: "ZPKG".into(),
+            ..Default::default()
+        };
+        let body = create_body_simple(ObjectType::Class, "ZCL_A", "", &spec, Some("DEVELOPER"));
+        assert!(body.contains("adtcore:type=\"CLAS/OC\""));
+        assert!(body.contains("adtcore:name=\"ZCL_A\""));
+        assert!(body.contains("adtcore:description=\"hello &amp; &lt;world&gt;\""));
+        assert!(body.contains("adtcore:responsible=\"DEVELOPER\""));
+        assert!(body.contains("<adtcore:packageRef adtcore:name=\"ZPKG\"/>"));
+
+        // Function 走 containerRef（组名大写属性 + 小写 URI）
+        let fbody = create_body_simple(ObjectType::Function, "Z_FM", "Zgrp", &spec, None);
+        assert!(fbody.contains("adtcore:type=\"FUGR/FF\""));
+        assert!(fbody.contains("adtcore:containerRef adtcore:name=\"ZGRP\""));
+        assert!(fbody.contains("adtcore:uri=\"/sap/bc/adt/functions/groups/zgrp\""));
+    }
+
+    #[test]
+    fn normalize_fm_source_converts_comment_block() {
+        // RFC 读回的经典形态：FUNCTION x. + *" 注释块
+        let classic = "FUNCTION zfoo.\n*\"----------------------------------------------------------------------\n*\"*\"Local Interface:\n*\"  IMPORTING\n*\"     VALUE(IV_IN) TYPE  STRING\n*\"     VALUE(IV_N) TYPE  I OPTIONAL\n*\"  EXPORTING\n*\"     VALUE(EV_OUT) TYPE  STRING\n*\"----------------------------------------------------------------------\n\n  ev_out = iv_in.\nENDFUNCTION.";
+        let out = normalize_function_source(classic);
+        assert!(
+            out.starts_with("FUNCTION zfoo\n"),
+            "开头应是无句点的 FUNCTION 行: {out}"
+        );
+        assert!(out.contains("  IMPORTING\n    VALUE(IV_IN) TYPE  STRING\n    VALUE(IV_N) TYPE  I OPTIONAL\n  EXPORTING\n    VALUE(EV_OUT) TYPE  STRING."));
+        assert!(!out.contains("*\""), "注释块应被移除: {out}");
+        // body 原样保留
+        assert!(out.contains("ev_out = iv_in."));
+        assert!(out.ends_with("ENDFUNCTION."));
+    }
+
+    #[test]
+    fn normalize_fm_source_converts_bare_statement_form() {
+        // 独立 IMPORTING 语句形态（写入疏漏/手写）
+        let bare = "FUNCTION zfoo.\nIMPORTING\n  VALUE(iv) TYPE string\nEXPORTING\n  VALUE(ev) TYPE string.\n\n  ev = iv.\nENDFUNCTION.";
+        let out = normalize_function_source(bare);
+        assert!(out.contains("FUNCTION zfoo\n  IMPORTING\n    VALUE(iv) TYPE string\n  EXPORTING\n    VALUE(ev) TYPE string."), "{out}");
+        assert!(out.contains("ev = iv."));
+    }
+
+    #[test]
+    fn normalize_fm_source_keeps_inline_and_plain_forms() {
+        // 已内联：原样
+        let inline = "FUNCTION zfoo IMPORTING VALUE(iv) TYPE string EXPORTING VALUE(ev) TYPE string.\n  ev = iv.\nENDFUNCTION.";
+        assert_eq!(normalize_function_source(inline), inline);
+        // 无签名：原样
+        let plain = "FUNCTION zfoo.\n  WRITE 'x'.\nENDFUNCTION.";
+        assert_eq!(normalize_function_source(plain), plain);
+        // 非 FM 源码：原样
+        assert_eq!(
+            normalize_function_source("REPORT zprog.\n"),
+            "REPORT zprog.\n"
         );
     }
 

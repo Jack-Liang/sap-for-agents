@@ -8,7 +8,7 @@
 - **技术栈**：Rust（标准库 FFI 直连 `sapnwrfc.dll`）+ axum + tokio + serde
 - **零 SDK 依赖客户端**：调用方只要会发 HTTP POST
 - **通用接口**：一个端点 `/api/rfc` 描述任意 BAPI，无需为每个 BAPI 写代码
-- **面向 AI**：15 个元数据端点（搜函数/查接口/查文档/看源码/读透明表/查数据字典/排查短转储/**修改 ABAP 代码**），Agent 能自服务探索与操作。给 AI 的操作指南见 [`AGENTS.md`](./AGENTS.md)
+- **面向 AI**：16 个元数据端点（自描述/搜函数/查接口/查文档/看源码/读透明表/查数据字典/排查短转储/**修改 ABAP 代码**），Agent 能自服务探索与操作。给 AI 的操作指南见 [`AGENTS.md`](./AGENTS.md)
 
 > ⚠️ **风险提示**：本项目是一个**探索性、实验性项目**，主要用于学习、测试与本地开发场景。它未经生产环境的充分打磨，不保证稳定性与正确性，API 可能随时变更。它以所配置 `SAP_USER` 的完整权限开放 RFC 调用能力——使用前请自行评估风险（数据暴露、未授权调用、合规性等）并自行采取防护措施。对生产 SAP 系统使用本项目的风险由使用者自行承担，作者不对使用本项目造成的任何损失负责。
 
@@ -206,7 +206,7 @@ curl -X POST http://127.0.0.1:3000/api/rfc \
 
 ### 认证（可选）
 
-设置环境变量 `SAP_API_KEY` 后，所有 `/api/*` 业务端点要求请求头 `Authorization: Bearer <token>`；未设置则免鉴权（本机默认）。探针 `/health`、`/ready` 与公开页 `/`、`/agents.md` 始终免鉴权。
+设置环境变量 `SAP_API_KEY` 后，所有 `/api/*` 业务端点要求请求头 `Authorization: Bearer <token>`；未设置则免鉴权（本机默认）。探针 `/health`、`/ready`、`/api/version` 与公开页 `/`、`/agents.md` 始终免鉴权。
 
 ```bash
 # 启用认证（生成一个长随机串）
@@ -228,7 +228,7 @@ curl -H "Authorization: Bearer $SAP_API_KEY" \
 不触碰 SAP，秒回，用于判断进程是否存活。
 
 ```json
-{ "status": "ok" }
+{ "status": "ok", "version": "0.10.0" }
 ```
 
 #### `GET /ready` —— readiness（SAP 可达）
@@ -249,6 +249,24 @@ curl -H "Authorization: Bearer $SAP_API_KEY" \
 - `rfc_call_duration_ms{func}` —— 调用耗时直方图（含 p50/p90/p99）
 
 > 免鉴权（运维探针，与 `/health` `/ready` 同类）。若公网部署，需在反向代理层保护。
+
+#### `GET /api/version` —— 版本与能力自描述（公开）
+
+一次调用回答 Agent 原本要撞 401/403/503/429 才能发现的一切：网关版本 + git 提交号（构建时带未提交改动则带 `-dirty` 后缀）、能力开关、目标 SAP 系统信息。
+
+```json
+{
+  "name": "sap-for-agents",
+  "version": "0.10.0",
+  "commit": "0fa6d6b",
+  "capabilities": { "auth": false, "read_only": false, "adt": true, "rate_limit_rps": null },
+  "sap": { "sysid": "A4H", "release": "816", "host": "vhcala4h", "os": "Linux", "destination": "vhcala4hci_A4H_00", "client": "001" }
+}
+```
+
+- 本地部分（版本/commit/能力开关）不碰 SAP、永不失败；`sap` 块首次调用经 `RFC_SYSTEM_INFO` 懒加载并缓存整个进程生命周期，SAP 不可达时为 `null`（带 `sap_error`），端点仍返回 200。
+- `sap.release` 是内核/Basis 版本号，不区分 ECC 与 S/4HANA（判定 S/4 请查 `CVERS` 表的 `S4CORE` 组件）。
+- 刻意免鉴权：Agent 需要在拿到 token 之前知道 `capabilities.auth`（要不要 token）。公网部署若介意暴露 SAP 主机名，请在反向代理层保护。
 
 ---
 
@@ -314,10 +332,11 @@ curl -H "Authorization: Bearer $SAP_API_KEY" \
 
 ### 3.3 面向 AI 的元数据 API
 
-15 个端点让 AI/Agent 自服务地发现函数、理解参数、查数据字典、读文档、看源码、读表数据、排查短转储、**修改代码**。典型工作流：**搜索 → 查接口 → 查文档 → 看源码 → 调用**。给 AI 的完整操作指南见 [`AGENTS.md`](./AGENTS.md)。
+16 个端点让 AI/Agent 自服务地发现函数、理解参数、查数据字典、读文档、看源码、读表数据、排查短转储、**修改代码**。典型工作流：**自描述（`/api/version`）→ 搜索 → 查接口 → 查文档 → 看源码 → 调用**。给 AI 的完整操作指南见 [`AGENTS.md`](./AGENTS.md)。
 
 | 端点 | 用途 | 示例 |
 |------|------|------|
+| `GET /api/version` | 开局先自描述：版本/commit + 能力开关（鉴权/只读/ADT/限流）+ SAP sysid/release（公开、缓存） | `/api/version` |
 | `POST /api/functions/search` | 按通配符搜索函数 | `{"pattern":"BAPI_USER_*","max_results":10}` |
 | `GET /api/functions/:name` | 查函数完整接口（参数/类型/方向/嵌套字段） | `/api/functions/BAPI_USER_GET_DETAIL` |
 | `GET /api/functions/:name/doc` | 查文档（短文本+SE37长文档+参数说明） | `/api/functions/BAPI_USER_GET_DETAIL/doc?lang=EN` |
@@ -338,7 +357,7 @@ curl -H "Authorization: Bearer $SAP_API_KEY" \
 | `GET /openapi.json` | 全网关 OpenAPI 3.0.3 规范（免鉴权公开页）：20 端点 + 33 schema + 认证方案，喂给代码生成器 / Postman / Agent 工具注册表 | `/openapi.json` |
 | `GET /api/openapi?functions=A,B` | 动态规范：按 `functions` 列表从 DDIC 元数据为每个 BAPI 生成类型化 operation（参数/类型/嵌套字段全展开，指向 `{name}/invoke`；一次 ≤50 个） | `/api/openapi?functions=BAPI_USER_GETLIST` |
 | `GET /api/functions/:name/where-used` | 函数被谁使用（REPOSITORY_ENVIRONMENT_SET_RFC；依赖 SAP 使用索引——trial 系统返回空 + note） | `/api/functions/BAPI_TRANSACTION_COMMIT/where-used` |
-| `POST /mcp` | MCP 服务器（Model Context Protocol）：13 个工具面向 Claude 等 Agent——搜索/接口/文档/调用/源码/DDIC/转储/语法/引用。无状态 Streamable HTTP 上的 JSON-RPC | `POST /mcp`，body `{"method":"tools/list"}` |
+| `POST /mcp` | MCP 服务器（Model Context Protocol）：19 个工具面向 Claude 等 Agent——网关自描述/搜索/接口/文档/调用/源码/DDIC/转储/语法/引用/写入。无状态 Streamable HTTP 上的 JSON-RPC | `POST /mcp`，body `{"method":"tools/list"}` |
 | `GET /docs` | 交互式 API 文档（Redoc 渲染 `/openapi.json`） | `/docs` |
 
 端到端示例（列出用户）：
@@ -642,7 +661,7 @@ src/
 | 命名空间函数 `/NS/NAME` | ✅ 已实现（校验放行 + 通配路由分发，v0.4.10 起） |
 | ADT REST 代理 | ✅ 已实现（`/api/adt/**` 透传 + 写方法 CSRF 自动处理，v0.4.11 起） |
 | ST22 结构化分析 | ✅ 已实现（`/api/dumps` 列表/聚合/详情，解析自 ADT——免去几十万字节原始文本，v0.5.0 起） |
-| ABAP 代码修改 | ✅ 已实现（prog/class/func 的 `PUT source` / `POST replace` / `POST syntax`——专用 stateful 会话内完整锁→写→激活编排，v0.6.0 起） |
+| ABAP 代码修改 | ✅ 已实现（prog/incl/class/intf/func/fugr/cds/package 的 `PUT source` / `POST replace` / `POST syntax` / `GET source` / `POST create` / `DELETE`——专用 stateful 会话内完整锁→写→激活编排；ADT-first 创建 + RFC 回退，FM 签名可经源码写入（SEDI 形态）+ `rfc_enabled` 远程启用，v0.6.0 起） |
 | 源码依赖前言 | ✅ 已实现（`/api/functions/:name/source?prologue=true` 内联 `CALL FUNCTION` 目标紧凑签名，v0.5.0 起） |
 | 按 IP 限流 | ✅ 已实现（可选 `SAP_RATE_LIMIT_RPS`，governor 键控限流器，超限 429） |
 | 单次 RFC 执行超时 | ✅ 已实现（`run_blocking_with_timeout` 用 `tokio::time::timeout` 包 `spawn_blocking`；默认 60s / `SAP_REQUEST_TIMEOUT_SECS`，单请求 `timeout_secs`，超时 504） |
