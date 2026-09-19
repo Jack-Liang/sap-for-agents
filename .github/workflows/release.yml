@@ -35,7 +35,7 @@ jobs:
     name: Verify tag matches Cargo.toml version
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: tag == Cargo.toml version
         run: |
           TAG="${GITHUB_REF_NAME#v}"
@@ -103,7 +103,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
