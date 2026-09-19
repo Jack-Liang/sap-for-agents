@@ -29,7 +29,7 @@ metrics-exporter-prometheus = "0.18"
 governor = "0.10"
 # Server 模式：同步 HTTP 客户端（回调线程内调用）+ TOML 配置
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
-toml = "0.8"
+toml = "1.1"
 # ST22 结构化读取：解析 ADT runtime dumps 的 Atom feed（/api/dumps/**）
 quick-xml = "0.42"
 
