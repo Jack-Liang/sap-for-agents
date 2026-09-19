@@ -26,7 +26,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 metrics = "0.23"
 metrics-exporter-prometheus = "0.15"
 # 限流（按 IP，可选 SAP_RATE_LIMIT_RPS）
-governor = "0.7"
+governor = "0.10"
 # Server 模式：同步 HTTP 客户端（回调线程内调用）+ TOML 配置
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 toml = "0.8"
