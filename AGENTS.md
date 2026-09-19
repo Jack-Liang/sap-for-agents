@@ -236,6 +236,7 @@ curl -X POST http://127.0.0.1:3000/api/objects/prog/ZMY_REPORT/syntax \
 - Lock conflict (someone else editing) → 409 `OBJECT_LOCKED` with SAP's own message.
 - **Function modules**: in the FM source the parameter block (`FUNCTION name.` down to `EXCEPTIONS ... .`) is **regenerated from parameter metadata** — edits anchored there are silently dropped. Anchor `old_string` in the function **body**. Parameter changes need the metadata API (not built yet).
 - Writes need the object to exist (creation is not built yet) and ADT enabled; a failed write still attempts UNLOCK so no orphan lock is left behind.
+- **Read-only deployments**: the deployer may run the gateway with `SAP_READ_ONLY=1` — write endpoints (`PUT .../source`, `POST .../replace`, non-read `/api/adt` methods) then return 403 `READ_ONLY`. This is intentional: don't retry writes, stick to reads and `POST .../syntax` (still allowed, nothing is stored). `POST /api/rfc` is unaffected by the switch.
 
 ## Key constraints (pitfalls to avoid)
 

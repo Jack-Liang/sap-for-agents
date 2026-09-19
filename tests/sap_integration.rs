@@ -526,3 +526,339 @@ fn adt_proxy_passes_through_adt_status() {
         .unwrap();
     assert_eq!(resp.status(), 406, "ADT 自身状态码应透传");
 }
+
+// ========================================================================
+// 结构化 ST22 转储（/api/dumps**）
+// ========================================================================
+
+#[test]
+#[ignore]
+fn dumps_list_returns_structured_entries() {
+    let _s = start_server();
+    let resp = http_client()
+        .get(format!("{}/api/dumps?limit=5", _s.base_url))
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().unwrap();
+    let dumps = body["dumps"].as_array().expect("dumps 应为数组");
+    assert_eq!(body["count"].as_u64().unwrap(), dumps.len() as u64);
+    // 环境可能无转储（count=0 合法）；有转储时每条必须有结构化字段
+    if let Some(first) = dumps.first() {
+        let key = first["key"].as_str().expect("dump 应有 key");
+        assert!(!key.is_empty(), "key 非空（detail 端点依赖它）");
+        assert!(first["error_type"].is_string(), "应有 error_type");
+        assert!(first["at"].is_string(), "应有时间戳 at");
+    }
+}
+
+#[test]
+#[ignore]
+fn dumps_grouped_sorts_by_count_desc() {
+    let _s = start_server();
+    let resp = http_client()
+        .get(format!("{}/api/dumps/grouped", _s.base_url))
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().unwrap();
+    let groups = body["groups"].as_array().expect("groups 应为数组");
+    assert_eq!(body["count"].as_u64().unwrap(), groups.len() as u64);
+    // 组数 >=2 时验证按 count 降序（并列按最近时间，不测并列细节）
+    let counts: Vec<u64> = groups.iter().filter_map(|g| g["count"].as_u64()).collect();
+    assert_eq!(counts.len(), groups.len(), "每组都应有 count");
+    let mut sorted = counts.clone();
+    sorted.sort_unstable_by(|a, b| b.cmp(a));
+    assert_eq!(counts, sorted, "groups 应按 count 降序");
+    for g in groups {
+        assert!(g["latest_key"].is_string(), "每组应有 latest_key");
+    }
+}
+
+#[test]
+#[ignore]
+fn dumps_detail_uses_key_from_list() {
+    let _s = start_server();
+    let list: serde_json::Value = http_client()
+        .get(format!("{}/api/dumps?limit=1", _s.base_url))
+        .send()
+        .unwrap()
+        .json()
+        .unwrap();
+    let Some(first) = list["dumps"].as_array().and_then(|a| a.first()) else {
+        return; // 环境无转储，跳过（结构由上面的列表测试覆盖）
+    };
+    let key = first["key"].as_str().unwrap();
+    // key 本身含 %20 等已编码序列，原样拼进路径
+    let resp = http_client()
+        .get(format!("{}/api/dumps/{}/detail", _s.base_url, key))
+        .send()
+        .unwrap();
+    // 200 = 解析出结构化详情；404 = 转储已被清或版本过老无 detail 资源（7.50）
+    let status = resp.status();
+    assert!(
+        status == 200 || status == 404,
+        "detail 应返回 200 或 404，实际 {status}"
+    );
+    if status == 200 {
+        let body: serde_json::Value = resp.json().unwrap();
+        assert!(body["error_type"].is_string(), "detail 应有 error_type");
+        assert!(body["stack"].is_array(), "detail 应有 stack 数组");
+    }
+}
+
+// ========================================================================
+// 源码读取（/api/functions/{name}/source、/api/programs/{name}/source）
+// ========================================================================
+
+#[test]
+#[ignore]
+fn function_source_returns_lines_and_via() {
+    let _s = start_server();
+    let resp = http_client()
+        .get(format!("{}/api/functions/STFC_CONNECTION/source", _s.base_url))
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().unwrap();
+    let lines = body["lines"].as_array().expect("lines 应为数组");
+    assert!(!lines.is_empty(), "源码不应为空");
+    let via = body["source_via"].as_str().expect("应有 source_via");
+    assert!(
+        via == "rfc" || via == "adt",
+        "source_via 应标明来源渠道，实际 {via}"
+    );
+    let first = lines[0].as_str().unwrap().to_lowercase();
+    assert!(
+        first.contains("stfc_connection"),
+        "首行应是函数头，实际: {first}"
+    );
+}
+
+#[test]
+#[ignore]
+fn function_source_prologue_inlines_dependencies() {
+    let _s = start_server();
+    // BAPI_TRANSACTION_COMMIT 内部 CALL FUNCTION BALW_BAPIRETURN_GET2，
+    // 是所有版本都稳定的经典依赖，适合验证 prologue 内联
+    let resp = http_client()
+        .get(format!(
+            "{}/api/functions/BAPI_TRANSACTION_COMMIT/source?prologue=true",
+            _s.base_url
+        ))
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().unwrap();
+    let prologue = &body["prologue"];
+    assert!(prologue.is_object(), "应返回 prologue 对象");
+    let text = prologue["text"].as_str().expect("prologue 应有 text");
+    assert!(
+        text.contains("FUNCTION"),
+        "prologue.text 应内联被调函数签名块，实际: {}",
+        &text[..text.len().min(120)]
+    );
+}
+
+#[test]
+#[ignore]
+fn program_source_returns_lines_and_via() {
+    let _s = start_server();
+    // SAPLSTFC = 标准函数组 STFC 的主程序，RFC 可用的系统必有
+    let resp = http_client()
+        .get(format!("{}/api/programs/SAPLSTFC/source", _s.base_url))
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().unwrap();
+    let lines = body["lines"].as_array().expect("lines 应为数组");
+    assert!(!lines.is_empty(), "程序源码不应为空");
+    let via = body["source_via"].as_str().expect("应有 source_via");
+    assert!(via == "rfc" || via == "adt");
+}
+
+// ========================================================================
+// 透明表读取（POST /api/table/read）
+// ========================================================================
+
+#[test]
+#[ignore]
+fn table_read_t000_clients() {
+    let _s = start_server();
+    // T000（集团表）任何系统都有、行数个位数，是最安全的探针表
+    let resp = http_client()
+        .post(format!("{}/api/table/read", _s.base_url))
+        .json(&serde_json::json!({
+            "table": "T000",
+            "fields": ["MANDT", "MTEXT"],
+            "rowcount": 3
+        }))
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().unwrap();
+    assert_eq!(body["table"], "T000");
+    let rows = body["rows"].as_array().expect("rows 应为数组");
+    assert!(!rows.is_empty(), "T000 至少一行");
+    assert_eq!(body["count"].as_u64().unwrap(), rows.len() as u64);
+    for row in rows {
+        assert!(row["MANDT"].is_string(), "字段值应为字符串");
+        assert!(row["MTEXT"].is_string());
+    }
+}
+
+#[test]
+#[ignore]
+fn table_read_rejects_empty_fields() {
+    let _s = start_server();
+    let resp = http_client()
+        .post(format!("{}/api/table/read", _s.base_url))
+        .json(&serde_json::json!({"table": "T000", "fields": []}))
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    let body: serde_json::Value = resp.json().unwrap();
+    assert_eq!(body["error"]["key"], "FIELDS_EMPTY");
+}
+
+// ========================================================================
+// 语法检查（POST /api/objects/{type}/{name}/syntax，不落库）
+// ========================================================================
+
+#[test]
+#[ignore]
+fn objects_syntax_reports_error_lines() {
+    let _s = start_server();
+    // 锚在不存在的 Z 名上：ADT 按虚拟对象检查，干扰告警最少（不落库）
+    let resp = http_client()
+        .post(format!("{}/api/objects/prog/ZSYNTAX_PROBE/syntax", _s.base_url))
+        .json(&serde_json::json!({"source": "REPORT zsyntax_probe.\nWRIT 1."}))
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().unwrap();
+    let issues = body["issues"].as_array().expect("issues 应为数组");
+    let has_error = issues
+        .iter()
+        .any(|i| i["severity"] == "E" && i["line"].as_u64().unwrap_or(0) >= 1);
+    assert!(has_error, "WRIT 拼写错应报 E 级问题，实际: {issues:?}");
+}
+
+#[test]
+#[ignore]
+fn objects_syntax_clean_source_has_no_errors() {
+    let _s = start_server();
+    // 注意锚点选可执行程序语义：F 类型主程序（如 SAPLSTFC）顶层 WRITE 会报
+    // 「Statement is not accessible」E，与源码本身无关；Z 名 = type 1 语义
+    let resp = http_client()
+        .post(format!("{}/api/objects/prog/ZSYNTAX_PROBE/syntax", _s.base_url))
+        .json(&serde_json::json!({"source": "REPORT zsyntax_probe.\nWRITE 1."}))
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().unwrap();
+    let issues = body["issues"].as_array().expect("issues 应为数组");
+    assert!(
+        issues.iter().all(|i| i["severity"] != "E"),
+        "合法源码不应有 E 级问题（W 允许），实际: {issues:?}"
+    );
+}
+
+// ========================================================================
+// 只读模式（SAP_READ_ONLY=1）
+// ========================================================================
+
+#[test]
+#[ignore]
+fn read_only_blocks_object_writes_but_allows_syntax() {
+    let _s = start_server_with_env(&[("SAP_READ_ONLY", "1")]);
+    // PUT 全量写 → 403 READ_ONLY
+    let resp = http_client()
+        .put(format!("{}/api/objects/prog/ZRO_TEST/source", _s.base_url))
+        .json(&serde_json::json!({"source": "REPORT zro_test.\nWRITE 1."}))
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 403, "只读模式应拦 PUT source");
+    let body: serde_json::Value = resp.json().unwrap();
+    assert_eq!(body["error"]["key"], "READ_ONLY");
+    // POST replace → 403
+    let resp = http_client()
+        .post(format!("{}/api/objects/prog/ZRO_TEST/replace", _s.base_url))
+        .json(&serde_json::json!({"old_string": "A", "new_string": "B"}))
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 403, "只读模式应拦 replace");
+    // POST syntax（不落库）→ 照常工作
+    let resp = http_client()
+        .post(format!("{}/api/objects/prog/ZRO_TEST/syntax", _s.base_url))
+        .json(&serde_json::json!({"source": "REPORT zro_test.\nWRITE 1."}))
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 200, "syntax 不落库，只读模式应放行");
+}
+
+#[test]
+#[ignore]
+fn read_only_blocks_adt_writes_but_passes_reads() {
+    let _s = start_server_with_env(&[("SAP_READ_ONLY", "1")]);
+    // ADT 写方法 → 403 READ_ONLY（网关侧拦截，不转发到 ICF）
+    let resp = http_client()
+        .post(format!("{}/api/adt/oo/classes/zcl_ro_test/source/main", _s.base_url))
+        .header("Content-Type", "text/plain")
+        .body("class")
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 403, "只读模式应拦 ADT POST");
+    let body: serde_json::Value = resp.json().unwrap();
+    assert_eq!(body["error"]["key"], "READ_ONLY");
+    // ADT 读方法照常透传
+    let resp = http_client()
+        .get(format!("{}/api/adt/runtime/dumps", _s.base_url))
+        .header("Accept", "*/*")
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 200, "只读模式不应影响 ADT 读");
+}
+
+#[test]
+#[ignore]
+fn read_only_keeps_rfc_and_reads_working() {
+    let _s = start_server_with_env(&[("SAP_READ_ONLY", "1")]);
+    // /api/rfc 明确不在拦截范围（RFC 无法可靠区分读写），读取类端点照常
+    let resp = http_client()
+        .post(format!("{}/api/rfc", _s.base_url))
+        .json(&serde_json::json!({"func_name": "RFC_PING"}))
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 200, "只读模式不应拦 /api/rfc");
+    let resp = http_client()
+        .get(format!("{}/api/functions/STFC_CONNECTION", _s.base_url))
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 200, "只读模式不应拦接口查看");
+}
+
+#[test]
+#[ignore]
+fn idle_connection_validated_on_checkout() {
+    // 阈值压到 1s：睡 2s 后借出必然走 ping 校验路径，校验通过则调用照常成功
+    let _s = start_server_with_env(&[("SAP_POOL_IDLE_VALIDATE_SECS", "1")]);
+    let r1: serde_json::Value = http_client()
+        .post(format!("{}/api/rfc", _s.base_url))
+        .json(&serde_json::json!({"func_name": "RFC_PING"}))
+        .send()
+        .unwrap()
+        .json()
+        .unwrap();
+    assert_eq!(r1["func"], "RFC_PING");
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    let r2 = http_client()
+        .post(format!("{}/api/rfc", _s.base_url))
+        .json(&serde_json::json!({
+            "func_name": "STFC_CONNECTION",
+            "inputs": {"REQUTEXT": "after idle validate"}
+        }))
+        .send()
+        .unwrap();
+    assert_eq!(r2.status(), 200, "空闲超阈值后借出（先 ping 校验）应照常成功");
+}

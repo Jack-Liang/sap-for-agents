@@ -208,7 +208,8 @@ fn adt_unreachable(e: reqwest::Error) -> RfcError {
     }
 }
 
-fn is_write_method(m: &Method) -> bool {
+/// 是否为写方法（ADT 代理的 CSRF 处理与只读模式的写拦截共用）。
+pub(crate) fn is_write_method(m: &Method) -> bool {
     matches!(*m, Method::POST | Method::PUT | Method::DELETE | Method::PATCH)
 }
 

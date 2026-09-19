@@ -83,7 +83,11 @@ async fn run_client() -> Result<(), Box<dyn std::error::Error>> {
     };
     tracing::info!(listen = cfg.listen_addr, "client 配置加载完成");
 
-    let pool = RfcConnectionPool::with_max_size(cfg.conn_params, cfg.pool_size)?;
+    let pool = RfcConnectionPool::with_max_size(
+        cfg.conn_params,
+        cfg.pool_size,
+        cfg.pool_idle_validate,
+    )?;
     tracing::info!(pool_size = cfg.pool_size, "SAP 系统连接成功（多连接池）");
     // 认证：未设 SAP_API_KEY → None（免鉴权）；设置后 /api/* 要求 Bearer token
     let auth_enabled = cfg.api_key.is_some();
@@ -91,6 +95,11 @@ async fn run_client() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!(auth_enabled, "API 认证配置");
     // 全局请求超时（/api/rfc 还支持 per-request timeout_secs 覆盖）
     server::init_request_timeout(cfg.request_timeout);
+    // 只读模式（SAP_READ_ONLY）：拦截网关写端点（objects 写 / ADT 写方法）
+    server::init_read_only(cfg.read_only);
+    if cfg.read_only {
+        tracing::warn!("🔒 只读模式已启用（SAP_READ_ONLY）：/api/objects 写端点与 /api/adt 写方法返回 403；/api/rfc 不受影响");
+    }
     // Prometheus 指标（GET /metrics）
     server::init_metrics();
     // 可选限流（按 IP；未设 SAP_RATE_LIMIT_RPS 则不限流）

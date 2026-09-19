@@ -13,6 +13,9 @@ pub struct AppConfig {
     pub listen_addr: String,
     /// SAP 连接池上限（并发 SAP 调用数）
     pub pool_size: usize,
+    /// 连接空闲多久后，借出前需 `RFC_PING` 校验（默认 30s，
+    /// 由 `SAP_POOL_IDLE_VALIDATE_SECS` 配置；设 0 禁用校验）
+    pub pool_idle_validate: std::time::Duration,
     /// 可选 API key：设置后 `/api/*` 需 Bearer token；`None` = 免鉴权
     pub api_key: Option<String>,
     /// 单次 SAP 调用的全局超时（默认 60s，由 `SAP_REQUEST_TIMEOUT_SECS` 配置）
@@ -26,6 +29,10 @@ pub struct AppConfig {
     pub adt_user: String,
     /// ADT 代理认证密码（`SAP_ADT_PASSWD` 覆盖，默认同 SAP_PASSWD）
     pub adt_passwd: String,
+    /// 只读模式（`SAP_READ_ONLY`，识别 1/true/yes/on）：拦截网关自身写端点
+    /// （objects PUT/replace、ADT 写方法）。`/api/rfc` 不受影响——RFC 无法
+    /// 按函数名可靠区分读写，SAP 端授权才是真正的边界。
+    pub read_only: bool,
 }
 
 fn required(key: &str) -> Result<String, String> {
@@ -46,6 +53,18 @@ pub fn load() -> Result<AppConfig, String> {
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|&n| n >= 1)
         .unwrap_or(8);
+    // 空闲连接借出前校验阈值（默认 30s；0 = 禁用校验）
+    let pool_idle_validate = env::var("SAP_POOL_IDLE_VALIDATE_SECS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .map(|n| {
+            if n == 0 {
+                std::time::Duration::MAX
+            } else {
+                std::time::Duration::from_secs(n)
+            }
+        })
+        .unwrap_or(std::time::Duration::from_secs(30));
     // API key：留空/未设 → None（免鉴权）；设置后 /api/* 要求 Bearer token
     let api_key = env::var("SAP_API_KEY").ok().filter(|s| !s.is_empty());
     // 全局请求超时（默认 60s，≥1）
@@ -69,6 +88,10 @@ pub fn load() -> Result<AppConfig, String> {
     };
     let adt_user = env::var("SAP_ADT_USER").unwrap_or_else(|_| user.clone());
     let adt_passwd = env::var("SAP_ADT_PASSWD").unwrap_or_else(|_| passwd.clone());
+    // 只读模式：识别 1/true/yes/on（大小写不敏感），其余值视为关闭
+    let read_only = env::var("SAP_READ_ONLY")
+        .map(|v| matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false);
 
     // 键为 'static 字面量，值使用环境变量的 String（运行期存活）
     Ok(AppConfig {
@@ -82,12 +105,14 @@ pub fn load() -> Result<AppConfig, String> {
         ],
         listen_addr,
         pool_size,
+        pool_idle_validate,
         api_key,
         request_timeout,
         rate_limit_rps,
         adt_base_url,
         adt_user,
         adt_passwd,
+        read_only,
     })
 }
 
@@ -114,10 +139,12 @@ mod tests {
             "SAP_LISTEN_ADDR",
             "SAP_API_KEY",
             "SAP_REQUEST_TIMEOUT_SECS",
+            "SAP_POOL_IDLE_VALIDATE_SECS",
             "SAP_RATE_LIMIT_RPS",
             "SAP_ADT_BASE_URL",
             "SAP_ADT_USER",
             "SAP_ADT_PASSWD",
+            "SAP_READ_ONLY",
         ] {
             unsafe {
                 std::env::remove_var(k);
@@ -175,6 +202,59 @@ mod tests {
         }
         let cfg = load().unwrap();
         assert_eq!(cfg.request_timeout, std::time::Duration::from_secs(120));
+    }
+
+    #[test]
+    fn load_respects_pool_idle_validate() {
+        let _g = ENV_LOCK.lock().unwrap();
+        clear_env();
+        set_all_required();
+        unsafe {
+            std::env::set_var("SAP_POOL_IDLE_VALIDATE_SECS", "5");
+        }
+        let cfg = load().unwrap();
+        assert_eq!(cfg.pool_idle_validate, std::time::Duration::from_secs(5));
+        // 0 = 禁用（永不触发校验）
+        unsafe {
+            std::env::set_var("SAP_POOL_IDLE_VALIDATE_SECS", "0");
+        }
+        let cfg = load().unwrap();
+        assert_eq!(cfg.pool_idle_validate, std::time::Duration::MAX);
+    }
+
+    #[test]
+    fn load_defaults_pool_idle_validate_to_30s() {
+        let _g = ENV_LOCK.lock().unwrap();
+        clear_env();
+        set_all_required();
+        let cfg = load().unwrap();
+        assert_eq!(cfg.pool_idle_validate, std::time::Duration::from_secs(30));
+    }
+
+    #[test]
+    fn load_parses_read_only_truthy_values() {
+        let _g = ENV_LOCK.lock().unwrap();
+        for (val, expect) in [("1", true), ("true", true), ("YES", true), ("On", true)] {
+            clear_env();
+            set_all_required();
+            unsafe {
+                std::env::set_var("SAP_READ_ONLY", val);
+            }
+            let cfg = load().unwrap();
+            assert_eq!(cfg.read_only, expect, "SAP_READ_ONLY={val} 应为 {expect}");
+        }
+        // 假值/未设 → 关闭
+        for val in ["0", "false", ""] {
+            clear_env();
+            set_all_required();
+            unsafe {
+                std::env::set_var("SAP_READ_ONLY", val);
+            }
+            assert!(!load().unwrap().read_only, "SAP_READ_ONLY={val} 应为 false");
+        }
+        clear_env();
+        set_all_required();
+        assert!(!load().unwrap().read_only, "未设 SAP_READ_ONLY 应为 false");
     }
 
     #[test]

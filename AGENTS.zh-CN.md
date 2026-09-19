@@ -236,6 +236,7 @@ curl -X POST http://127.0.0.1:3000/api/objects/prog/ZMY_REPORT/syntax \
 - 锁冲突（他人正在编辑）→ 409 `OBJECT_LOCKED`，消息来自 SAP 原文。
 - **函数模块**：FM 源码的参数块（`FUNCTION 名.` 到 `EXCEPTIONS … .`）由参数元数据再生成——锚定在此区域的编辑会被**静默丢弃**，请把 `old_string` 锚定在函数**体**内；参数增删需元数据接口（尚未提供）。
 - 写入要求对象已存在（对象创建尚未提供）且 ADT 已启用；写入失败也会尽力 UNLOCK，不留孤儿锁。
+- **只读部署**：部署者可能以 `SAP_READ_ONLY=1` 运行网关——写端点（`PUT .../source`、`POST .../replace`、`/api/adt` 非读方法）此时返回 403 `READ_ONLY`。这是刻意为之：不要重试写操作，改为只读操作与 `POST .../syntax`（仍可用，不落库）。`POST /api/rfc` 不受该开关影响。
 
 ## 关键约束（避坑）
 

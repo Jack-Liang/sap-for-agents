@@ -169,7 +169,7 @@ curl -X POST http://127.0.0.1:3000/api/rfc \
 
 | 项 | 说明 |
 |---|---|
-| 并发 | 多连接池（默认 8，`SAP_POOL_SIZE` 可配），不同请求可并行执行 SAP 调用；池耗尽时 acquire 等待上限 120s |
+| 并发 | 多连接池（默认 8，`SAP_POOL_SIZE` 可配），不同请求可并行执行 SAP 调用；池耗尽时 acquire 等待上限 120s。空闲超过 `SAP_POOL_IDLE_VALIDATE_SECS`（默认 30s）的连接借出前先 `RFC_PING` 校验——SAP 端重启造成的僵尸连接在借出时即被丢弃，不再污染空闲后的首批请求。连接/建连失败按错误码有界重试（最多 3 轮、每轮 300ms 退避，重试只用新建连接），SAP 暖机窗口（license 校验等）的瞬断对调用方透明 |
 | 字符集 | 通过 UTF-16 桥接 SAP UC，UTF-8 输入输出 |
 | 平台 | Windows/Linux/macOS × x86_64/aarch64（`build.rs` 自动选 SDK 子目录） |
 | RFC 调用超时 | 连接池层有 acquire 超时（120s）；单次 RFC 调用暂无执行超时 |
@@ -190,6 +190,8 @@ curl -X POST http://127.0.0.1:3000/api/rfc \
 | `SAP_LANG` | ❌ | `EN` | 登录语言（也影响文档端点的默认语言） |
 | `SAP_LISTEN_ADDR` | ❌ | `127.0.0.1:3000` | HTTP 服务监听地址 |
 | `SAP_POOL_SIZE` | ❌ | `8` | SAP 连接池上限（并发调用数），≥1 |
+| `SAP_POOL_IDLE_VALIDATE_SECS` | ❌ | `30` | 空闲连接借出前校验阈值（秒）：空闲超过该时长的连接，借出前先 `RFC_PING` 校验（僵尸连接丢弃重建），空闲后的首批请求不再撞 `RFC_INVALID_HANDLE`。`0` = 禁用校验。背景：连接死亡与 SAP 是否重启无关——网关空闲断连策略（`gw/conn_disconnect`，依系统配置而异）、笔记本休眠/唤醒、Docker/VM 暂停恢复、VPN 重连、防火墙/NAT 空闲超时都会**静默**产生半开连接，池端收不到任何通知 |
+| `SAP_READ_ONLY` | ❌ | _(关闭)_ | 只读模式（`1`/`true`/`yes`/`on`）：网关自身写端点——`/api/objects` 的 `PUT source` 与 `POST replace`、`/api/adt` 非读方法——返回 `403 READ_ONLY`。`POST syntax`（不落库）与 `POST /api/rfc` 不受影响（RFC 无法按函数名可靠区分读写，SAP 端授权才是真正的边界） |
 | `SAP_REQUEST_TIMEOUT_SECS` | ❌ | `60` | 单次 SAP 调用全局超时（秒），≥1；超时返回 504。`/api/rfc` 可用请求体 `timeout_secs` per-request 覆盖 |
 | `SAP_RATE_LIMIT_RPS` | ❌ | _(不限流)_ | `/api` 按调用方 IP 的每秒请求数，≥1 启用；超限返回 429 |
 | `SAP_ROLE` | ❌ | `client` | 运行模式：`client`/`server`/`both`（server 模式见 [§9](#9-server-端模式被-sap-调用)） |

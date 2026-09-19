@@ -77,6 +77,60 @@ pub fn init_rate_limiter(rps: Option<u32>) {
     let _ = RATE_LIMITER.set(limiter);
 }
 
+/// 只读模式（`SAP_READ_ONLY=1`，启动期由 [`init_read_only`] 写入；默认关闭）。
+///
+/// 语义：拦截**网关自身编排的写端点**（`/api/objects` 的 PUT source / POST replace、
+/// `/api/adt` 的非读方法），防误改。`syntax` 不落库、照常放行；`POST /api/rfc`
+/// **不在拦截范围**——RFC 无法按函数名可靠区分读写，SAP 端授权才是真正的边界。
+static READ_ONLY: OnceLock<bool> = OnceLock::new();
+
+/// 启动期设置只读模式。
+pub fn init_read_only(enabled: bool) {
+    let _ = READ_ONLY.set(enabled);
+}
+
+fn read_only_enabled() -> bool {
+    *READ_ONLY.get().unwrap_or(&false)
+}
+
+/// 只读模式下该请求是否应被拦截（纯函数，便于单测）。
+fn is_read_only_blocked(method: &axum::http::Method, path: &str) -> bool {
+    if path.starts_with("/api/adt/") {
+        return crate::adt::is_write_method(method);
+    }
+    if path.starts_with("/api/objects/") {
+        if *method == axum::http::Method::PUT {
+            return true; // 全量写 source
+        }
+        // POST 分发 replace / syntax：replace 落库要拦；syntax 只检查不落库，放行
+        if *method == axum::http::Method::POST {
+            return path.rsplit('/').next() == Some("replace");
+        }
+    }
+    false
+}
+
+/// 只读守卫中间件：拦截写端点（403 READ_ONLY），其余照常放行。
+/// 挂在鉴权层之内——未授权的写请求先拿到 401，语义正确。
+async fn read_only_guard(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Result<axum::response::Response, RfcError> {
+    if read_only_enabled() && is_read_only_blocked(req.method(), req.uri().path()) {
+        return Err(RfcError {
+            code: -1,
+            status: 403,
+            message: format!(
+                "只读模式已启用（SAP_READ_ONLY），写端点被禁用: {} {}",
+                req.method(),
+                req.uri().path()
+            ),
+            key: "READ_ONLY".into(),
+        });
+    }
+    Ok(next.run(req).await)
+}
+
 /// 构造超时错误（504 Gateway Timeout，body 走 ErrorResponse）。
 fn timeout_error(timeout: Duration) -> RfcError {
     RfcError {
@@ -162,6 +216,7 @@ pub fn app(pool: SharedPool) -> Router {
         )
         // ADT REST 通用代理（dump 正文、类/程序源码等，任何方法透传）
         .route("/api/adt/*path", axum::routing::any(crate::adt::adt_proxy))
+        .layer(axum::middleware::from_fn(read_only_guard))
         .layer(axum::middleware::from_fn(crate::auth::require_api_key))
         .layer(axum::middleware::from_fn(rate_limit_middleware));
 
@@ -1311,6 +1366,23 @@ mod tests {
         // 非敏感 key 保留值
         assert_eq!(mask_value("REQUTEXT", &ScalarValue::Chars("hi".into())), "hi");
         assert_eq!(mask_value("MAX_ROWS", &ScalarValue::Int(100)), "100");
+    }
+
+    #[test]
+    fn read_only_blocks_gateway_writes_only() {
+        use axum::http::Method;
+        // 拦：objects 全量写 + replace + ADT 写方法
+        assert!(is_read_only_blocked(&Method::PUT, "/api/objects/prog/Z/report/source"));
+        assert!(is_read_only_blocked(&Method::POST, "/api/objects/prog/Z/replace"));
+        assert!(is_read_only_blocked(&Method::POST, "/api/adt/oo/classes/zcl_foo/source/main"));
+        assert!(is_read_only_blocked(&Method::DELETE, "/api/adt/oo/classes/zcl_foo"));
+        // 放行：syntax（不落库）、objects 读、ADT 读、rfc、其他端点
+        assert!(!is_read_only_blocked(&Method::POST, "/api/objects/prog/Z/syntax"));
+        assert!(!is_read_only_blocked(&Method::GET, "/api/objects/prog/Z/source"));
+        assert!(!is_read_only_blocked(&Method::GET, "/api/adt/runtime/dumps"));
+        assert!(!is_read_only_blocked(&Method::POST, "/api/rfc"));
+        assert!(!is_read_only_blocked(&Method::POST, "/api/functions/search"));
+        assert!(!is_read_only_blocked(&Method::POST, "/api/table/read"));
     }
 
     #[test]

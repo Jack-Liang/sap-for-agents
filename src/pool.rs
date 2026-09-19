@@ -5,7 +5,8 @@
 //! 但不同连接之间可并行——配合 tokio 的 `spawn_blocking`，handler
 //! 并发请求能拿到不同连接并行执行。
 //!
-//! 连接生命周期：首次按需创建 → 复用 → 遇通信错误丢弃 → 池满后新建补充。
+//! 连接生命周期：首次按需创建 → 复用（空闲超阈值时借出前 `RFC_PING` 校验）
+//! → 遇通信错误丢弃 → 池满后新建补充。
 //! 对调用方完全透明（`with_connection` 接口与旧单连接版一致）。
 
 use crate::connection::RfcConnection;
@@ -50,14 +51,24 @@ fn should_discard(err: &RfcError) -> bool {
     RECONNECT_RC.contains(&err.code)
 }
 
+/// 默认的空闲校验阈值：连接归还后空闲超过 30s，下次借出前先 ping 一遍。
+/// 热路径（连续调用间隔 < 30s）不产生任何额外开销。
+const DEFAULT_IDLE_VALIDATE: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// 单次 wait_timeout 的等待时长（让循环定期醒来检查池状态）。
 const WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 /// acquire 的总等待上限：超过则返回错误，避免池耗尽时调用方永久挂起。
 const ACQUIRE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
+/// 空闲连接：记录归还时刻，借出时据此判断是否需要先 ping 校验。
+struct IdleConn {
+    conn: RfcConnection,
+    idle_since: std::time::Instant,
+}
+
 /// 池的内部可变状态：空闲连接栈 + 当前总连接数。
 struct PoolInner {
-    idle: Vec<RfcConnection>,
+    idle: Vec<IdleConn>,
     /// 当前已创建的连接总数（空闲 + 借出中）
     total: usize,
 }
@@ -73,6 +84,8 @@ pub struct RfcConnectionPool {
     params: Vec<(&'static str, String)>,
     /// 池上限（含空闲 + 借出）。超过则等待，不无限增长。
     max_size: usize,
+    /// 空闲多久后借出前需先 `RFC_PING` 校验（< 阈值视为刚归还、直接借出）
+    idle_validate_after: std::time::Duration,
     inner: Mutex<PoolInner>,
     /// 空闲连接可用时唤醒等待者
     cv: Condvar,
@@ -82,13 +95,15 @@ impl RfcConnectionPool {
     /// 创建池（默认上限 8）：立即建立首次连接，其余按需创建。
     #[allow(dead_code)]
     pub fn new(params: Vec<(&'static str, String)>) -> Result<Self, RfcError> {
-        Self::with_max_size(params, 8)
+        Self::with_max_size(params, 8, DEFAULT_IDLE_VALIDATE)
     }
 
-    /// 指定池上限创建。
+    /// 指定池上限创建。`idle_validate_after`：连接空闲超过该时长后，
+    /// 借出前先用 `RFC_PING` 校验（防 SAP 端已悄悄断开的僵尸连接污染首批请求）。
     pub fn with_max_size(
         params: Vec<(&'static str, String)>,
         max_size: usize,
+        idle_validate_after: std::time::Duration,
     ) -> Result<Self, RfcError> {
         let borrowed: Vec<(&str, &str)> = params.iter().map(|(k, v)| (*k, v.as_str())).collect();
         let conn = RfcConnection::new(&borrowed)?;
@@ -97,8 +112,12 @@ impl RfcConnectionPool {
         Ok(Self {
             params,
             max_size,
+            idle_validate_after,
             inner: Mutex::new(PoolInner {
-                idle: vec![conn],
+                idle: vec![IdleConn {
+                    conn,
+                    idle_since: std::time::Instant::now(),
+                }],
                 total: 1,
             }),
             cv: Condvar::new(),
@@ -107,69 +126,140 @@ impl RfcConnectionPool {
 
     /// 用一个连接执行闭包。接口与旧单连接版完全一致，调用方无需改动。
     ///
-    /// - 闭包成功 → 归还连接，返回结果
-    /// - 闭包失败但属通信类 → 丢弃连接，新建一个重试一次
-    /// - 闭包失败且非通信类 → 归还连接（连接仍健康），返回错误
+    /// 首轮从池里借出（复用空闲或按需新建）；执行失败属通信类（连接已死）→
+    /// 丢弃，**新建一条保证新鲜的连接**重试。建连失败（含首轮借出时的按需
+    /// 新建）若属可重试类——SAP 暖机窗口：license 校验未就绪 →
+    /// `RFC_LOGON_FAILURE`、CPIC 半就绪等——同样退避后重试。
+    /// 每轮迭代 = 一次取连接 + 一次执行，最多 [`MAX_ATTEMPTS`] 轮，
+    /// 全败才把最后一次的错误上抛。
     ///
-    /// 无空闲连接且未达上限时新建；已达上限则阻塞等待他人归还。
+    /// 重试绝不从空闲栈取连接：SAP 端批量断开后栈里可能全是死连接，
+    /// pop 到死连接会让重试白费、错误直接漏给调用方（用户反馈的
+    /// 「有时候 curl 返回句柄失效」即此路径）。
     pub fn with_connection<R, F>(&self, mut f: F) -> Result<R, RfcError>
     where
         F: FnMut(&RfcConnection) -> Result<R, RfcError>,
     {
-        // 1. 借出一个连接
-        let conn = self.acquire()?;
+        /// 通信类错误连败后的退避（等 SAP 暖机/抖动窗口过去）
+        const RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(300);
+        /// 总尝试轮数上限（每轮 = 一次取连接 + 一次执行）
+        const MAX_ATTEMPTS: u8 = 3;
 
-        // 2. 执行
-        let result = f(&conn);
-
-        match result {
-            Ok(r) => {
-                self.release(conn);
-                Ok(r)
-            }
-            Err(e) if should_discard(&e) => {
-                // 通信类错误：丢弃废连接，新建一个重试
-                tracing::warn!(code = e.code, key = %e.key, "SAP 连接失败，丢弃并重试");
-                self.discard_and_replenish(conn)?;
-                // 重新借一个（此时池里至少有刚新建的那个）
-                let conn2 = self.acquire()?;
-                let r = f(&conn2);
-                // 重试失败时也要按错误码决定丢弃/归还：
-                // 若仍属"应丢弃"类（含 RFC_INVALID_HANDLE）→ conn2 也丢，避免把毒连接塞回池里
-                // 否则（业务类错误，比如参数错）→ 归还，连接本身仍健康
-                match &r {
-                    Err(e2) if should_discard(e2) => {
-                        tracing::warn!(code = e2.code, key = %e2.key, "SAP 重试连接也失败，丢弃（不归还）");
-                        // 显式 drop conn2 触发 RfcCloseConnection；total 由 create_connection 加回去，
-                        // 这里同步减回去，保持计数平衡。
-                        drop(conn2);
-                        if let Ok(mut guard) = self.inner.lock() {
-                            guard.total = guard.total.saturating_sub(1);
-                            self.cv.notify_one();
+        // None = 本轮需要取连接（首轮 acquire 复用池，重试轮 create 保证新鲜）
+        let mut conn: Option<RfcConnection> = None;
+        for attempt in 1..=MAX_ATTEMPTS {
+            // 1) 确保手上有连接
+            let c = match conn.take() {
+                Some(c) => c,
+                None => {
+                    let got = if attempt == 1 {
+                        self.acquire() // 首轮：复用空闲或按需新建
+                    } else {
+                        self.create_and_count() // 重试轮：保证新鲜，不碰空闲栈
+                    };
+                    match got {
+                        Ok(c) => c,
+                        Err(e) if should_discard(&e) => {
+                            // 建连失败但属可重试类（暖机/license 窗口）：消耗本轮，退避再来
+                            tracing::warn!(
+                                code = e.code, key = %e.key, attempt,
+                                "SAP 取/建连接失败（可重试类），退避后重试"
+                            );
+                            if attempt == MAX_ATTEMPTS {
+                                return Err(e);
+                            }
+                            std::thread::sleep(RETRY_BACKOFF);
+                            continue;
                         }
+                        Err(e) => return Err(e), // 配置类错误（参数/密码）：重试无意义
                     }
-                    _ => self.release(conn2),
                 }
-                r
-            }
-            Err(e) => {
-                // 非通信错误（参数错/ABAP 业务异常）：连接仍健康，归还
-                self.release(conn);
-                Err(e)
+            };
+            // 2) 执行
+            match f(&c) {
+                Ok(r) => {
+                    self.release(c);
+                    return Ok(r);
+                }
+                Err(e) if should_discard(&e) => {
+                    tracing::warn!(
+                        code = e.code, key = %e.key, attempt,
+                        "SAP 连接失败，丢弃并新建重试"
+                    );
+                    drop(c); // 触发 RfcCloseConnection；计数在下方减回
+                    self.dec_total_and_notify();
+                    if attempt == MAX_ATTEMPTS {
+                        tracing::warn!(attempts = attempt, "SAP 重试均失败，错误上抛");
+                        return Err(e);
+                    }
+                    std::thread::sleep(RETRY_BACKOFF);
+                    // conn 保持 None → 下轮新建
+                }
+                Err(e) => {
+                    // 非通信错误（参数错/ABAP 业务异常）：连接仍健康，归还
+                    self.release(c);
+                    return Err(e);
+                }
             }
         }
+        unreachable!("循环必经 return 退出")
+    }
+
+    /// 计数减一并唤醒等待者（一条连接被丢弃，腾出可建配额）。
+    fn dec_total_and_notify(&self) {
+        if let Ok(mut guard) = self.inner.lock() {
+            guard.total = guard.total.saturating_sub(1);
+        }
+        self.cv.notify_one();
+    }
+
+    /// 新建连接并计入总数（借出状态）。失败时计数不动（未建成就不存在）。
+    fn create_and_count(&self) -> Result<RfcConnection, RfcError> {
+        let conn = self.create_connection()?;
+        if let Ok(mut guard) = self.inner.lock() {
+            guard.total += 1;
+        }
+        self.cv.notify_one();
+        Ok(conn)
     }
 
     /// 借出一个连接：优先 pop 空闲；无空闲且未达上限则新建；达上限则等待。
+    ///
+    /// 空闲超过 `idle_validate_after` 的连接，借出前先 `RFC_PING` 校验：
+    /// SAP 端会话死亡（网关重启/空闲超时）不会主动通知本端，pop 到僵尸连接
+    /// 只能等业务调用撞上 `RFC_INVALID_HANDLE`。校验把这次失败提前到借出时，
+    /// 业务请求拿到的永远是已确认可达的连接。校验失败 → 丢弃该连接，继续取下一个。
     ///
     /// 等待有总超时上限（ACQUIRE_TIMEOUT），避免池耗尽时调用方永久挂起。
     fn acquire(&self) -> Result<RfcConnection, RfcError> {
         let mut guard = self.inner.lock().map_err(|e| poison_err("连接池锁", e))?;
         let deadline = std::time::Instant::now() + ACQUIRE_TIMEOUT;
         loop {
-            // 有空闲：直接 pop
-            if let Some(conn) = guard.idle.pop() {
-                return Ok(conn);
+            // 有空闲：pop 出来
+            if let Some(entry) = guard.idle.pop() {
+                // 刚归还不久：直接借出（热路径，不加 ping 开销）
+                if entry.idle_since.elapsed() < self.idle_validate_after {
+                    return Ok(entry.conn);
+                }
+                // 空闲已久：出锁校验（FFI 调用可能阻塞，不能持锁）
+                drop(guard);
+                match entry.conn.ping() {
+                    Ok(()) => return Ok(entry.conn),
+                    Err(e) => {
+                        // 校验失败：连接不可信，丢弃（drop 触发 RfcCloseConnection），
+                        // 计数减一后继续循环——取下一个空闲或新建
+                        tracing::warn!(code = e.code, key = %e.key, "空闲连接校验失败，丢弃并重建");
+                        drop(entry.conn);
+                        guard = self
+                            .inner
+                            .lock()
+                            .map_err(|e2| poison_err("连接池锁", e2))?;
+                        guard.total = guard.total.saturating_sub(1);
+                        // 腾出一个可建配额，唤醒等待者重估（持锁 notify 合法）
+                        self.cv.notify_one();
+                        continue;
+                    }
+                }
             }
             // 无空闲但未达上限：新建（锁内不建连接——握手慢，会阻塞他人）
             if guard.total < self.max_size {
@@ -209,45 +299,16 @@ impl RfcConnectionPool {
         }
     }
 
-    /// 归还健康连接到空闲栈，唤醒一个等待者。
+    /// 归还健康连接到空闲栈（记录归还时刻，供借出时判断是否需校验），唤醒一个等待者。
     fn release(&self, conn: RfcConnection) {
         if let Ok(mut guard) = self.inner.lock() {
-            guard.idle.push(conn);
+            guard.idle.push(IdleConn {
+                conn,
+                idle_since: std::time::Instant::now(),
+            });
         }
         // 无论锁成功与否都唤醒（锁毒化时等待者会自行报错）
         self.cv.notify_one();
-    }
-
-    /// 丢弃废连接并补充一个新建连接（保持池容量）。
-    /// 旧连接 drop 时自动 RfcCloseConnection。
-    fn discard_and_replenish(&self, _discarded: RfcConnection) -> Result<(), RfcError> {
-        // _discarded 在函数结束时 drop，自动关闭。
-        // 先减计数（旧连接即将销毁），再建新的（计数加回）。
-        {
-            let mut guard = self.inner.lock().map_err(|e| poison_err("连接池锁", e))?;
-            guard.total -= 1; // 旧连接销毁，腾出配额
-        }
-        // 新建并放回空闲栈
-        let new_conn = match self.create_connection() {
-            Ok(c) => c,
-            Err(e) => {
-                // 新建失败：把 total 加回，避免池容量永久缩水
-                if let Ok(mut guard) = self.inner.lock() {
-                    guard.total += 1;
-                }
-                // 唤醒等待者让他们也重试/失败
-                self.cv.notify_one();
-                return Err(e);
-            }
-        };
-        {
-            let mut guard = self.inner.lock().map_err(|e| poison_err("连接池锁", e))?;
-            guard.total += 1;
-            guard.idle.push(new_conn);
-        }
-        self.cv.notify_one();
-        tracing::info!("SAP 连接已重建（池内补充）");
-        Ok(())
     }
 
     /// 用保存的参数新建一个连接（无锁操作，调用方负责计数管理）。
