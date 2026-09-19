@@ -33,6 +33,10 @@ pub struct AppConfig {
     /// （objects PUT/replace、ADT 写方法）。`/api/rfc` 不受影响——RFC 无法
     /// 按函数名可靠区分读写，SAP 端授权才是真正的边界。
     pub read_only: bool,
+    /// 新版本检查（`SAP_UPDATE_CHECK`，默认开启；off/false/0/no 关闭）：
+    /// 启动时与每 24h 查 GitHub 最新 Release（仅一个匿名 GET，无遥测），
+    /// 结果进 `/api/version` 的 latest 块与首页页脚。
+    pub update_check: bool,
 }
 
 fn required(key: &str) -> Result<String, String> {
@@ -92,6 +96,15 @@ pub fn load() -> Result<AppConfig, String> {
     let read_only = env::var("SAP_READ_ONLY")
         .map(|v| matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
         .unwrap_or(false);
+    // 新版本检查：默认开启；识别 0/false/off/no（大小写不敏感）为关闭
+    let update_check = env::var("SAP_UPDATE_CHECK")
+        .map(|v| {
+            !matches!(
+                v.trim().to_lowercase().as_str(),
+                "0" | "false" | "off" | "no"
+            )
+        })
+        .unwrap_or(true);
 
     // 键为 'static 字面量，值使用环境变量的 String（运行期存活）
     Ok(AppConfig {
@@ -113,6 +126,7 @@ pub fn load() -> Result<AppConfig, String> {
         adt_user,
         adt_passwd,
         read_only,
+        update_check,
     })
 }
 
@@ -145,6 +159,7 @@ mod tests {
             "SAP_ADT_USER",
             "SAP_ADT_PASSWD",
             "SAP_READ_ONLY",
+            "SAP_UPDATE_CHECK",
         ] {
             unsafe {
                 std::env::remove_var(k);
@@ -255,6 +270,36 @@ mod tests {
         clear_env();
         set_all_required();
         assert!(!load().unwrap().read_only, "未设 SAP_READ_ONLY 应为 false");
+    }
+
+    #[test]
+    fn load_update_check_defaults_on_and_disables() {
+        let _g = ENV_LOCK.lock().unwrap();
+        // 未设 → 默认开启
+        clear_env();
+        set_all_required();
+        assert!(load().unwrap().update_check, "未设 SAP_UPDATE_CHECK 应默认开启");
+        // off/false/0/no（大小写不敏感）→ 关闭
+        for val in ["off", "false", "0", "NO", " Off "] {
+            clear_env();
+            set_all_required();
+            unsafe {
+                std::env::set_var("SAP_UPDATE_CHECK", val);
+            }
+            assert!(
+                !load().unwrap().update_check,
+                "SAP_UPDATE_CHECK={val} 应关闭"
+            );
+        }
+        // 其余值（含 on/1/true）→ 开启
+        for val in ["on", "1", "true", "anything"] {
+            clear_env();
+            set_all_required();
+            unsafe {
+                std::env::set_var("SAP_UPDATE_CHECK", val);
+            }
+            assert!(load().unwrap().update_check, "SAP_UPDATE_CHECK={val} 应开启");
+        }
     }
 
     #[test]

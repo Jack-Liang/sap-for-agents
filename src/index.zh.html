@@ -386,6 +386,8 @@ tailwind.config = {
             项目源码
         </a>
         <a class="font-code-sm text-code-sm text-on-surface-variant hover:text-primary transition-colors" href="https://github.com/Jack-Liang/sap-for-agents/issues" target="_blank">问题反馈</a>
+        <a href="/api/version" title="网关自描述（版本 / 能力开关 / SAP 系统）" class="font-code-sm text-code-sm text-on-surface-variant hover:text-primary transition-colors bg-surface-container-high px-sm py-xs rounded border border-outline-variant/40">v{{VERSION}} · {{COMMIT}}</a>
+        <a href="{{LATEST_URL}}" style="display:{{UPDATE_HINT_VISIBILITY}}" title="GitHub 上有新版本" class="font-code-sm text-code-sm text-primary hover:text-on-surface transition-colors bg-surface-container-high px-sm py-xs rounded border border-outline-variant/40">可更新 v{{LATEST_VERSION}} ↗</a>
     </div>
     <div class="font-code-sm text-code-sm text-on-surface-variant">
         完整文档见 <code class="font-code-sm">README.md</code> / <code class="font-code-sm">AGENTS.md</code>

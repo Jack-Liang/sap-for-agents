@@ -341,6 +341,11 @@ curl http://127.0.0.1:3000/api/version
 #     "adt": true,                       # true = /api/adt/** and /api/dumps* are usable
 #     "rate_limit_rps": null             # per-IP cap; null = unlimited
 #   },
+#   "latest": {                          # background GitHub release check (startup + every 24h);
+#     "version": "0.11.0",               # null = not fetched / disabled (SAP_UPDATE_CHECK=off) /
+#     "url": "https://github.com/...",   # unreachable — this field never blocks the response
+#     "update_available": true
+#   },
 #   "sap": {                             # fetched lazily on first call, cached for the process lifetime
 #     "sysid": "A4H", "release": "816", "host": "vhcala4h", "os": "Linux",
 #     "destination": "vhcala4hci_A4H_00", "client": "001"
@@ -348,6 +353,6 @@ curl http://127.0.0.1:3000/api/version
 # }
 ```
 
-- When SAP is unreachable, `sap` is `null` and `sap_error` carries the reason — the endpoint still returns 200.
+- When SAP is unreachable, `sap` is `null` and `sap_error` carries the reason — the endpoint still returns 200. Same resilience for `latest` (background, cached).
 - `sap.release` is the kernel/Basis level (e.g. `816`); it does **not** distinguish ECC vs S/4HANA. To detect S/4, check the `CVERS` table for the `S4CORE` component via `POST /api/table/read`.
 - MCP clients get the same payload from the `get_gateway_info` tool.

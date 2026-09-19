@@ -17,7 +17,6 @@ use crate::server::SharedPool;
 use serde_json::{json, Value};
 use std::sync::Arc;
 use std::time::Duration;
-
 /// 登录客户端号（启动期由 [`init_sap_client`] 写入）。
 static SAP_CLIENT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
@@ -42,6 +41,8 @@ const SAP_INFO_TIMEOUT: Duration = Duration::from_secs(10);
 /// 组装完整的自描述 JSON（`/api/version` 与 `get_gateway_info` 共用）。
 pub async fn gateway_info(pool: &SharedPool) -> Value {
     let mut out = local_info();
+    // latest 与 SAP 块独立：任一不可用不影响另一个
+    out["latest"] = latest_json().await;
     match fetch_cached_sap_info(pool).await {
         Ok(info) => out["sap"] = json!({
             "sysid": info.sysid,
@@ -102,6 +103,119 @@ async fn fetch_cached_sap_info(pool: &SharedPool) -> Result<Arc<RemoteSystemInfo
     Ok(info)
 }
 
+// ========================================================================
+// 新版本检查（GitHub Releases；默认开启，SAP_UPDATE_CHECK=off 关闭）
+// ========================================================================
+
+/// 已知的最新发布信息（后台任务写入；None = 尚未取到/禁用/网络不可达）。
+#[derive(Debug, Clone)]
+pub struct LatestRelease {
+    /// 最新 tag 去掉 `v` 前缀（如 "0.11.0"）
+    pub version: String,
+    /// Release 页面链接
+    pub url: String,
+}
+
+static LATEST: tokio::sync::RwLock<Option<Arc<LatestRelease>>> =
+    tokio::sync::RwLock::const_new(None);
+
+/// 检查周期：启动即查一次，之后每 24h 复查（GitHub 匿名限额 60 次/时，绰绰有余）。
+const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(24 * 3600);
+
+/// 后台版本检查循环（main 里 spawn）。失败静默降级（debug 级日志）——
+/// 更新检查绝不能拖慢请求或刷屏；离线/隔离环境是常态而非异常。
+pub async fn update_checker_loop() {
+    loop {
+        match fetch_latest_release().await {
+            Ok(rel) => {
+                if is_newer(&rel.version, env!("CARGO_PKG_VERSION")) {
+                    tracing::info!(
+                        current = env!("CARGO_PKG_VERSION"),
+                        latest = %rel.version,
+                        url = %rel.url,
+                        "发现新版本（/api/version latest 块与首页页脚可见）"
+                    );
+                }
+                *LATEST.write().await = Some(Arc::new(rel));
+            }
+            Err(e) => tracing::debug!(error = %e, "新版本检查失败（不影响服务）"),
+        }
+        tokio::time::sleep(UPDATE_CHECK_INTERVAL).await;
+    }
+}
+
+/// 拉取 GitHub 最新 Release（匿名、带 UA、5s 超时）。仅向 api.github.com 发一个
+/// 无任何用户数据的 GET——不做遥测，不携带部署环境信息。
+async fn fetch_latest_release() -> Result<LatestRelease, String> {
+    let client = reqwest::Client::builder()
+        .user_agent(concat!("sap-for-agents/", env!("CARGO_PKG_VERSION")))
+        .timeout(Duration::from_secs(5))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let resp = client
+        .get("https://api.github.com/repos/Jack-Liang/sap-for-agents/releases/latest")
+        .send()
+        .await
+        .map_err(|e| e.to_string())?
+        .error_for_status()
+        .map_err(|e| e.to_string())?
+        .text()
+        .await
+        .map_err(|e| e.to_string())?;
+    parse_latest_release(&resp).ok_or_else(|| "响应缺少 tag_name/html_url".into())
+}
+
+/// 解析 releases/latest 响应（独立成纯函数便于单测）。
+fn parse_latest_release(body: &str) -> Option<LatestRelease> {
+    let v: Value = serde_json::from_str(body).ok()?;
+    let tag = v.get("tag_name")?.as_str()?;
+    let url = v.get("html_url")?.as_str()?;
+    if tag.is_empty() || url.is_empty() {
+        return None;
+    }
+    Some(LatestRelease {
+        version: tag.trim_start_matches('v').to_string(),
+        url: url.to_string(),
+    })
+}
+
+/// semver 三段比较：latest 是否**严格大于** current。
+/// 解析失败一律 false——检查失败宁可漏报不可误报。
+fn is_newer(latest: &str, current: &str) -> bool {
+    fn parse(s: &str) -> Option<(u64, u64, u64)> {
+        let mut p = s.split('.');
+        let v = (
+            p.next()?.parse().ok()?,
+            p.next()?.parse().ok()?,
+            p.next()?.parse().ok()?,
+        );
+        p.next().is_none().then_some(v)
+    }
+    match (parse(latest), parse(current)) {
+        (Some(l), Some(c)) => l > c,
+        _ => false,
+    }
+}
+
+/// `/api/version` 的 `latest` 块；null = 尚未取到 / 已禁用 / 不可达。
+pub async fn latest_json() -> Value {
+    match LATEST.read().await.clone() {
+        Some(rel) => json!({
+            "version": rel.version,
+            "url": rel.url,
+            "update_available": is_newer(&rel.version, env!("CARGO_PKG_VERSION")),
+        }),
+        None => Value::Null,
+    }
+}
+
+/// 首页页脚的更新提示：仅当确认有更新时返回 Some((version, url))。
+pub async fn update_hint() -> Option<(String, String)> {
+    let rel = LATEST.read().await.clone()?;
+    is_newer(&rel.version, env!("CARGO_PKG_VERSION"))
+        .then(|| (rel.version.clone(), rel.url.clone()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -127,5 +241,35 @@ mod tests {
     fn git_commit_is_populated() {
         // 本仓库构建必有注入值（CI 从源码包构建才可能是 unknown）
         assert!(!git_commit().is_empty());
+    }
+
+    #[test]
+    fn semver_is_newer_compares_three_segments() {
+        use is_newer as newer;
+        assert!(newer("0.11.0", "0.10.0"), "次版本更高");
+        assert!(newer("0.10.1", "0.10.0"), "补丁更高");
+        assert!(newer("1.0.0", "0.99.99"), "主版本更高");
+        assert!(!newer("0.10.0", "0.10.0"), "相等不算更新");
+        assert!(!newer("0.9.9", "0.10.0"), "更低不算更新");
+        // 解析失败宁可漏报不可误报
+        assert!(!newer("", "0.10.0"));
+        assert!(!newer("latest", "0.10.0"));
+        assert!(!newer("0.11", "0.10.0"), "缺段视为非法");
+        assert!(!newer("0.11.0.1", "0.10.0"), "多段视为非法");
+        assert!(!newer("0.11.0-rc1", "0.10.0"), "带预发布后缀视为非法");
+    }
+
+    #[test]
+    fn parse_latest_release_extracts_tag_and_url() {
+        let rel = parse_latest_release(
+            r#"{"tag_name":"v0.11.0","html_url":"https://github.com/Jack-Liang/sap-for-agents/releases/tag/v0.11.0","draft":false}"#,
+        )
+        .expect("合法响应应解析成功");
+        assert_eq!(rel.version, "0.11.0", "tag 的 v 前缀应剥掉");
+        assert!(rel.url.contains("/tag/v0.11.0"));
+        // 缺字段 / 非法 JSON → None（调用方静默降级）
+        assert!(parse_latest_release(r#"{"tag_name":"v1.0.0"}"#).is_none());
+        assert!(parse_latest_release("not json").is_none());
+        assert!(parse_latest_release(r#"{"tag_name":"","html_url":"u"}"#).is_none());
     }
 }

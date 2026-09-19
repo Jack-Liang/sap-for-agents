@@ -9,6 +9,8 @@ Wraps the SAP NWRFC SDK into a long-running HTTP service that exposes any SAP RF
 - **Generic interface**: one endpoint, `/api/rfc`, describes any BAPI — no per-BAPI glue code
 - **AI-friendly**: 16 metadata endpoints (self-description / search functions / inspect interfaces / read docs / view source / read transparent tables / query the data dictionary / triage short dumps / **edit ABAP code**) let agents explore and act self-service. The operator guide for AI lives in [`AGENTS.md`](./AGENTS.md)
 
+![Web UI of the gateway: the agents.md link to paste into your AI, a connectivity check, and the endpoint lists](docs/images/demo.jpg)
+
 > ⚠️ **Risk disclaimer**: this is an **exploratory, experimental project**, primarily built for learning, testing, and local development scenarios. It has not been hardened for production use, offers no guarantee of stability or correctness, and its APIs may change at any time. It grants RFC access with the full privileges of the configured `SAP_USER` — before using it, you must evaluate the risks yourself (data exposure, unauthorized calls, compliance, etc.) and take your own precautions. Use it against production SAP systems at your own risk; the authors accept no liability for any loss arising from its use.
 
 ## Table of Contents
@@ -194,6 +196,7 @@ All configuration goes through environment variables, written to `.env` in the p
 | `SAP_READ_ONLY` | ❌ | _(off)_ | Read-only mode (`1`/`true`/`yes`/`on`): the gateway's own write endpoints — `/api/objects` `PUT source` and `POST replace`, plus non-read `/api/adt` methods — return `403 READ_ONLY`. `POST syntax` (nothing stored) and `POST /api/rfc` are unaffected (RFC calls cannot be reliably classified as read/write; SAP-side authorizations remain the real boundary) |
 | `SAP_REQUEST_TIMEOUT_SECS` | ❌ | `60` | Global timeout in seconds for a single SAP call, ≥1; returns 504 on timeout. `/api/rfc` accepts a per-request `timeout_secs` in the body to override it |
 | `SAP_RATE_LIMIT_RPS` | ❌ | _(no rate limit)_ | Requests per second per caller IP for `/api`; set ≥1 to enable; returns 429 when exceeded |
+| `SAP_UPDATE_CHECK` | ❌ | _(on)_ | New-release check: at startup and every 24h the gateway makes one anonymous GET to `api.github.com` for this repo's latest release (no telemetry, no user data). Result surfaces in `/api/version` → `latest` and the web UI footer. Set `off`/`false`/`0`/`no` to disable (fully offline) |
 | `SAP_ROLE` | ❌ | `client` | Run mode: `client`/`server`/`both` (server mode: see [§9](#9-server-mode-called-by-sap)) |
 | `SAP_SDK_DIR` | ❌ | `./nwrfcsdk` | SDK root directory (for Docker/CI/custom paths) |
 
@@ -260,11 +263,13 @@ One call answers everything an agent would otherwise learn by hitting 401/403/50
   "version": "0.10.0",
   "commit": "0fa6d6b",
   "capabilities": { "auth": false, "read_only": false, "adt": true, "rate_limit_rps": null },
+  "latest": { "version": "0.11.0", "url": "https://github.com/Jack-Liang/sap-for-agents/releases/tag/v0.11.0", "update_available": true },
   "sap": { "sysid": "A4H", "release": "816", "host": "vhcala4h", "os": "Linux", "destination": "vhcala4hci_A4H_00", "client": "001" }
 }
 ```
 
 - Gateway-local fields (version/commit/capabilities) never touch SAP and never fail. The `sap` block is fetched lazily via `RFC_SYSTEM_INFO` on the first call and cached for the process lifetime; when SAP is unreachable it is `null` (with `sap_error`) and the endpoint still returns 200.
+- `latest` comes from a background check against GitHub Releases (at startup and every 24h; one anonymous GET, no telemetry — disable with `SAP_UPDATE_CHECK=off`). It is `null` when not fetched yet, disabled, or unreachable; the web UI footer also shows an "update available" badge when a newer release exists.
 - `sap.release` is the kernel/Basis level; it does not distinguish ECC from S/4HANA (check the `CVERS` table for `S4CORE` instead).
 - Unauthenticated by design: an agent must be able to learn `capabilities.auth` (whether a token is needed) before holding one. On a public deployment, protect it at the reverse-proxy layer if the SAP hostnames it exposes are sensitive.
 

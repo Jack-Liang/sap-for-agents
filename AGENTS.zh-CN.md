@@ -341,6 +341,11 @@ curl http://127.0.0.1:3000/api/version
 #     "adt": true,                       # true = /api/adt/** 与 /api/dumps* 可用
 #     "rate_limit_rps": null             # 按 IP 每秒上限；null = 不限流
 #   },
+#   "latest": {                          # 后台 GitHub Release 检查（启动时 + 每 24h）；
+#     "version": "0.11.0",               # null = 尚未取到 / 已禁用（SAP_UPDATE_CHECK=off）/
+#     "url": "https://github.com/...",   # 网络不可达——该字段绝不阻塞响应
+#     "update_available": true
+#   },
 #   "sap": {                             # 首次调用懒加载，进程生命周期内缓存
 #     "sysid": "A4H", "release": "816", "host": "vhcala4h", "os": "Linux",
 #     "destination": "vhcala4hci_A4H_00", "client": "001"
@@ -348,6 +353,6 @@ curl http://127.0.0.1:3000/api/version
 # }
 ```
 
-- SAP 不可达时 `sap` 为 `null`、`sap_error` 带原因——端点仍返回 200，下次调用自动重试。
+- SAP 不可达时 `sap` 为 `null`、`sap_error` 带原因——端点仍返回 200，下次调用自动重试；`latest` 同理（后台任务、缓存）。
 - `sap.release` 是内核/Basis 版本号（如 `816`），**不区分** ECC 与 S/4HANA；要判定 S/4，用 `POST /api/table/read` 查 `CVERS` 表有无 `S4CORE` 组件。
 - MCP 客户端等价工具：`get_gateway_info`。

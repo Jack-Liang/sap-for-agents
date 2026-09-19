@@ -385,6 +385,8 @@ tailwind.config = {
             Source
         </a>
         <a class="font-code-sm text-code-sm text-on-surface-variant hover:text-primary transition-colors" href="https://github.com/Jack-Liang/sap-for-agents/issues" target="_blank">Feedback</a>
+        <a href="/api/version" title="Gateway self-description (version / capabilities / SAP system)" class="font-code-sm text-code-sm text-on-surface-variant hover:text-primary transition-colors bg-surface-container-high px-sm py-xs rounded border border-outline-variant/40">v{{VERSION}} · {{COMMIT}}</a>
+        <a href="{{LATEST_URL}}" style="display:{{UPDATE_HINT_VISIBILITY}}" title="A newer release is available on GitHub" class="font-code-sm text-code-sm text-primary hover:text-on-surface transition-colors bg-surface-container-high px-sm py-xs rounded border border-outline-variant/40">update: v{{LATEST_VERSION}} ↗</a>
     </div>
     <div class="font-code-sm text-code-sm text-on-surface-variant">
         Full docs in <code class="font-code-sm">README.md</code> / <code class="font-code-sm">AGENTS.md</code>

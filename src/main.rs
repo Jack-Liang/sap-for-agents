@@ -139,6 +139,13 @@ async fn run_client() -> Result<(), Box<dyn std::error::Error>> {
     );
     let shared: server::SharedPool = Arc::new(pool);
 
+    // 新版本检查（GitHub Releases，后台任务：启动即查 + 每 24h；失败静默）
+    if cfg.update_check {
+        tokio::spawn(version::update_checker_loop());
+    } else {
+        tracing::info!("新版本检查已禁用（SAP_UPDATE_CHECK=off）");
+    }
+
     server::run(shared, &cfg.listen_addr, wait_shutdown_signal()).await?;
     Ok(())
 }

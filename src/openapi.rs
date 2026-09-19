@@ -1397,6 +1397,25 @@ const SPEC_JSON: &str = r##"{
               }
             }
           },
+          "latest": {
+            "nullable": true,
+            "type": "object",
+            "description": "Latest GitHub release, from a background check (startup + every 24h, one anonymous GET — disable with SAP_UPDATE_CHECK=off). null when not fetched / disabled / unreachable; never blocks the response",
+            "properties": {
+              "version": {
+                "type": "string",
+                "example": "0.11.0"
+              },
+              "url": {
+                "type": "string",
+                "description": "Release page URL"
+              },
+              "update_available": {
+                "type": "boolean",
+                "description": "true = the running version is older than this release"
+              }
+            }
+          },
           "sap": {
             "nullable": true,
             "type": "object",

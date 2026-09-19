@@ -10,6 +10,8 @@
 - **通用接口**：一个端点 `/api/rfc` 描述任意 BAPI，无需为每个 BAPI 写代码
 - **面向 AI**：16 个元数据端点（自描述/搜函数/查接口/查文档/看源码/读透明表/查数据字典/排查短转储/**修改 ABAP 代码**），Agent 能自服务探索与操作。给 AI 的操作指南见 [`AGENTS.md`](./AGENTS.md)
 
+![网关 Web 首页：粘贴给 AI 的 agents.md 链接、连通性测试与端点列表](docs/images/demo.jpg)
+
 > ⚠️ **风险提示**：本项目是一个**探索性、实验性项目**，主要用于学习、测试与本地开发场景。它未经生产环境的充分打磨，不保证稳定性与正确性，API 可能随时变更。它以所配置 `SAP_USER` 的完整权限开放 RFC 调用能力——使用前请自行评估风险（数据暴露、未授权调用、合规性等）并自行采取防护措施。对生产 SAP 系统使用本项目的风险由使用者自行承担，作者不对使用本项目造成的任何损失负责。
 
 ## 目录
@@ -194,6 +196,7 @@ curl -X POST http://127.0.0.1:3000/api/rfc \
 | `SAP_READ_ONLY` | ❌ | _(关闭)_ | 只读模式（`1`/`true`/`yes`/`on`）：网关自身写端点——`/api/objects` 的 `PUT source` 与 `POST replace`、`/api/adt` 非读方法——返回 `403 READ_ONLY`。`POST syntax`（不落库）与 `POST /api/rfc` 不受影响（RFC 无法按函数名可靠区分读写，SAP 端授权才是真正的边界） |
 | `SAP_REQUEST_TIMEOUT_SECS` | ❌ | `60` | 单次 SAP 调用全局超时（秒），≥1；超时返回 504。`/api/rfc` 可用请求体 `timeout_secs` per-request 覆盖 |
 | `SAP_RATE_LIMIT_RPS` | ❌ | _(不限流)_ | `/api` 按调用方 IP 的每秒请求数，≥1 启用；超限返回 429 |
+| `SAP_UPDATE_CHECK` | ❌ | _(开启)_ | 新版本检查：启动时与每 24h 向 `api.github.com` 发一个匿名 GET 查询本仓库最新 Release（无遥测、不携带任何用户数据），结果展示在 `/api/version` 的 `latest` 块与首页页脚；设 `off`/`false`/`0`/`no` 可完全关闭（无外联） |
 | `SAP_ROLE` | ❌ | `client` | 运行模式：`client`/`server`/`both`（server 模式见 [§9](#9-server-端模式被-sap-调用)） |
 | `SAP_SDK_DIR` | ❌ | `./nwrfcsdk` | SDK 根目录（Docker/CI/自定义路径用） |
 
@@ -260,11 +263,13 @@ curl -H "Authorization: Bearer $SAP_API_KEY" \
   "version": "0.10.0",
   "commit": "0fa6d6b",
   "capabilities": { "auth": false, "read_only": false, "adt": true, "rate_limit_rps": null },
+  "latest": { "version": "0.11.0", "url": "https://github.com/Jack-Liang/sap-for-agents/releases/tag/v0.11.0", "update_available": true },
   "sap": { "sysid": "A4H", "release": "816", "host": "vhcala4h", "os": "Linux", "destination": "vhcala4hci_A4H_00", "client": "001" }
 }
 ```
 
 - 本地部分（版本/commit/能力开关）不碰 SAP、永不失败；`sap` 块首次调用经 `RFC_SYSTEM_INFO` 懒加载并缓存整个进程生命周期，SAP 不可达时为 `null`（带 `sap_error`），端点仍返回 200。
+- `latest` 来自后台任务对 GitHub Releases 的检查（启动时 + 每 24h 一次匿名 GET，无遥测，`SAP_UPDATE_CHECK=off` 可关）：尚未取到/已禁用/不可达时为 `null`；有更新时首页页脚也会出现"可更新"徽标。
 - `sap.release` 是内核/Basis 版本号，不区分 ECC 与 S/4HANA（判定 S/4 请查 `CVERS` 表的 `S4CORE` 组件）。
 - 刻意免鉴权：Agent 需要在拿到 token 之前知道 `capabilities.auth`（要不要 token）。公网部署若介意暴露 SAP 主机名，请在反向代理层保护。
 

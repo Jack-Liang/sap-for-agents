@@ -515,10 +515,22 @@ async fn index_handler(req: axum::http::Request<axum::body::Body>) -> axum::resp
     } else {
         include_str!("index.html")
     };
+    // 页脚更新提示：仅当 GitHub 上确有更新时显示（version 模块缓存）
+    let (hint_vis, latest_ver, latest_url) = match crate::version::update_hint().await {
+        Some((v, u)) => ("inline-block", v, u),
+        None => ("none", String::new(), "#".to_string()),
+    };
     let html = template
         .replace("{{BASE_URL}}", &base)
         .replace("{{AGENTS_URL}}", &agents_url)
-        .replace("{{AUTH_BANNER_VISIBILITY}}", auth_visibility);
+        .replace("{{AUTH_BANNER_VISIBILITY}}", auth_visibility)
+        // 页脚版本徽标：版本 + 构建提交号（点击进 /api/version 自描述）
+        .replace("{{VERSION}}", env!("CARGO_PKG_VERSION"))
+        .replace("{{COMMIT}}", crate::version::git_commit())
+        // 页脚新版本提示（无更新时隐藏）
+        .replace("{{UPDATE_HINT_VISIBILITY}}", hint_vis)
+        .replace("{{LATEST_VERSION}}", &latest_ver)
+        .replace("{{LATEST_URL}}", &latest_url);
     axum::response::Html(html)
 }
 
@@ -2066,6 +2078,15 @@ mod tests {
         assert!(!body.contains("{{BASE_URL}}"));
         assert!(!body.contains("{{AGENTS_URL}}"));
         assert!(body.contains("http://192.168.1.5:9999"));
+        // 页脚版本徽标：版本与 commit 都已注入（不再含占位符）
+        assert!(!body.contains("{{VERSION}}"));
+        assert!(!body.contains("{{COMMIT}}"));
+        assert!(body.contains(&format!("v{}", env!("CARGO_PKG_VERSION"))));
+        assert!(body.contains(crate::version::git_commit()));
+        // 更新提示占位符同样被清（单测环境无缓存 → 隐藏，但替换必须发生）
+        assert!(!body.contains("{{UPDATE_HINT_VISIBILITY}}"));
+        assert!(!body.contains("{{LATEST_VERSION}}"));
+        assert!(!body.contains("{{LATEST_URL}}"));
     }
 
     #[tokio::test]
