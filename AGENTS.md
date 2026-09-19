@@ -22,7 +22,7 @@ curl -H "Authorization: Bearer <SAP_API_KEY>" http://127.0.0.1:3000/api/function
 ```
 
 - Missing or wrong token → `401 {"code":401,"message":"..."}`.
-- The probes `/health`, `/ready` and the public pages `/`, `/agents.md` are **always unauthenticated** (no token required).
+- The probes `/health`, `/ready` and the public pages `/`, `/agents.md`, `/openapi.json` are **always unauthenticated** (no token required).
 - Whether auth is enabled is decided by the deployer. The default local environment is usually unauthenticated — try without a token first, and request one from the deployer if you receive a 401.
 
 ## What you can do
@@ -47,6 +47,9 @@ curl -H "Authorization: Bearer <SAP_API_KEY>" http://127.0.0.1:3000/api/function
 | Want to syntax-check source **without** writing it | `POST /api/objects/{type}/{name}/syntax` |
 | Want to read/write ABAP class sources and other ADT (Eclipse tooling) resources | `ANY /api/adt/{path}` |
 | **Actually invoke an SAP function** | `POST /api/rfc` |
+| Want to invoke a function **without** filling `func_name` (typed endpoint) | `POST /api/functions/{name}/invoke` |
+| Want a machine-readable OpenAPI spec of this gateway | `GET /openapi.json` (public) |
+| Want a spec with **typed operations per BAPI** (params/types/fields expanded) | `GET /api/openapi?functions=BAPI_X,BAPI_Y` |
 
 ## Standard workflow
 

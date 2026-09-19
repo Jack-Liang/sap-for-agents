@@ -862,3 +862,106 @@ fn idle_connection_validated_on_checkout() {
         .unwrap();
     assert_eq!(r2.status(), 200, "空闲超阈值后借出（先 ping 校验）应照常成功");
 }
+
+// ========================================================================
+// OpenAPI 规范与类型化调用（/openapi.json、/api/openapi、{name}/invoke）
+// ========================================================================
+
+#[test]
+#[ignore]
+fn openapi_json_returns_valid_spec() {
+    let _s = start_server();
+    let resp = http_client()
+        .get(format!("{}/openapi.json", _s.base_url))
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 200, "公开规范应免鉴权可访问");
+    let body: serde_json::Value = resp.json().unwrap();
+    assert_eq!(body["openapi"], "3.0.3");
+    assert!(body["paths"]["/api/rfc"].is_object(), "应含通用调用端点");
+    assert!(
+        body["paths"]["/api/functions/{name}/source"].is_object(),
+        "应含源码端点"
+    );
+}
+
+#[test]
+#[ignore]
+fn openapi_dynamic_generates_typed_operations() {
+    let _s = start_server();
+    let resp = http_client()
+        .get(format!(
+            "{}/api/openapi?functions=STFC_CONNECTION,BAPI_USER_GETLIST",
+            _s.base_url
+        ))
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let spec: serde_json::Value = resp.json().unwrap();
+    // STFC_CONNECTION 的类型化 operation 存在，REQUTEXT 已展开
+    let op = &spec["paths"]["/api/functions/STFC_CONNECTION/invoke"]["post"];
+    assert!(op.is_object(), "应生成类型化 operation");
+    let inputs = &op["requestBody"]["content"]["application/json"]["schema"]["properties"]["inputs"];
+    assert_eq!(inputs["properties"]["REQUTEXT"]["type"], "string");
+    // BAPI 的输出表进 table_outputs 提示
+    let bapi = &spec["paths"]["/api/functions/BAPI_USER_GETLIST/invoke"]["post"];
+    assert!(
+        bapi["requestBody"]["content"]["application/json"]["schema"]["properties"]
+            ["table_outputs"]["example"]["USERLIST"]
+            .is_array(),
+        "USERLIST 输出表应有示例"
+    );
+}
+
+#[test]
+#[ignore]
+fn openapi_dynamic_rejects_bad_requests() {
+    let _s = start_server();
+    // 空列表 → 400
+    let resp = http_client()
+        .get(format!("{}/api/openapi?functions=,,", _s.base_url))
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    // 超过 50 个 → 400
+    let many = (0..51).map(|_| "RFC_PING").collect::<Vec<_>>().join(",");
+    let resp = http_client()
+        .get(format!("{}/api/openapi?functions={}", _s.base_url, many))
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+}
+
+#[test]
+#[ignore]
+fn function_invoke_endpoint_roundtrip() {
+    let _s = start_server();
+    // 函数名来自路径，body 免填 func_name
+    let resp = http_client()
+        .post(format!("{}/api/functions/STFC_CONNECTION/invoke", _s.base_url))
+        .json(&serde_json::json!({
+            "inputs": {"REQUTEXT": "typed invoke"},
+            "string_outputs": {"ECHOTEXT": 135}
+        }))
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().unwrap();
+    assert_eq!(body["func"], "STFC_CONNECTION");
+    assert_eq!(body["scalars"]["ECHOTEXT"], "typed invoke");
+}
+
+#[test]
+#[ignore]
+fn function_invoke_path_overrides_body_func_name() {
+    let _s = start_server();
+    // body 里塞了错误的 func_name 也应被路径覆盖
+    let resp = http_client()
+        .post(format!("{}/api/functions/RFC_PING/invoke", _s.base_url))
+        .json(&serde_json::json!({"func_name": "WRONG_FUNC", "inputs": {}}))
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 200, "路径注入应优先于 body");
+    let body: serde_json::Value = resp.json().unwrap();
+    assert_eq!(body["func"], "RFC_PING");
+}

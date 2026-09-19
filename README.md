@@ -333,6 +333,9 @@ Fields you don't read (e.g. you didn't pass `table_outputs`) do **not** appear i
 | `POST /api/objects/:type/:name/replace` | AI-style unique find-and-replace + activate | `{"old_string":"...","new_string":"..."}` |
 | `POST /api/objects/:type/:name/syntax` | Syntax-check source without writing it | `{"source":"REPORT z..."}` |
 | `ANY /api/adt/:path` | Generic ADT REST proxy (`/sap/bc/adt/**` 1:1): dumps, class sources, anything Eclipse ADT exposes; CSRF handled for write methods | `/api/adt/runtime/dumps` |
+| `POST /api/functions/:name/invoke` | Typed invocation: function name comes from the path, body is structurally identical to `/api/rfc` (no `func_name` needed) | `{"inputs":{"REQUTEXT":"hi"}}` |
+| `GET /openapi.json` | Full OpenAPI 3.0.3 spec of the gateway (public, unauthenticated): 20 endpoints + 33 schemas + auth scheme — feed it to code generators, Postman, or an AI agent's tool registry | `/openapi.json` |
+| `GET /api/openapi?functions=A,B` | Dynamic spec: generates a typed operation per BAPI from DDIC metadata (params/types/nested fields expanded, targeting `{name}/invoke`; ≤50 per call) | `/api/openapi?functions=BAPI_USER_GETLIST` |
 
 End-to-end example (list users):
 ```bash

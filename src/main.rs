@@ -11,6 +11,7 @@ mod ffi;
 mod function;
 mod metadata;
 mod objects;
+mod openapi;
 mod pool;
 mod server;
 mod server_config;

@@ -330,6 +330,9 @@ curl -H "Authorization: Bearer $SAP_API_KEY" \
 | `GET /api/dumps/grouped` | 按（错误类型、终止程序）聚合——什么在反复失败 | `/api/dumps/grouped` |
 | `GET /api/dumps/:key/detail` | 单个转储的解析详情：头表/终止点/调用栈 | `/api/dumps/<key>/detail` |
 | `ANY /api/adt/:path` | ADT REST 通用代理（1:1 透传 `/sap/bc/adt/**`）：dump 正文、类源码等 Eclipse ADT 暴露的一切资源；写方法 CSRF 自动处理 | `/api/adt/runtime/dumps` |
+| `POST /api/functions/:name/invoke` | 类型化调用：函数名来自路径，请求体与 `/api/rfc` 同构（免填 `func_name`） | `{"inputs":{"REQUTEXT":"hi"}}` |
+| `GET /openapi.json` | 全网关 OpenAPI 3.0.3 规范（免鉴权公开页）：20 端点 + 33 schema + 认证方案，喂给代码生成器 / Postman / Agent 工具注册表 | `/openapi.json` |
+| `GET /api/openapi?functions=A,B` | 动态规范：按 `functions` 列表从 DDIC 元数据为每个 BAPI 生成类型化 operation（参数/类型/嵌套字段全展开，指向 `{name}/invoke`；一次 ≤50 个） | `/api/openapi?functions=BAPI_USER_GETLIST` |
 
 端到端示例（列出用户）：
 ```bash

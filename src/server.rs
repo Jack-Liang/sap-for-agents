@@ -189,6 +189,11 @@ pub fn static_app<S: Clone + Send + Sync + 'static>() -> Router<S> {
     Router::new()
         .route("/", axum::routing::get(index_handler))
         .route("/agents.md", axum::routing::get(agents_handler))
+        // OpenAPI 规范导出：机器可读接口契约（免鉴权公开页，规范内不含敏感信息）
+        .route(
+            "/openapi.json",
+            axum::routing::get(crate::openapi::openapi_handler),
+        )
         .route("/health", axum::routing::get(health_handler))
 }
 
@@ -198,9 +203,14 @@ pub fn app(pool: SharedPool) -> Router {
     let api = Router::new()
         .route("/api/rfc", post(invoke_handler))
         .route("/api/functions/search", post(search_functions_handler))
+        // 动态 OpenAPI 规范：?functions=A,B 按接口元数据生成类型化 operation
+        .route("/api/openapi", axum::routing::get(openapi_dynamic_handler))
         // 函数名可能带 /NS/ 命名空间前缀（如 /SDF/X），路径参数无法匹配多段路径，
         // 统一用通配路由捕获后按尾部 /doc、/source 分发（见 function_route_dispatcher）。
-        .route("/api/functions/*name", axum::routing::get(function_route_dispatcher))
+        .route(
+            "/api/functions/*name",
+            axum::routing::get(function_route_dispatcher).post(function_invoke_handler),
+        )
         .route("/api/programs/:name/source", axum::routing::get(program_source_handler))
         .route("/api/table/read", post(table_read_handler))
         .route("/api/ddic/type/:name", axum::routing::get(ddic_type_handler))
@@ -315,6 +325,7 @@ pub async fn run(
     tracing::info!("✅ 服务就绪！");
     tracing::info!("   👉 浏览器打开:         http://{}", display_host);
     tracing::info!("   👉 给 AI/Agent 的文档: http://{}/agents.md", display_host);
+    tracing::info!("   👉 OpenAPI 规范:       http://{}/openapi.json", display_host);
     tracing::info!("   端点速览: POST /api/rfc | GET /api/functions/:name | POST /api/functions/search");
     tracing::info!("           GET /api/functions/:name/doc | GET /api/ddic/type/:name | GET /api/ddic/field/:t/:f");
     axum::serve(
@@ -496,7 +507,6 @@ async fn invoke_handler(
     axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
     req: Result<Json<InvokeRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Json<InvokeResponse>, RfcError> {
-    let started = std::time::Instant::now();
     let caller_ip = addr.ip().to_string();
     // JSON 解析/反序列化失败 → 统一错误格式（status 取 axum 语义码，body_text 作 message）
     let Json(req) = req.map_err(|r| RfcError {
@@ -505,6 +515,55 @@ async fn invoke_handler(
         message: r.body_text(),
         key: "JSON_INVALID".into(),
     })?;
+    run_invoke_and_log(pool, caller_ip, req).await
+}
+
+/// POST /api/functions/{name}/invoke —— 类型化调用（函数名来自路径，请求体免填 func_name）。
+///
+/// 与 `POST /api/rfc` 完全同构：body 的字段（inputs/table_inputs/.../timeout_secs）
+/// 语义一致，仅 `func_name` 由路径注入（body 里同名键被忽略）。动态 OpenAPI 规范
+/// （`GET /api/openapi?functions=...`）为每个函数生成的 operation 即指向本端点。
+async fn function_invoke_handler(
+    axum::extract::State(pool): axum::extract::State<SharedPool>,
+    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+    body: Result<Json<serde_json::Value>, axum::extract::rejection::JsonRejection>,
+) -> Result<Json<InvokeResponse>, RfcError> {
+    // 通配路由捕获形如 "STFC_CONNECTION/invoke"（或命名空间 "/SDF/X/invoke"）
+    let Some(func) = name.strip_suffix("/invoke").filter(|b| !b.is_empty()) else {
+        return Err(RfcError {
+            code: -1,
+            status: 404,
+            message: format!("未知操作: /api/functions/{name}（POST 仅支持 /invoke）"),
+            key: "ROUTE_NOT_FOUND".into(),
+        });
+    };
+    let caller_ip = addr.ip().to_string();
+    let Json(mut body) = body.map_err(|r| RfcError {
+        code: -1,
+        status: r.status().as_u16(),
+        message: r.body_text(),
+        key: "JSON_INVALID".into(),
+    })?;
+    // 函数名以路径为准（body 里的 func_name 被覆盖）
+    body["func_name"] = serde_json::json!(func);
+    let req: InvokeRequest = serde_json::from_value(body).map_err(|e| RfcError {
+        code: -1,
+        status: 400,
+        message: format!("请求体与 /api/rfc 契约不符: {e}"),
+        key: "JSON_INVALID".into(),
+    })?;
+    run_invoke_and_log(pool, caller_ip, req).await
+}
+
+/// /api/rfc 与 /api/functions/{name}/invoke 的共享执行段：
+/// 超时控制 → 连接池执行 → 指标采样 → 审计日志。
+async fn run_invoke_and_log(
+    pool: SharedPool,
+    caller_ip: String,
+    req: InvokeRequest,
+) -> Result<Json<InvokeResponse>, RfcError> {
+    let started = std::time::Instant::now();
     let func_name = req.func_name.clone();
     let params = summarize_params(&req);
     let pool_stats = pool.stats(); // 采样当前池状态（pool 即将 move 进闭包）
@@ -517,7 +576,7 @@ async fn invoke_handler(
         .filter(|&s| s >= 1)
         .map(|s| Duration::from_secs(s.min(MAX_TIMEOUT_SECS)))
         .unwrap_or_else(request_timeout);
-    // 通过 with_connection 执行：遇通信错误自动重连重试一次
+    // 通过 with_connection 执行：遇通信类错误自动丢弃并新建连接重试
     let result =
         run_blocking_with_timeout(pool, timeout, move |conn| execute_collect(conn, &req)).await;
     let elapsed_ms = started.elapsed().as_millis() as u64;
@@ -563,6 +622,89 @@ async fn invoke_handler(
 // ========================================================================
 // 面向 AI 的元数据查询 handler（端点 ①~⑤）
 // ========================================================================
+
+/// GET /api/openapi?functions=A,B —— 动态 OpenAPI 规范。
+///
+/// 静态规范（GET /openapi.json，免鉴权）只能把 /api/rfc 描述成泛型调用；
+/// 本端点按 `functions` 列表拉取各函数的 DDIC 接口元数据，为每个函数生成
+/// 指向 `POST /api/functions/{name}/invoke` 的**类型化 operation**（参数名/
+/// 类型/长度/嵌套字段全部展开），合并进完整规范返回。单个函数接口读取失败
+/// 时生成带错误说明的占位 operation（缺口可见，不吞错）。
+#[derive(serde::Deserialize)]
+pub(crate) struct DynamicSpecQuery {
+    /// 逗号分隔的函数名列表
+    functions: String,
+}
+
+/// functions 列表上限：防止一次请求拖垮元数据拉取
+const DYNAMIC_SPEC_MAX_FUNCTIONS: usize = 50;
+
+async fn openapi_dynamic_handler(
+    axum::extract::State(pool): axum::extract::State<SharedPool>,
+    axum::extract::Host(host): axum::extract::Host,
+    axum::extract::Query(q): axum::extract::Query<DynamicSpecQuery>,
+) -> Result<Json<serde_json::Value>, RfcError> {
+    let names: Vec<String> = q
+        .functions
+        .split(',')
+        .map(|s| s.trim().to_uppercase())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if names.is_empty() {
+        return Err(RfcError {
+            code: -1,
+            status: 400,
+            message: "functions 不能为空（逗号分隔的函数名列表，如 STFC_CONNECTION,BAPI_USER_GETLIST）".into(),
+            key: "SPEC_FUNCTIONS_EMPTY".into(),
+        });
+    }
+    if names.len() > DYNAMIC_SPEC_MAX_FUNCTIONS {
+        return Err(RfcError {
+            code: -1,
+            status: 400,
+            message: format!(
+                "functions 一次最多 {} 个（收到 {}），请分批生成",
+                DYNAMIC_SPEC_MAX_FUNCTIONS,
+                names.len()
+            ),
+            key: "SPEC_TOO_MANY".into(),
+        });
+    }
+    for n in &names {
+        crate::api::validate_func_name(n)?;
+    }
+
+    // (函数名, Ok<(path, operation)> | Err(错误消息))：单函数失败不拖垮整个规范
+    let results: Vec<(String, (String, serde_json::Value))> =
+        run_blocking(pool, move |conn| {
+            let ops: Vec<(String, (String, serde_json::Value))> = names
+                .iter()
+                .map(|n| {
+                    let r = collect_function_params(conn, n);
+                    let op = match r {
+                        Ok(params) => crate::openapi::function_operation(n, &params),
+                        Err(e) => crate::openapi::function_operation_failed(n, &e.message),
+                    };
+                    (n.clone(), op)
+                })
+                .collect();
+            Ok(ops)
+        })
+        .await?;
+
+    let mut spec = crate::openapi::build_spec(&format!("http://{host}"), crate::auth::is_enabled());
+    if let Some(paths) = spec["paths"].as_object_mut() {
+        for (_name, (path, op)) in results {
+            paths.insert(path, op);
+        }
+    }
+    spec["info"]["description"] = serde_json::json!(format!(
+        "{} — This document additionally contains typed operations generated from \
+?functions= (each maps to POST /api/functions/{{name}}/invoke).",
+        spec["info"]["description"].as_str().unwrap_or_default()
+    ));
+    Ok(Json(spec))
+}
 
 /// 默认语言（从 SAP_LANG 环境变量读，回退 EN）。
 /// 端点⑤④可用 ?lang= 覆盖。
@@ -639,31 +781,37 @@ async fn function_interface_handler(
     axum::extract::Path(name): axum::extract::Path<String>,
 ) -> Result<Json<FunctionInterface>, RfcError> {
     crate::api::validate_func_name(&name)?;
-    let result = run_blocking(pool, move |conn| {
-        let param_infos = conn.get_param_infos(&name)?;
-        let params: Vec<FunctionParam> = param_infos
-            .iter()
-            .map(|p| {
-                Ok(FunctionParam {
-                    name: p.name.clone(),
-                    type_name: rfctype_name(p.type_),
-                    direction: direction_name(p.direction),
-                    length: p.char_length,
-                    decimals: p.decimals,
-                    optional: p.optional,
-                    default: p.default_value.clone(),
-                    description: p.parameter_text.clone(),
-                    fields: param_info_to_field_def(p)?.fields,
-                }) as Result<FunctionParam, RfcError>
-            })
-            .collect::<Result<_, _>>()?;
-        Ok(FunctionInterface {
-            name: name.clone(),
-            params,
+    let req_name = name.clone();
+    let result = run_blocking(pool, move |conn| collect_function_params(conn, &name))
+        .await?;
+    Ok(Json(FunctionInterface {
+        name: req_name,
+        params: result,
+    }))
+}
+
+/// 拉取函数参数元数据并展开嵌套字段（接口端点与动态 OpenAPI 生成共用）。
+fn collect_function_params(
+    conn: &crate::connection::RfcConnection,
+    name: &str,
+) -> Result<Vec<FunctionParam>, RfcError> {
+    let param_infos = conn.get_param_infos(name)?;
+    param_infos
+        .iter()
+        .map(|p| {
+            Ok(FunctionParam {
+                name: p.name.clone(),
+                type_name: rfctype_name(p.type_),
+                direction: direction_name(p.direction),
+                length: p.char_length,
+                decimals: p.decimals,
+                optional: p.optional,
+                default: p.default_value.clone(),
+                description: p.parameter_text.clone(),
+                fields: param_info_to_field_def(p)?.fields,
+            }) as Result<FunctionParam, RfcError>
         })
-    })
-    .await?;
-    Ok(Json(result))
+        .collect()
 }
 
 /// ② POST /api/functions/search —— 搜索函数模块
@@ -1436,6 +1584,39 @@ mod tests {
         assert_eq!(resp.status(), axum::http::StatusCode::OK);
         let body = body_string(resp.into_body()).await;
         assert!(body.contains("\"status\":\"ok\""));
+    }
+
+    #[tokio::test]
+    async fn openapi_json_serves_spec_with_host_derived_server() {
+        let resp = static_app()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/openapi.json")
+                    .header("host", "192.168.1.5:9999")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let ct = resp
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(
+            ct.contains("application/json"),
+            "Content-Type 应为 JSON: {ct}"
+        );
+        let body = body_string(resp.into_body()).await;
+        let spec: serde_json::Value = serde_json::from_str(&body).expect("body 应为合法 JSON");
+        assert_eq!(spec["openapi"], "3.0.3");
+        // servers 按请求 Host 头推导
+        assert_eq!(spec["servers"][0]["url"], "http://192.168.1.5:9999");
+        // 核心端点在规范里
+        assert!(spec["paths"]["/api/rfc"].is_object());
+        assert!(spec["paths"]["/api/functions/search"].is_object());
     }
 
     #[tokio::test]
