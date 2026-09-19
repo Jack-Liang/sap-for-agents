@@ -24,7 +24,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # 指标（Prometheus /metrics 端点）
 metrics = "0.24"
-metrics-exporter-prometheus = "0.15"
+metrics-exporter-prometheus = "0.18"
 # 限流（按 IP，可选 SAP_RATE_LIMIT_RPS）
 governor = "0.10"
 # Server 模式：同步 HTTP 客户端（回调线程内调用）+ TOML 配置
