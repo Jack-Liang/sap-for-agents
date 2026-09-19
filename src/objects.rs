@@ -278,7 +278,7 @@ fn walk_xml(xml: &str) -> Vec<XmlElem> {
                 let name = local_name(e.name().as_ref()).to_string();
                 let mut attrs = Vec::new();
                 for a in e.attributes().flatten() {
-                    if a.key.as_ref().starts_with(b"xmlns") {
+                    if a.key.as_ref().starts_with("xmlns") {
                         continue;
                     }
                     attrs.push((
@@ -298,7 +298,7 @@ fn walk_xml(xml: &str) -> Vec<XmlElem> {
                 let name = local_name(e.name().as_ref()).to_string();
                 let mut attrs = Vec::new();
                 for a in e.attributes().flatten() {
-                    if a.key.as_ref().starts_with(b"xmlns") {
+                    if a.key.as_ref().starts_with("xmlns") {
                         continue;
                     }
                     attrs.push((
@@ -313,20 +313,26 @@ fn walk_xml(xml: &str) -> Vec<XmlElem> {
                     text: String::new(),
                 });
             }
+            // quick-xml ≥0.42：文本事件不含实体（拆成 GeneralRef 独立事件），
+            // 故按原始片段累积（Text 原文 + 重组的 &...;），End 时统一解码取 trim
             Ok(Event::Text(t)) => {
                 if let Some(&idx) = open.last() {
-                    let decoded = crate::dumps::xml_decode_of(t.as_ref());
-                    if !decoded.trim().is_empty() {
-                        let cell = &mut elems[idx];
-                        if !cell.text.is_empty() {
-                            cell.text.push(' ');
-                        }
-                        cell.text.push_str(decoded.trim());
-                    }
+                    elems[idx].text.push_str(t.as_ref());
+                }
+            }
+            Ok(Event::GeneralRef(r)) => {
+                if let Some(&idx) = open.last() {
+                    let cell = &mut elems[idx];
+                    cell.text.push('&');
+                    cell.text.push_str(r.as_ref());
+                    cell.text.push(';');
                 }
             }
             Ok(Event::End(_)) => {
-                open.pop();
+                if let Some(idx) = open.pop() {
+                    let decoded = crate::dumps::xml_decode_of(&elems[idx].text);
+                    elems[idx].text = decoded.trim().to_string();
+                }
             }
             Ok(Event::Eof) => break,
             Ok(_) => {}
@@ -336,7 +342,7 @@ fn walk_xml(xml: &str) -> Vec<XmlElem> {
     elems
 }
 
-fn local_name(qname: &[u8]) -> &str {
+fn local_name(qname: &str) -> &str {
     crate::dumps::xml_local_name_of(qname)
 }
 
