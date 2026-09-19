@@ -22,13 +22,14 @@ curl -H "Authorization: Bearer <SAP_API_KEY>" http://127.0.0.1:3000/api/function
 ```
 
 - 未带 / 错 token → `401 {"code":401,"message":"..."}`。
-- 探针 `/health`、`/ready` 与公开页 `/`、`/agents.md`、`/openapi.json` **始终免鉴权**（不需要 token）。
-- 是否启用由部署方决定。本机默认环境通常免鉴权——你可先不带 token 试，收到 401 再向部署方索取。
+- 探针 `/health`、`/ready`、`/api/version` 与公开页 `/`、`/agents.md`、`/openapi.json` **始终免鉴权**（不需要 token）。
+- 是否启用由部署方决定。别靠试错，先查 `GET /api/version` 的 `capabilities.auth`；本机默认环境通常免鉴权。
 
 ## 你能做什么
 
 | 目标 | 用哪个端点 |
 |------|-----------|
+| 新会话先**自描述**：网关版本/commit、能力开关（鉴权/只读/ADT/限流）、SAP sysid 与 release | `GET /api/version`（公开） |
 | 不知道有哪些函数 → 按名字模糊搜索 | `POST /api/functions/search` |
 | 知道函数名，想知道参数怎么填 | `GET /api/functions/{name}` |
 | 想读函数的完整文档（用途、示例） | `GET /api/functions/{name}/doc` |
@@ -42,9 +43,12 @@ curl -H "Authorization: Bearer <SAP_API_KEY>" http://127.0.0.1:3000/api/function
 | 想知道**什么在反复失败**（按错误类型 + 终止程序聚合） | `GET /api/dumps/grouped` |
 | 想看某个转储的调用栈/出错行/组件（免拉 45KB–1MB 的 ST22 正文） | `GET /api/dumps/{key}/detail` |
 | 想要原始的完整 ST22 正文（发生了什么/错误分析） | `GET /api/adt/runtime/dump/{key}/formatted` |
-| 想**修改** ABAP 代码（函数/类/程序） | `PUT /api/objects/{type}/{name}/source` |
+| 想**创建** ABAP 对象（prog / incl / class / intf / func / fugr / cds / package），可顺带首版源码 | `POST /api/objects/{type}/{name}/create` |
+| 想**修改** ABAP 代码（上列所有带源码的类型） | `PUT /api/objects/{type}/{name}/source` |
 | AI 式编辑（唯一匹配查找替换 + 自动激活） | `POST /api/objects/{type}/{name}/replace` |
 | 语法检查（**不写库**，源码内嵌提交） | `POST /api/objects/{type}/{name}/syntax` |
+| 想**读**对象源码（保留原文大小写；含 incl / intf / cds / fugr） | `GET /api/objects/{type}/{name}/source` |
+| 想**删除**对象（删 fugr 会连带其中函数模块） | `DELETE /api/objects/{type}/{name}?group=&transport=` |
 | 想读/写 ABAP 类源码等 ADT（Eclipse 工具链）资源 | `ANY /api/adt/{path}` |
 | **实际调用一个 SAP 函数** | `POST /api/rfc` |
 | 想调用函数但**免填** `func_name`（类型化端点） | `POST /api/functions/{name}/invoke` |
@@ -214,9 +218,9 @@ curl http://127.0.0.1:3000/api/dumps/20260824012009%20a4h/detail
 
 ### 9. 代码修改（写入编排）
 
-修改函数 / 类 / 程序。网关在一次 HTTP 请求内跑完 ADT 写序列：**建立 stateful 会话 → LOCK → PUT 源码 → UNLOCK → 激活**；lockHandle 绝不跨请求（ADT 锁绑定 ABAP 会话，跨请求的柄必然失效）。
+修改函数 / 类 / 程序 / 接口 / include / 函数组 / CDS 视图。网关在一次 HTTP 请求内跑完 ADT 写序列：**建立 stateful 会话 → LOCK → PUT 源码 → UNLOCK → 激活**；lockHandle 绝不跨请求（ADT 锁绑定 ABAP 会话，跨请求的柄必然失效）。
 
-`{type}` 取 `prog`（程序/报表）、`class`、`func`（函数模块，组名自动经 RFC 搜索反解，也可显式传 `"group"`）。
+`{type}` 取 `prog`（程序/报表）、`incl`（include）、`class`、`intf`（接口）、`func`（函数模块，组名自动经 RFC 搜索反解，也可显式传 `"group"`）、`fugr`（函数组）、`cds`（CDS/DDLS 视图，source 即 DDL 文本）、`package`（仅创建/删除——包没有源码）。
 
 ```bash
 # AI 式编辑（推荐）：唯一匹配查找替换 + 激活
@@ -229,20 +233,40 @@ curl -X PUT http://127.0.0.1:3000/api/objects/class/ZCL_FOO/source \
   -H "Content-Type: application/json" \
   -d '{"source":"CLASS zcl_foo DEFINITION ... ENDCLASS."}'
 
+# 读回对象源码（保留原文大小写；所有带源码类型可用）
+curl http://127.0.0.1:3000/api/objects/intf/ZIF_FOO/source
+
+# 一步：创建 + 填源码 + 设为 remote-enabled，随后直接经 /api/rfc 调用
+curl -X POST http://127.0.0.1:3000/api/objects/func/Z_CALC/create \
+  -H "Content-Type: application/json" \
+  -d '{"description":"calculator","group":"ZMATH","rfc_enabled":true,
+       "source":"FUNCTION z_calc IMPORTING VALUE(iv_a) TYPE i VALUE(iv_b) TYPE i EXPORTING VALUE(ev_sum) TYPE i.\n  ev_sum = iv_a + iv_b.\nENDFUNCTION."}'
+curl -X POST http://127.0.0.1:3000/api/rfc \
+  -H "Content-Type: application/json" \
+  -d '{"func_name":"Z_CALC","inputs":{"IV_A":20,"IV_B":22},"auto_outputs":["EV_SUM"]}'
+# → {"scalars":{"EV_SUM":42},...}
+
+# 删除对象（删 fugr 会连带其中的函数模块）
+curl -X DELETE "http://127.0.0.1:3000/api/objects/func/Z_CALC?group=ZMATH"
+
 # 语法检查（不写库：源码内嵌提交）
 curl -X POST http://127.0.0.1:3000/api/objects/prog/ZMY_REPORT/syntax \
   -H "Content-Type: application/json" \
   -d '{"source":"REPORT zmy_report.\nWRITE 1."}'
 ```
 
-- `replace` 请求体：`old_string` / `new_string`（可选 `transport`、`activate`（默认 true）、`group`）。`old_string` 必须精确匹配**唯一一处**（0 处 → 先读当前源码；多处 → 带更多上下文行；`\r\n`/`\n` 差异自动归一化）。空 `old_string` 仅对空对象有效。
+- `replace` 请求体：`old_string` / `new_string`（可选 `transport`、`activate`（默认 true）、`group`、`rfc_enabled`）。`old_string` 必须精确匹配**唯一一处**（0 处 → 先读当前源码；多处 → 带更多上下文行；`\r\n`/`\n` 差异自动归一化）。空 `old_string` 仅对空对象有效。
 - `PUT /source` 请求体：`source`（全量源码）+ 同上可选字段。
 - `syntax` 请求体：`source`。返回 `issues[]`：`severity`（E/W/…）、`line`、`offset`、`text`。
 - 响应里的 `activated.success` 是**逻辑结果**：激活失败时 HTTP 仍为 200，带 `activated.messages[]` / `problems[]`（"Line N: 文本"）——读它、改源码、重试。传输层错误（网络/会话）才走 4xx/5xx。
 - 锁冲突（他人正在编辑）→ 409 `OBJECT_LOCKED`，消息来自 SAP 原文。
-- **函数模块**：FM 源码的参数块（`FUNCTION 名.` 到 `EXCEPTIONS … .`）由参数元数据再生成——锚定在此区域的编辑会被**静默丢弃**，请把 `old_string` 锚定在函数**体**内；参数增删需元数据接口（尚未提供）。
-- 写入要求对象已存在（对象创建尚未提供）且 ADT 已启用；写入失败也会尽力 UNLOCK，不留孤儿锁。
-- **只读部署**：部署者可能以 `SAP_READ_ONLY=1` 运行网关——写端点（`PUT .../source`、`POST .../replace`、`/api/adt` 非读方法）此时返回 403 `READ_ONLY`。这是刻意为之：不要重试写操作，改为只读操作与 `POST .../syntax`（仍可用，不落库）。`POST /api/rfc` 不受该开关影响。
+- **函数模块签名可经源码写入（SEDI 形态）**：参数签名**内联写在 FUNCTION 语句里**——`FUNCTION zfm IMPORTING VALUE(iv) TYPE i EXPORTING VALUE(ev) TYPE i.` … `ENDFUNCTION.`——签名会注册进 FM 接口（已端到端实证）。网关也接受经典 `*" IMPORTING ...` 注释块形态（`/api/functions/{n}/source` 的返回形态）并自动转换。⚠️ 例外：**曾/现 rfc_enabled** 的模块接口被冻结——源码写得进、激活也成功，但参数变化被 SAP 忽略；改签名请删除重建（配合 `create` + `rfc_enabled` 成本很低）。
+- **`rfc_enabled: true`**（create / `PUT source` / `replace`，仅 func）：源码写完后，网关在同一把锁下 PUT 模块元数据（`fmodule:processingType="rfc"`，描述先读回再带上——该 PUT 是整文档替换）。新 FM 立即可经 `POST /api/rfc` 调用。
+- **创建走 ADT-first**：`POST /api/objects/{type}/{name}/create`（body：`description` 必填；可选 `devclass`（默认 `$TMP`）、`transport`、`software_component`（仅 package；缺省按 ZLOCAL→LOCAL→HOME 逐个试）、`source` 首版源码一步写入+激活）。网关按标准 ADT objectcreation XML 创建（Eclipse / vscode_abap_remote_fs / vibing-steampunk 同一契约）；`prog`/`func` 在 ADT 失败时回退 RFC RPY 插入路径。`func` 在组缺失时自动建 `fugr`（ADT 路径——ABAP Cloud Trial 上同样有效，绕开了 RFC 建组不写 TADIR 的限制）。更丝滑的形态：`PUT .../source` 与 `POST .../replace` 支持 `"create": true` + `"description"`——对象不存在时网关自动建壳并重试；建错的壳一个 `DELETE` 即可清掉。
+- 写入需 ADT 已启用；写入失败也会尽力 UNLOCK，不留孤儿锁。
+- **replace 匹配容忍阶梯**（依次）：精确 → CRLF/LF 归一 → 末尾 `\n` 修剪（末行锚点）→ **大小写不敏感唯一匹配**。SAP 存储源码原文，而部分读取路径曾返回大写化视图——兜底吸收这个漂移；大小写不敏感多命中仍按命中数报错。
+- **读回保留原文大小写**：`/api/programs/{name}/source` 现以 `WITH_LOWERCASE` 请求——读到即存到，从读回内容取的锚点必然匹配。`GET /api/objects/{type}/{name}/source`（ADT 通道）是新类型与函数模块的规范读入口（SEDI 形态，与写入口径一致）。
+- **只读部署**：部署者可能以 `SAP_READ_ONLY=1` 运行网关——写端点（`PUT .../source`、`POST .../replace`、`POST .../create`、`DELETE`、`/api/adt` 非读方法）此时返回 403 `READ_ONLY`。这是刻意为之：不要重试写操作，改为只读操作与 `POST .../syntax`（仍可用，不落库）。`POST /api/rfc` 不受该开关影响。
 
 ## 关键约束（避坑）
 
@@ -258,7 +282,7 @@ curl -X POST http://127.0.0.1:3000/api/objects/prog/ZMY_REPORT/syntax \
 10. **限流**：设了 `SAP_RATE_LIMIT_RPS` 时，`/api` 按调用方 IP 限速；超限返回 `429`（`key=RATE_LIMITED`）。默认不限流。
 11. **源码端点自动降级 ADT**：`/api/functions/{name}/source` 与 `/api/programs/{name}/source` 先走 RFC（`RPY_FUNCTIONMODULE_READ` / `RPY_PROGRAM_READ`），失败（NOT_FOUND 除外）自动改走 ADT 重读，响应的 `source_via` 字段标明来源（`rfc` / `adt`）。背景：源码行宽超 72 字符（现代 ABAP 常见）在部分系统上会让 RPY 路径直接报错。
 12. **激活失败不是 HTTP 错误**：写入端点在 SAP 拒绝激活时返回 200 + `activated.success=false` + `problems[]`——必须检查响应体里的 `activated` 字段。
-13. **函数模块的参数块归元数据管**：FM 源码里 `FUNCTION 头 … EXCEPTIONS x.` 这段是从参数元数据再生成的，锚定在这里的编辑会被 SAP 静默丢弃——编辑请锚定函数体；参数增删要走元数据接口（尚未提供）。
+13. **函数模块签名写在源码里（SEDI 形态）**：新版 ADT 系统把 FM 参数签名**内联存在 FUNCTION 语句里**——`FUNCTION zfm IMPORTING VALUE(iv) TYPE i EXPORTING VALUE(ev) TYPE i.`——并**拒绝**经典 `*" IMPORTING ...` 注释块（400 "Parameter comment blocks are not allowed"）。网关写入时自动转换经典块；RFC 读端点（`/api/functions/{n}/source`）返回的仍是经典形态——做读改写时优先用 `GET /api/objects/func/{n}/source`（ADT 形态）。签名变更**会**注册进 FM 接口——**例外**：曾/现 `rfc_enabled` 的模块接口冻结（SAP 忽略源码级签名变更），改签名请删除重建。
 
 ## 典型任务示例
 
@@ -289,14 +313,41 @@ curl -X POST http://127.0.0.1:3000/api/rfc \
 
 两个探针语义不同：
 
-- `GET /health` —— liveness，**不触碰 SAP**，秒回 `{"status":"ok"}`，判断进程是否存活。
+- `GET /health` —— liveness，**不触碰 SAP**，秒回 `{"status":"ok","version":"..."}`，判断进程是否存活（version 顺带给出，轮询方免费拿版本）。
 - `GET /ready` —— readiness，借连接池调 `RFC_PING`（5s 超时）验证 SAP 可达；成功 `{"status":"ready","sap":"ok"}`，失败/超时返回 `503`。
 - `GET /metrics` —— Prometheus 指标（免鉴权）：连接池 idle/total/max、RFC 调用计数/耗时。供采集系统抓取。
 
 ```bash
 curl http://127.0.0.1:3000/health
-# → {"status":"ok"}   （不触碰 SAP，仅探活）
+# → {"status":"ok","version":"0.10.0"}   （不触碰 SAP，仅探活）
 
 curl http://127.0.0.1:3000/ready
 # → {"status":"ready","sap":"ok"}   （连 SAP 跑 RFC_PING；失败返回 503）
 ```
+
+## 版本与能力（自描述）
+
+`GET /api/version`（公开，SAP 挂了也不会失败）——**新会话开局先调它**，不用靠撞 401/403/503/429 来发现部署开关：
+
+```bash
+curl http://127.0.0.1:3000/api/version
+# → {
+#   "name": "sap-for-agents",
+#   "version": "0.10.0",
+#   "commit": "0fa6d6b",                # 构建所用 git 短哈希；"-dirty" = 构建时有未提交改动
+#   "capabilities": {
+#     "auth": false,                     # true = /api/* 需 Bearer token（本端点除外）
+#     "read_only": false,                # true = 写端点返回 403 READ_ONLY
+#     "adt": true,                       # true = /api/adt/** 与 /api/dumps* 可用
+#     "rate_limit_rps": null             # 按 IP 每秒上限；null = 不限流
+#   },
+#   "sap": {                             # 首次调用懒加载，进程生命周期内缓存
+#     "sysid": "A4H", "release": "816", "host": "vhcala4h", "os": "Linux",
+#     "destination": "vhcala4hci_A4H_00", "client": "001"
+#   }
+# }
+```
+
+- SAP 不可达时 `sap` 为 `null`、`sap_error` 带原因——端点仍返回 200，下次调用自动重试。
+- `sap.release` 是内核/Basis 版本号（如 `816`），**不区分** ECC 与 S/4HANA；要判定 S/4，用 `POST /api/table/read` 查 `CVERS` 表有无 `S4CORE` 组件。
+- MCP 客户端等价工具：`get_gateway_info`。

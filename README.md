@@ -7,7 +7,7 @@ Wraps the SAP NWRFC SDK into a long-running HTTP service that exposes any SAP RF
 - **Stack**: Rust (standard-library FFI linking directly to `sapnwrfc.dll`) + axum + tokio + serde
 - **Zero-SDK clients**: callers only need to send an HTTP POST
 - **Generic interface**: one endpoint, `/api/rfc`, describes any BAPI — no per-BAPI glue code
-- **AI-friendly**: 15 metadata endpoints (search functions / inspect interfaces / read docs / view source / read transparent tables / query the data dictionary / triage short dumps / **edit ABAP code**) let agents explore and act self-service. The operator guide for AI lives in [`AGENTS.md`](./AGENTS.md)
+- **AI-friendly**: 16 metadata endpoints (self-description / search functions / inspect interfaces / read docs / view source / read transparent tables / query the data dictionary / triage short dumps / **edit ABAP code**) let agents explore and act self-service. The operator guide for AI lives in [`AGENTS.md`](./AGENTS.md)
 
 > ⚠️ **Risk disclaimer**: this is an **exploratory, experimental project**, primarily built for learning, testing, and local development scenarios. It has not been hardened for production use, offers no guarantee of stability or correctness, and its APIs may change at any time. It grants RFC access with the full privileges of the configured `SAP_USER` — before using it, you must evaluate the risks yourself (data exposure, unauthorized calls, compliance, etc.) and take your own precautions. Use it against production SAP systems at your own risk; the authors accept no liability for any loss arising from its use.
 
@@ -206,7 +206,7 @@ All configuration goes through environment variables, written to `.env` in the p
 
 ### Authentication (optional)
 
-Once `SAP_API_KEY` is set, every `/api/*` business endpoint requires the request header `Authorization: Bearer <token>`; without it the service is unauthenticated (the localhost default). The probes `/health`, `/ready`, and the public pages `/`, `/agents.md` are always open.
+Once `SAP_API_KEY` is set, every `/api/*` business endpoint requires the request header `Authorization: Bearer <token>`; without it the service is unauthenticated (the localhost default). The probes `/health`, `/ready`, `/api/version`, and the public pages `/`, `/agents.md` are always open.
 
 ```bash
 # Enable authentication (generate a long random string)
@@ -228,7 +228,7 @@ Two probe endpoints with distinct semantics:
 Does not touch SAP; returns instantly; used to check whether the process is alive.
 
 ```json
-{ "status": "ok" }
+{ "status": "ok", "version": "0.10.0" }
 ```
 
 #### `GET /ready` — readiness (SAP reachable)
@@ -249,6 +249,24 @@ Returns Prometheus text-format metrics for Prometheus / Grafana and other scrape
 - `rfc_call_duration_ms{func}` — call-duration histogram (with p50/p90/p99)
 
 > Unauthenticated (an ops probe, like `/health` and `/ready`). On a public deployment, protect it at the reverse-proxy layer.
+
+#### `GET /api/version` — version & capability self-description (public)
+
+One call answers everything an agent would otherwise learn by hitting 401/403/503/429: gateway version + git commit (`-dirty` suffix when built with uncommitted changes), capability switches, and the target SAP system info.
+
+```json
+{
+  "name": "sap-for-agents",
+  "version": "0.10.0",
+  "commit": "0fa6d6b",
+  "capabilities": { "auth": false, "read_only": false, "adt": true, "rate_limit_rps": null },
+  "sap": { "sysid": "A4H", "release": "816", "host": "vhcala4h", "os": "Linux", "destination": "vhcala4hci_A4H_00", "client": "001" }
+}
+```
+
+- Gateway-local fields (version/commit/capabilities) never touch SAP and never fail. The `sap` block is fetched lazily via `RFC_SYSTEM_INFO` on the first call and cached for the process lifetime; when SAP is unreachable it is `null` (with `sap_error`) and the endpoint still returns 200.
+- `sap.release` is the kernel/Basis level; it does not distinguish ECC from S/4HANA (check the `CVERS` table for `S4CORE` instead).
+- Unauthenticated by design: an agent must be able to learn `capabilities.auth` (whether a token is needed) before holding one. On a public deployment, protect it at the reverse-proxy layer if the SAP hostnames it exposes are sensitive.
 
 ---
 
@@ -314,10 +332,11 @@ Fields you don't read (e.g. you didn't pass `table_outputs`) do **not** appear i
 
 ### 3.3 AI-facing metadata API
 
-15 endpoints let an AI/agent self-service discover functions, understand parameters, query the data dictionary, read docs, view source, read table data, triage short dumps, and **edit code**. Typical workflow: **search → inspect interface → read docs → view source → call**. The full operator guide for AI lives in [`AGENTS.md`](./AGENTS.md).
+16 endpoints let an AI/agent self-service discover functions, understand parameters, query the data dictionary, read docs, view source, read table data, triage short dumps, and **edit code**. Typical workflow: **self-description (`/api/version`) → search → inspect interface → read docs → view source → call**. The full operator guide for AI lives in [`AGENTS.md`](./AGENTS.md).
 
 | Endpoint | Purpose | Example |
 |------|------|------|
+| `GET /api/version` | Self-description first: version/commit + capability switches (auth/read_only/adt/rate limit) + SAP sysid/release (public, cached) | `/api/version` |
 | `POST /api/functions/search` | Search functions by wildcard | `{"pattern":"BAPI_USER_*","max_results":10}` |
 | `GET /api/functions/:name` | Inspect a function's full interface (parameters/types/direction/nested fields) | `/api/functions/BAPI_USER_GET_DETAIL` |
 | `GET /api/functions/:name/doc` | Read docs (short text + SE37 long doc + parameter descriptions) | `/api/functions/BAPI_USER_GET_DETAIL/doc?lang=EN` |
@@ -329,7 +348,8 @@ Fields you don't read (e.g. you didn't pass `table_outputs`) do **not** appear i
 | `GET /api/dumps` | Structured short-dump list (parsed from the ADT Atom feed) | `/api/dumps?limit=50` |
 | `GET /api/dumps/grouped` | Dumps grouped by (error type, terminated program) — what keeps failing | `/api/dumps/grouped` |
 | `GET /api/dumps/:key/detail` | One dump's parsed detail: header, termination point, call stack | `/api/dumps/<key>/detail` |
-| `PUT /api/objects/:type/:name/source` | Write full source (lock→put→unlock→activate orchestrated in one request) | `{"source":"REPORT z..."}` |
+| `POST /api/objects/:type/:name/create` | Create an ABAP object (optional first `source` written + activated in the same call; `create:true` also available on PUT/replace for auto-create) | `{"description":"...","source":"REPORT z..."}` |
+| `PUT /api/objects/:type/:name/source` | Write full source (lock→put→unlock→activate orchestrated in one request; supports `create:true` auto-creation) | `{"source":"REPORT z..."}` |
 | `POST /api/objects/:type/:name/replace` | AI-style unique find-and-replace + activate | `{"old_string":"...","new_string":"..."}` |
 | `POST /api/objects/:type/:name/syntax` | Syntax-check source without writing it | `{"source":"REPORT z..."}` |
 | `ANY /api/adt/:path` | Generic ADT REST proxy (`/sap/bc/adt/**` 1:1): dumps, class sources, anything Eclipse ADT exposes; CSRF handled for write methods | `/api/adt/runtime/dumps` |
@@ -337,7 +357,7 @@ Fields you don't read (e.g. you didn't pass `table_outputs`) do **not** appear i
 | `GET /openapi.json` | Full OpenAPI 3.0.3 spec of the gateway (public, unauthenticated): 20 endpoints + 33 schemas + auth scheme — feed it to code generators, Postman, or an AI agent's tool registry | `/openapi.json` |
 | `GET /api/openapi?functions=A,B` | Dynamic spec: generates a typed operation per BAPI from DDIC metadata (params/types/nested fields expanded, targeting `{name}/invoke`; ≤50 per call) | `/api/openapi?functions=BAPI_USER_GETLIST` |
 | `GET /api/functions/:name/where-used` | Where-used list of a function module (REPOSITORY_ENVIRONMENT_SET_RFC; needs the SAP usage index — empty + note on trial systems) | `/api/functions/BAPI_TRANSACTION_COMMIT/where-used` |
-| `POST /mcp` | MCP server (Model Context Protocol): 13 tools for Claude & friends — search/inspect/docs/invoke/source/DDIC/dumps/syntax/where-used. JSON-RPC over stateless Streamable HTTP | `POST /mcp` with `{"method":"tools/list"}` |
+| `POST /mcp` | MCP server (Model Context Protocol): 19 tools for Claude & friends — gateway-info/search/inspect/docs/invoke/source/DDIC/dumps/syntax/where-used/writes. JSON-RPC over stateless Streamable HTTP | `POST /mcp` with `{"method":"tools/list"}` |
 | `GET /docs` | Interactive API docs (Redoc rendering of `/openapi.json`) | `/docs` |
 
 End-to-end example (list users):
@@ -641,7 +661,7 @@ src/
 | Namespaced function modules `/NS/NAME` | ✅ Implemented (validation + wildcard route dispatch, since v0.4.10) |
 | ADT REST proxy | ✅ Implemented (`/api/adt/**` passthrough with automatic CSRF handling, since v0.4.11) |
 | Structured ST22 analysis | ✅ Implemented (`/api/dumps` list/grouped/detail parsed from ADT — no more multi-hundred-KB raw texts; since v0.5.0) |
-| ABAP code modification | ✅ Implemented (`PUT source` / `POST replace` / `POST syntax` for prog/class/func — full lock→write→activate orchestration with dedicated stateful session; since v0.6.0) |
+| ABAP code modification | ✅ Implemented (`PUT source` / `POST replace` / `POST syntax` / `GET source` / `POST create` / `DELETE` for prog/incl/class/intf/func/fugr/cds/package — full lock→write→activate orchestration with dedicated stateful session; ADT-first creation with RFC fallback, FM signatures writable via source (SEDI form) + `rfc_enabled` remote-enable; since v0.6.0) |
 | Source dependency prologue | ✅ Implemented (`/api/functions/:name/source?prologue=true` inlines compact signatures of `CALL FUNCTION` targets; since v0.5.0) |
 | Per-IP rate limiting | ✅ Implemented (optional `SAP_RATE_LIMIT_RPS`, `governor`-keyed limiter, 429 on excess) |
 | Per-RFC execution timeout | ✅ Implemented (`run_blocking_with_timeout` wraps `spawn_blocking` with `tokio::time::timeout`; default 60s / `SAP_REQUEST_TIMEOUT_SECS`, per-request `timeout_secs`, 504 on timeout) |

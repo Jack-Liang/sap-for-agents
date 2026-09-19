@@ -174,7 +174,7 @@ tailwind.config = {
         <h1 class="font-display-lg text-display-lg text-on-surface mb-sm">sap-for-agents</h1>
         <p class="font-headline-md text-headline-md text-primary mb-md">SAP NWRFC → REST 网关服务</p>
         <p class="font-body-lg text-body-lg text-on-surface-variant max-w-2xl">
-            一个端点调用任意 BAPI，14 个元数据端点（含 ST22 短转储分析与代码修改）供 AI 自主探索
+            一个端点调用任意 BAPI，15 个元数据端点（含版本自描述、ST22 短转储分析与代码修改）供 AI 自主探索
         </p>
     </section>
 
@@ -235,6 +235,11 @@ tailwind.config = {
                 面向 AI 的元数据 API
             </h3>
             <ul class="space-y-sm">
+                <li class="flex items-center gap-md py-sm border-b border-outline-variant/30 last:border-0">
+                    <span class="font-code-sm text-code-sm px-sm py-xs rounded method-get w-16 text-center">GET</span>
+                    <code class="font-code-sm text-code-sm text-on-surface flex-grow">/api/version</code>
+                    <span class="font-body-sm text-body-sm text-on-surface-variant whitespace-nowrap">自描述（能力开关 + SAP 版本）</span>
+                </li>
                 <li class="flex items-center gap-md py-sm border-b border-outline-variant/30 last:border-0">
                     <span class="font-code-sm text-code-sm px-sm py-xs rounded method-get w-16 text-center">GET</span>
                     <code class="font-code-sm text-code-sm text-on-surface flex-grow">/api/functions/{name}</code>

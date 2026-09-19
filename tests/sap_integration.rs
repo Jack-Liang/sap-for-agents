@@ -137,6 +137,59 @@ fn ready_returns_sap_ok() {
 
 #[test]
 #[ignore]
+fn version_endpoint_reports_gateway_and_sap() {
+    // /api/version：本地部分秒回 + SAP 块（RFC_SYSTEM_INFO 懒加载缓存）
+    let _s = start_server();
+    let client = http_client();
+
+    let resp = client
+        .get(format!("{}/api/version", _s.base_url))
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().unwrap();
+    assert_eq!(body["name"], "sap-for-agents");
+    assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
+    for k in ["auth", "read_only", "adt"] {
+        assert!(
+            body["capabilities"][k].is_boolean(),
+            "capabilities.{k} 应为布尔: {body}"
+        );
+    }
+    // SAP 可达时应给出系统信息（sysid/release 非空，client 来自启动配置）
+    assert!(body["sap"].is_object(), "SAP 可达时 sap 块应有值: {body}");
+    assert!(!body["sap"]["sysid"].as_str().unwrap_or("").is_empty());
+    assert!(!body["sap"]["release"].as_str().unwrap_or("").is_empty());
+    let expect_client = std::env::var("SAP_CLIENT").unwrap_or_default();
+    assert_eq!(body["sap"]["client"], expect_client);
+
+    // 第二次调用走缓存，形状不变（sap_error 不应出现）
+    let resp2 = client
+        .get(format!("{}/api/version", _s.base_url))
+        .send()
+        .unwrap();
+    let body2: serde_json::Value = resp2.json().unwrap();
+    assert!(body2["sap"].is_object());
+    assert!(body2["sap_error"].is_null());
+}
+
+#[test]
+#[ignore]
+fn version_stays_public_when_auth_enabled() {
+    // 设了 SAP_API_KEY：/api/version 仍免鉴权（Agent 需在拿到 token 前
+    // 知道 capabilities.auth），且如实上报 auth=true
+    let _s = start_server_with_env(&[("SAP_API_KEY", "test-secret")]);
+    let resp = http_client()
+        .get(format!("{}/api/version", _s.base_url))
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 200, "认证开启时 /api/version 仍应公开");
+    let body: serde_json::Value = resp.json().unwrap();
+    assert_eq!(body["capabilities"]["auth"], true);
+}
+
+#[test]
+#[ignore]
 fn api_requires_token_when_key_set() {
     // 启动带 SAP_API_KEY 的 server：/api/* 应要求 Bearer token，探针免鉴权。
     let _s = start_server_with_env(&[("SAP_API_KEY", "test-secret")]);
@@ -1132,4 +1185,107 @@ fn mcp_where_used_tool_available() {
     let text = body["result"]["content"][0]["text"].as_str().unwrap();
     let payload: serde_json::Value = serde_json::from_str(text).unwrap();
     assert!(payload["count"].is_u64());
+}
+
+// ========================================================================
+// 写入丝滑度（创建 + 增删改 + 大小写漂移 + MCP 编辑）
+// ========================================================================
+
+#[test]
+#[ignore]
+fn smooth_write_lifecycle_on_program() {
+    let _s = start_server();
+    let name = format!("ZSMOOTH_T{}", std::process::id() % 10000);
+
+    // ① PUT + create:true 从零创建并写入（历史痛点：不存在 → 409）
+    let resp = http_client()
+        .put(format!("{}/api/objects/prog/{}/source", _s.base_url, name))
+        .json(&serde_json::json!({
+            "source": "REPORT zsmooth.\nDATA lv_n TYPE i.\nWRITE 'born'.",
+            "create": true, "description": "smooth lifecycle test"
+        }))
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 200, "create:true 应从零创建");
+    let body: serde_json::Value = resp.json().unwrap();
+    assert_eq!(body["activated"]["success"], true);
+
+    // ② 读回保留原文大小写（口径修复：RPY 读回不再大写化）
+    let src: serde_json::Value = http_client()
+        .get(format!("{}/api/programs/{}/source", _s.base_url, name))
+        .send()
+        .unwrap()
+        .json()
+        .unwrap();
+    let text = src["lines"].as_array().unwrap().iter()
+        .map(|l| l.as_str().unwrap()).collect::<Vec<_>>().join("\n");
+    assert!(text.contains("lv_n"), "读回应保留小写原文: {text}");
+
+    // ③ 大写锚点改小写原文（大小写漂移兜底）
+    let resp = http_client()
+        .post(format!("{}/api/objects/prog/{}/replace", _s.base_url, name))
+        .json(&serde_json::json!({"old_string": "LV_N TYPE I.", "new_string": "lv_n TYPE i VALUE 7."}))
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 200, "大写锚点应经大小写不敏感兜底命中");
+    let body: serde_json::Value = resp.json().unwrap();
+    assert_eq!(body["activated"]["success"], true);
+
+    // ④ 末行 \n 锚点
+    let resp = http_client()
+        .post(format!("{}/api/objects/prog/{}/replace", _s.base_url, name))
+        .json(&serde_json::json!({"old_string": "WRITE 'born'.\n", "new_string": "WRITE / |n={ lv_n }|."}))
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 200, "末行 \\n 锚点应命中");
+
+    // ⑤ 删行 + create 动作端点
+    let resp = http_client()
+        .post(format!("{}/api/objects/prog/{}/replace", _s.base_url, name))
+        .json(&serde_json::json!({"old_string": "DATA lv_n TYPE i VALUE 7.\n", "new_string": ""}))
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+}
+
+#[test]
+#[ignore]
+fn mcp_edit_code_and_write_source_tools() {
+    let _s = start_server();
+    let name = format!("ZMCPW{}", std::process::id() % 10000);
+
+    // MCP write_source 从零创建（create:true）
+    let resp = http_client()
+        .post(format!("{}/mcp", _s.base_url))
+        .json(&serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": "write_source", "arguments": {
+                "type": "prog", "name": name,
+                "source": "REPORT zmcpw.\nWRITE 'mcp born'.",
+                "create": true, "description": "mcp write test"
+            }}
+        }))
+        .send()
+        .unwrap();
+    let body: serde_json::Value = resp.json().unwrap();
+    assert_eq!(body["result"]["isError"], false, "MCP write_source 创建应成功");
+
+    // MCP edit_code 用大写漂移锚点丝滑修改
+    let resp = http_client()
+        .post(format!("{}/mcp", _s.base_url))
+        .json(&serde_json::json!({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": {"name": "edit_code", "arguments": {
+                "type": "prog", "name": name,
+                "old_string": "WRITE 'MCP BORN'.",
+                "new_string": "WRITE / 'mcp edited smoothly'."
+            }}
+        }))
+        .send()
+        .unwrap();
+    let body: serde_json::Value = resp.json().unwrap();
+    assert_eq!(body["result"]["isError"], false, "MCP edit_code 大写锚点应兜底命中");
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    let payload: serde_json::Value = serde_json::from_str(text).unwrap();
+    assert_eq!(payload["activated"]["success"], true);
 }

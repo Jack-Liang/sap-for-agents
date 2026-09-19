@@ -1,6 +1,6 @@
 [package]
 name = "sap_for_agents"
-version = "0.9.0"
+version = "0.10.0"
 license = "MIT"
 edition = "2021"
 rust-version = "1.75"
@@ -18,15 +18,15 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 dotenvy = "0.15"
 # 二进制字段 Base64 编解码
-base64 = "0.22"
+base64 = "0.23"
 # 结构化日志
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # 指标（Prometheus /metrics 端点）
-metrics = "0.23"
+metrics = "0.24"
 metrics-exporter-prometheus = "0.18"
 # 限流（按 IP，可选 SAP_RATE_LIMIT_RPS）
-governor = "0.7"
+governor = "0.10"
 # Server 模式：同步 HTTP 客户端（回调线程内调用）+ TOML 配置
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 toml = "0.8"

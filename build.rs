@@ -96,8 +96,51 @@ fn main() {
         }
     }
 
+    emit_git_commit();
+
     println!("cargo:warning=使用 SAP NWRFC SDK: {}", target_dir);
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=SAP_SDK_DIR");
     println!("cargo:rerun-if-env-changed=SAP_SDK_HOST_PATH");
+}
+
+/// 注入 git 提交号（`/api/version` 自描述用），运行期经
+/// `option_env!("SAP_GIT_COMMIT")` 读取。优先级：
+///   1) 环境变量 SAP_BUILD_COMMIT（CI / 无 git 环境显式指定）
+///   2) `git rev-parse --short HEAD`（工作树脏时附 `-dirty`）
+///   3) 均不可用 → "unknown"（如从源码包构建），不 panic
+///
+/// 只监听 .git/HEAD 变化：同分支连续提交后 commit 号可能滞后到下次
+/// 全量构建才刷新——发布构建（CI 全新 clone）不受影响，属可接受偏差。
+fn emit_git_commit() {
+    let commit = std::env::var("SAP_BUILD_COMMIT")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            let short = std::process::Command::new("git")
+                .args(["rev-parse", "--short", "HEAD"])
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .filter(|s| !s.is_empty());
+            if let Some(short) = short {
+                // 工作树有未提交改动 → 标记 dirty（排查"连的是哪个构建"的关键信息）
+                let dirty = std::process::Command::new("git")
+                    .args(["status", "--porcelain"])
+                    .output()
+                    .map(|o| !o.stdout.is_empty())
+                    .unwrap_or(false);
+                Some(if dirty {
+                    format!("{short}-dirty")
+                } else {
+                    short
+                })
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| "unknown".to_string());
+    println!("cargo:rustc-env=SAP_GIT_COMMIT={commit}");
+    println!("cargo:rerun-if-changed=.git/HEAD");
 }

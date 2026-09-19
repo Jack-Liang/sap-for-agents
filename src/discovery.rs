@@ -345,10 +345,19 @@ pub fn read_program_source(
 ) -> Result<Vec<String>, RfcError> {
     let req = InvokeRequest {
         func_name: "RPY_PROGRAM_READ".to_string(),
-        inputs: HashMap::from([(
-            "PROGRAM_NAME".to_string(),
-            ScalarValue::Chars(prog_name.to_uppercase()),
-        )]),
+        inputs: HashMap::from([
+            (
+                "PROGRAM_NAME".to_string(),
+                ScalarValue::Chars(prog_name.to_uppercase()),
+            ),
+            // 保留源码原文大小写：默认读取会把源码大写化（pretty 视图），
+            // 而 ADT 写路径读的是原文——两个视图不一致会让 replace 的
+            // old_string 锚点永远匹配不上（实测踩坑）。口径必须与写路径一致。
+            (
+                "WITH_LOWERCASE".to_string(),
+                ScalarValue::Chars("X".to_string()),
+            ),
+        ]),
         table_outputs: HashMap::from([("SOURCE_EXTENDED".to_string(), source_line_spec())]),
         ..Default::default()
     };

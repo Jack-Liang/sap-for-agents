@@ -28,7 +28,26 @@ permissions:
   contents: write
 
 jobs:
+  # 发版一致性闸门：tag 名（去 v 前缀）必须等于 Cargo.toml 的 version。
+  # 防止"tag 了 v0.11.0 但忘了 bump toml"→ Release 名对、二进制自报旧版本
+  # （/api/version、MCP serverInfo 都读 Cargo.toml，版本可信度依赖此校验）。
+  check-version:
+    name: Verify tag matches Cargo.toml version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: tag == Cargo.toml version
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          CARGO_VER="$(grep -m1 '^version' Cargo.toml | sed 's/version *= *"\(.*\)"/\1/')"
+          echo "tag: ${TAG}, Cargo.toml: ${CARGO_VER}"
+          if [ "${TAG}" != "${CARGO_VER}" ]; then
+            echo "::error::tag v${TAG} does not match Cargo.toml version ${CARGO_VER} — bump Cargo.toml before tagging"
+            exit 1
+          fi
+
   build:
+    needs: check-version
     name: Build (${{ matrix.target }})
     strategy:
       fail-fast: false

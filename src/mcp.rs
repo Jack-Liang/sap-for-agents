@@ -139,10 +139,70 @@ pub fn tools_manifest() -> Vec<Value> {
             }, "required": ["name"] }
         }),
         json!({
+            "name": "write_source",
+            "description": "Write FULL source of an ABAP object (prog/incl/class/intf/func/fugr/cds) and activate. Destructive: overwrites everything. Pass create:true + description to create the object when missing. For func: FM parameter signatures are part of the source (write them inline in the FUNCTION statement: 'FUNCTION zfm IMPORTING VALUE(iv) TYPE string EXPORTING VALUE(ev) TYPE string. ... ENDFUNCTION.'); classic *\" comment blocks are converted automatically. rfc_enabled:true additionally marks the function module remote-enabled. For surgical edits prefer edit_code.",
+            "inputSchema": { "type": "object", "properties": {
+                "type": { "type": "string", "enum": ["prog", "incl", "class", "intf", "func", "fugr", "cds"], "description": "Object type" },
+                "name": str_param("Object name (uppercase)"),
+                "source": str_param("Full ABAP source"),
+                "group": { "type": "string", "description": "Function group (func only; auto-resolved when omitted)" },
+                "transport": { "type": "string", "description": "Transport request (optional)" },
+                "create": { "type": "boolean", "description": "Create the object when missing (default false)" },
+                "description": { "type": "string", "description": "Title for auto-creation (required with create:true)" },
+                "devclass": { "type": "string", "description": "Package for auto-creation (default $TMP)" },
+                "rfc_enabled": { "type": "boolean", "description": "func only: mark the function module remote-enabled (processingType=rfc)" }
+            }, "required": ["type", "name", "source"] }
+        }),
+        json!({
+            "name": "edit_code",
+            "description": "Surgical edit of an existing ABAP object: unique find-and-replace + activate. old_string must match exactly one place; CRLF differences are normalized and a case-insensitive unique fallback applies (SAP stores original case). Empty old_string only works on an empty/new object (with create:true it initializes a new object with new_string). rfc_enabled:true (func only) marks the module remote-enabled after the edit.",
+            "inputSchema": { "type": "object", "properties": {
+                "type": { "type": "string", "enum": ["prog", "incl", "class", "intf", "func", "fugr", "cds"], "description": "Object type" },
+                "name": str_param("Object name"),
+                "old_string": str_param("Text to replace (match exactly one place; empty only for empty/new objects)"),
+                "new_string": str_param("Replacement text"),
+                "group": { "type": "string", "description": "Function group (func only)" },
+                "transport": { "type": "string", "description": "Transport request (optional)" },
+                "create": { "type": "boolean", "description": "Create the object when missing; new_string becomes the initial source (default false)" },
+                "description": { "type": "string", "description": "Title for auto-creation" },
+                "rfc_enabled": { "type": "boolean", "description": "func only: mark remote-enabled after the write" }
+            }, "required": ["type", "name", "old_string", "new_string"] }
+        }),
+        json!({
+            "name": "create_object",
+            "description": "Create an ABAP object shell (prog/incl/class/intf/func/fugr/cds/package) via ADT. Optional 'source' writes+activates the first version in one call. package: devclass = parent package, software_component optional (candidates ZLOCAL/LOCAL/HOME tried in order).",
+            "inputSchema": { "type": "object", "properties": {
+                "type": { "type": "string", "enum": ["prog", "incl", "class", "intf", "func", "fugr", "cds", "package"], "description": "Object type" },
+                "name": str_param("Object name (uppercase)"),
+                "description": str_param("Object title / short text (required)"),
+                "devclass": { "type": "string", "description": "Package (default $TMP); for package type: parent package" },
+                "group": { "type": "string", "description": "Function group (func only)" },
+                "transport": { "type": "string", "description": "Transport request (optional)" },
+                "software_component": { "type": "string", "description": "package only: software component" },
+                "source": str_param("Optional first source (written + activated in one call)"),
+                "rfc_enabled": { "type": "boolean", "description": "func only: mark remote-enabled" }
+            }, "required": ["type", "name", "description"] }
+        }),
+        json!({
+            "name": "delete_object",
+            "description": "Delete an ABAP object (lock → DELETE → done). Deleting a fugr removes its function modules too. Use for cleanup of scratch objects; irreversible.",
+            "inputSchema": { "type": "object", "properties": {
+                "type": { "type": "string", "enum": ["prog", "incl", "class", "intf", "func", "fugr", "cds", "package"], "description": "Object type" },
+                "name": str_param("Object name"),
+                "group": { "type": "string", "description": "Function group (func only)" },
+                "transport": { "type": "string", "description": "Transport request (optional)" }
+            }, "required": ["type", "name"] }
+        }),
+        json!({
+            "name": "get_gateway_info",
+            "description": "Gateway self-description: version, git commit, capability switches (auth/read_only/adt/rate_limit) and the SAP system info (sysid/release/host/os/client, cached from the first call). Call this first in a new session to learn whether writes are allowed and whether SAP is reachable — never fails on SAP outage (sap becomes null).",
+            "inputSchema": { "type": "object", "properties": {} }
+        }),
+        json!({
             "name": "syntax_check",
             "description": "Syntax-check ABAP source WITHOUT storing it (object name anchors the check; use a Z name for scratch checks)",
             "inputSchema": { "type": "object", "properties": {
-                "type": { "type": "string", "enum": ["prog", "class", "func"], "description": "Object type" },
+                "type": { "type": "string", "enum": ["prog", "incl", "class", "intf", "func", "fugr", "cds"], "description": "Object type" },
                 "name": str_param("Object name (a Z name works for scratch checks)"),
                 "source": str_param("Full ABAP source to check")
             }, "required": ["type", "name", "source"] }
@@ -155,17 +215,23 @@ pub fn tools_manifest() -> Vec<Value> {
 // ========================================================================
 
 fn rpc_result(id: Value, result: Value) -> Response {
-    ([(axum::http::header::CONTENT_TYPE, "application/json")], axum::Json(json!({
-        "jsonrpc": "2.0", "id": id, "result": result
-    })))
+    (
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        axum::Json(json!({
+            "jsonrpc": "2.0", "id": id, "result": result
+        })),
+    )
         .into_response()
 }
 
 fn rpc_error(id: Value, code: i32, message: &str) -> Response {
-    ([(axum::http::header::CONTENT_TYPE, "application/json")], axum::Json(json!({
-        "jsonrpc": "2.0", "id": id,
-        "error": { "code": code, "message": message }
-    })))
+    (
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        axum::Json(json!({
+            "jsonrpc": "2.0", "id": id,
+            "error": { "code": code, "message": message }
+        })),
+    )
         .into_response()
 }
 
@@ -203,7 +269,11 @@ pub async fn mcp_handler(
     };
     // Streamable HTTP 无状态模式：一次一条消息，不接受批量
     if msg.is_array() {
-        return rpc_error(Value::Null, -32600, "Batch requests not supported (stateless mode)");
+        return rpc_error(
+            Value::Null,
+            -32600,
+            "Batch requests not supported (stateless mode)",
+        );
     }
     let id = msg.get("id").cloned().unwrap_or(Value::Null);
     let method = msg.get("method").and_then(|m| m.as_str()).unwrap_or("");
@@ -297,7 +367,7 @@ async fn call_tool(pool: SharedPool, name: &str, args: Value) -> Result<Value, R
                     code: -1,
                     status: 400,
                     message: format!("invalid invoke_rfc arguments: {e}"),
-                    key: "JSON_INVALID".into()
+                    key: "JSON_INVALID".into(),
                 })?;
             req.func_name = req.func_name.to_uppercase();
             crate::api::validate_func_name(&req.func_name)?;
@@ -323,7 +393,10 @@ async fn call_tool(pool: SharedPool, name: &str, args: Value) -> Result<Value, R
         "read_function_source" => {
             let fname = req_str(&args, "name")?.to_uppercase();
             crate::api::validate_func_name(&fname)?;
-            let prologue = args.get("prologue").and_then(|v| v.as_bool()).unwrap_or(false);
+            let prologue = args
+                .get("prologue")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
             let out = crate::server::run_blocking(pool, move |conn| {
                 let lines = crate::discovery::read_function_source(conn, &fname)?;
                 let prologue_text = if prologue {
@@ -366,7 +439,11 @@ async fn call_tool(pool: SharedPool, name: &str, args: Value) -> Result<Value, R
         "get_ddic_field" => {
             let table = req_str(&args, "table")?.to_uppercase();
             let field = req_str(&args, "field")?.to_uppercase();
-            let lang = args.get("lang").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let lang = args
+                .get("lang")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
             let out = crate::server::run_blocking(pool, move |conn| {
                 crate::discovery::read_ddic_field_info(conn, &table, &field, &lang)
             })
@@ -378,31 +455,54 @@ async fn call_tool(pool: SharedPool, name: &str, args: Value) -> Result<Value, R
             let fields: Vec<String> = args
                 .get("fields")
                 .and_then(|f| f.as_array())
-                .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
                 .unwrap_or_default();
             if fields.is_empty() {
                 return Err(RfcError {
                     code: -1,
                     status: 400,
                     message: "fields is required (non-empty array)".into(),
-                    key: "FIELDS_EMPTY".into()
+                    key: "FIELDS_EMPTY".into(),
                 });
             }
             let where_clauses: Vec<String> = args
                 .get("where")
                 .and_then(|w| w.as_array())
-                .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
                 .unwrap_or_default();
-            let rowcount = args.get("rowcount").and_then(|v| v.as_u64()).unwrap_or(1000).min(10000) as u32;
+            let rowcount = args
+                .get("rowcount")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(1000)
+                .min(10000) as u32;
             let resp_table = table.clone();
             let rows = crate::server::run_blocking(pool, move |conn| {
-                crate::discovery::read_table(conn, &table, &fields, &where_clauses, rowcount, '\u{1}')
+                crate::discovery::read_table(
+                    conn,
+                    &table,
+                    &fields,
+                    &where_clauses,
+                    rowcount,
+                    '\u{1}',
+                )
             })
             .await?;
             Ok(json!({ "table": resp_table, "count": rows.len(), "rows": rows }))
         }
         "list_dumps" => {
-            let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(50).min(1000);
+            let limit = args
+                .get("limit")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(50)
+                .min(1000);
             let entries = crate::dumps::fetch_feed(None, None).await?;
             let out: Vec<_> = entries.into_iter().take(limit as usize).collect();
             Ok(json!({ "count": out.len(), "dumps": out }))
@@ -411,6 +511,147 @@ async fn call_tool(pool: SharedPool, name: &str, args: Value) -> Result<Value, R
             let key = req_str(&args, "key")?;
             let detail = crate::dumps::fetch_detail(&key).await?;
             Ok(serde_json::to_value(detail).unwrap_or(json!({})))
+        }
+        "write_source" | "edit_code" | "create_object" => {
+            use crate::objects::ObjectType;
+            let tool = name; // 工具名（下方 name 会被对象名遮蔽）
+            let otype = req_str(&args, "type")?;
+            let name = req_str(&args, "name")?.to_uppercase();
+            let group_hint = args.get("group").and_then(|v| v.as_str()).map(String::from);
+            let transport = args
+                .get("transport")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let create = args
+                .get("create")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let description = args
+                .get("description")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let devclass = args
+                .get("devclass")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let rfc_enabled = args
+                .get("rfc_enabled")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let obj_type = ObjectType::parse(&otype).ok_or_else(|| RfcError {
+                code: -1,
+                status: 400,
+                message: format!(
+                    "type 必须是 prog/incl/class/intf/func/fugr/cds/package，收到: {otype}"
+                ),
+                key: "OBJECT_TYPE_INVALID".into(),
+            })?;
+            crate::server::validate_object_name(&name)?;
+            let group =
+                crate::server::resolve_group_if_needed(&pool, obj_type, &name, group_hint).await?;
+
+            if tool == "create_object" {
+                // 显式创建壳（可选首版源码一并写入激活）
+                let spec = crate::objects::CreateSpec {
+                    description: description.clone(),
+                    devclass,
+                    transport: transport.clone(),
+                    software_component: args
+                        .get("software_component")
+                        .and_then(|v| v.as_str())
+                        .map(String::from),
+                };
+                crate::objects::create_object(&pool, obj_type, &name, &group, &spec).await?;
+                let mut out = json!({ "created": true, "type": obj_type.api_name(), "name": name });
+                if let Some(src) = args
+                    .get("source")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.trim().is_empty())
+                {
+                    if obj_type.has_source() {
+                        let outcome = crate::objects::write_object_source(
+                            obj_type,
+                            &name,
+                            &group,
+                            src,
+                            transport.as_deref(),
+                            true,
+                            rfc_enabled,
+                        )
+                        .await?;
+                        out["write"] = serde_json::to_value(outcome).unwrap_or_default();
+                    }
+                }
+                return Ok(out);
+            }
+
+            let opts = crate::objects::WriteOpts {
+                transport: transport.as_deref(),
+                activate: true,
+                create_desc: create.then_some(description.as_str()),
+                rfc_enabled,
+            };
+            let outcome: serde_json::Value = if tool == "write_source" {
+                let source = req_str(&args, "source")?;
+                let o = crate::objects::write_object_maybe_create(
+                    &pool, obj_type, &name, &group, &source, &opts,
+                )
+                .await?;
+                serde_json::to_value(&o).unwrap_or_default()
+            } else {
+                let old_string = args
+                    .get("old_string")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let new_string = args
+                    .get("new_string")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                crate::objects::replace_object_maybe_create(
+                    &pool,
+                    obj_type,
+                    &name,
+                    &group,
+                    &old_string,
+                    &new_string,
+                    &opts,
+                )
+                .await?
+            };
+            Ok(outcome)
+        }
+        "delete_object" => {
+            use crate::objects::ObjectType;
+            let otype = req_str(&args, "type")?;
+            let name = req_str(&args, "name")?.to_uppercase();
+            let group_hint = args.get("group").and_then(|v| v.as_str()).map(String::from);
+            let transport = args
+                .get("transport")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let obj_type = ObjectType::parse(&otype).ok_or_else(|| RfcError {
+                code: -1,
+                status: 400,
+                message: format!(
+                    "type 必须是 prog/incl/class/intf/func/fugr/cds/package，收到: {otype}"
+                ),
+                key: "OBJECT_TYPE_INVALID".into(),
+            })?;
+            crate::server::validate_object_name(&name)?;
+            let group =
+                crate::server::resolve_group_if_needed(&pool, obj_type, &name, group_hint).await?;
+            let outcome =
+                crate::objects::delete_object(obj_type, &name, &group, transport.as_deref())
+                    .await?;
+            Ok(serde_json::to_value(outcome).unwrap_or_default())
+        }
+        "get_gateway_info" => {
+            // 与 GET /api/version 同源（version 模块内含懒加载缓存）
+            Ok(crate::version::gateway_info(&pool).await)
         }
         "where_used" => {
             let fname = req_str(&args, "name")?.to_uppercase();
@@ -432,20 +673,23 @@ async fn call_tool(pool: SharedPool, name: &str, args: Value) -> Result<Value, R
             let otype = req_str(&args, "type")?;
             let name = req_str(&args, "name")?.to_uppercase();
             let source = req_str(&args, "source")?;
-            let group_hint = args
-                .get("group")
-                .and_then(|v| v.as_str())
-                .map(String::from);
+            let group_hint = args.get("group").and_then(|v| v.as_str()).map(String::from);
             let obj_type = ObjectType::parse(&otype).ok_or_else(|| RfcError {
                 code: -1,
                 status: 400,
-                message: format!("type 必须是 prog/class/func，收到: {otype}"),
-                key: "OBJECT_TYPE_INVALID".into()
+                message: format!("type 必须是 prog/incl/class/intf/func/fugr/cds，收到: {otype}"),
+                key: "OBJECT_TYPE_INVALID".into(),
             })?;
             crate::server::validate_object_name(&name)?;
             let group =
                 crate::server::resolve_group_if_needed(&pool, obj_type, &name, group_hint).await?;
             let base = obj_type.base_rel(&name, &group);
+            // FM 语法检查同样按 SEDI 形态（与写入口径一致）
+            let source = if obj_type == ObjectType::Function {
+                crate::objects::normalize_function_source(&source)
+            } else {
+                source
+            };
             let issues = crate::objects::syntax_check(&base, &source).await?;
             Ok(json!({ "type": otype, "name": name, "count": issues.len(), "issues": issues }))
         }
@@ -478,10 +722,7 @@ mod tests {
     #[test]
     fn manifest_covers_core_workflow() {
         let tools = tools_manifest();
-        let names: Vec<&str> = tools
-            .iter()
-            .map(|t| t["name"].as_str().unwrap())
-            .collect();
+        let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         for expected in [
             "search_functions",
             "get_function_interface",
@@ -494,6 +735,7 @@ mod tests {
             "read_table",
             "list_dumps",
             "get_dump_detail",
+            "get_gateway_info",
             "syntax_check",
         ] {
             assert!(names.contains(&expected), "缺少工具 {expected}");

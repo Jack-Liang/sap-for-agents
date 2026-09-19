@@ -6,9 +6,9 @@
 //! 只存在于阻塞闭包内，不跨 await 点，保证 future 干净 Send。
 
 use crate::api::{
-    direction_name, rfctype_name, DdicTypeResponse, FieldDef, FieldSemanticsResponse, FixedValueDto,
-    FunctionDocResponse, FunctionInterface, FunctionParam, InvokeRequest, InvokeResponse, ParamDoc,
-    ScalarValue, SearchFunctionEntry, SearchResponse,
+    direction_name, rfctype_name, DdicTypeResponse, FieldDef, FieldSemanticsResponse,
+    FixedValueDto, FunctionDocResponse, FunctionInterface, FunctionParam, InvokeRequest,
+    InvokeResponse, ParamDoc, ScalarValue, SearchFunctionEntry, SearchResponse,
 };
 use crate::connection::{get_field_infos, RfcConnection};
 use crate::error::RfcError;
@@ -16,11 +16,7 @@ use crate::executor::execute_collect;
 use crate::pool::RfcConnectionPool;
 use axum::response::IntoResponse;
 use axum::{routing::post, Json, Router};
-use governor::{
-    clock::DefaultClock,
-    state::keyed::DefaultKeyedStateStore,
-    Quota, RateLimiter,
-};
+use governor::{clock::DefaultClock, state::keyed::DefaultKeyedStateStore, Quota, RateLimiter};
 use metrics::{counter, gauge, histogram};
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use std::net::IpAddr;
@@ -71,11 +67,20 @@ static RATE_LIMITER: OnceLock<Option<IpLimiter>> = OnceLock::new();
 /// 启动期设置限流：`rps=None` 或 0 → 不限流；≥1 → 按 IP 每秒 rps 个请求。
 pub fn init_rate_limiter(rps: Option<u32>) {
     // NonZeroU32::new(r) 对 r=0 返 None（= 不启用），不会 panic
-    let limiter = rps.and_then(|r| {
-        NonZeroU32::new(r).map(|n| RateLimiter::keyed(Quota::per_second(n)))
-    });
+    let limiter =
+        rps.and_then(|r| NonZeroU32::new(r).map(|n| RateLimiter::keyed(Quota::per_second(n))));
     let _ = RATE_LIMITER.set(limiter);
+    // 限流阈值本身也存一份（/api/version 能力自描述用；None = 不限流）
+    let _ = RATE_LIMIT_RPS.set(rps);
 }
+
+/// 已配置的限流阈值（未初始化 = None = 不限流）。供 /api/version 自描述。
+pub(crate) fn rate_limit_rps() -> Option<u32> {
+    RATE_LIMIT_RPS.get().copied().flatten()
+}
+
+/// 限流阈值（启动期由 [`init_rate_limiter`] 一并写入）。
+static RATE_LIMIT_RPS: OnceLock<Option<u32>> = OnceLock::new();
 
 /// 只读模式（`SAP_READ_ONLY=1`，启动期由 [`init_read_only`] 写入；默认关闭）。
 ///
@@ -93,18 +98,25 @@ fn read_only_enabled() -> bool {
     *READ_ONLY.get().unwrap_or(&false)
 }
 
+/// 只读模式是否启用。pub(crate) 供 /api/version 能力自描述。
+pub(crate) fn read_only_active() -> bool {
+    read_only_enabled()
+}
+
 /// 只读模式下该请求是否应被拦截（纯函数，便于单测）。
 fn is_read_only_blocked(method: &axum::http::Method, path: &str) -> bool {
     if path.starts_with("/api/adt/") {
         return crate::adt::is_write_method(method);
     }
     if path.starts_with("/api/objects/") {
-        if *method == axum::http::Method::PUT {
-            return true; // 全量写 source
+        if *method == axum::http::Method::PUT || *method == axum::http::Method::DELETE {
+            return true; // 全量写 source / 删除对象
         }
-        // POST 分发 replace / syntax：replace 落库要拦；syntax 只检查不落库，放行
+        // POST 分发 replace/syntax/create：replace 与 create 落库要拦；
+        // syntax 只检查不落库，放行
         if *method == axum::http::Method::POST {
-            return path.rsplit('/').next() == Some("replace");
+            let last = path.rsplit('/').next();
+            return last == Some("replace") || last == Some("create");
         }
     }
     false
@@ -168,7 +180,10 @@ where
         Err(_elapsed) => {
             // 超时：spawn_blocking 任务无法取消（NWRFC 固有限制），它会在 SAP 真正响应后
             // 自行结束并归还连接。这里只负责及时返回 504；记告警以便运维监控慢调用堆积。
-            tracing::warn!(?timeout, "SAP 调用超时，阻塞任务将在 SAP 响应后自行归还连接");
+            tracing::warn!(
+                ?timeout,
+                "SAP 调用超时，阻塞任务将在 SAP 响应后自行归还连接"
+            );
             Err(timeout_error(timeout))
         }
     }
@@ -216,18 +231,33 @@ pub fn app(pool: SharedPool) -> Router {
             "/api/functions/*name",
             axum::routing::get(function_route_dispatcher).post(function_invoke_handler),
         )
-        .route("/api/programs/:name/source", axum::routing::get(program_source_handler))
+        .route(
+            "/api/programs/:name/source",
+            axum::routing::get(program_source_handler),
+        )
         .route("/api/table/read", post(table_read_handler))
-        .route("/api/ddic/type/:name", axum::routing::get(ddic_type_handler))
-        .route("/api/ddic/field/:table/:field", axum::routing::get(ddic_field_handler))
+        .route(
+            "/api/ddic/type/:name",
+            axum::routing::get(ddic_type_handler),
+        )
+        .route(
+            "/api/ddic/field/:table/:field",
+            axum::routing::get(ddic_field_handler),
+        )
         // ABAP 短转储结构化读取（解析自 ADT，免拉 45KB–1MB 原始文本）
         .route("/api/dumps", axum::routing::get(dumps_list_handler))
-        .route("/api/dumps/grouped", axum::routing::get(dumps_grouped_handler))
+        .route(
+            "/api/dumps/grouped",
+            axum::routing::get(dumps_grouped_handler),
+        )
         .route("/api/dumps/*key", axum::routing::get(dump_detail_handler))
         // ABAP 对象写入编排（锁→写→解锁→激活一体；replace/syntax 见 dispatcher）
         .route(
             "/api/objects/*path",
-            axum::routing::put(object_write_handler).post(object_post_handler),
+            axum::routing::put(object_write_handler)
+                .post(object_post_handler)
+                .get(object_get_handler)
+                .delete(object_delete_handler),
         )
         // ADT REST 通用代理（dump 正文、类/程序源码等，任何方法透传）
         .route("/api/adt/*path", axum::routing::any(crate::adt::adt_proxy))
@@ -238,6 +268,12 @@ pub fn app(pool: SharedPool) -> Router {
     // 探针与公开页免鉴权：编排系统探针不便带 token，且无业务数据泄露
     static_app()
         .route("/ready", axum::routing::get(ready_handler))
+        // /api/version 同样公开：Agent 拿不到 token 前也需要知道"要不要 token"
+        // （capabilities.auth）。挂在公开侧使其不受 require_api_key 拦截。
+        .route(
+            "/api/version",
+            axum::routing::get(version_handler),
+        )
         .route("/metrics", axum::routing::get(metrics_handler))
         .merge(api)
         .fallback(fallback_handler)
@@ -257,18 +293,20 @@ async fn docs_handler() -> impl axum::response::IntoResponse {
 async fn fallback_handler() -> (axum::http::StatusCode, Json<serde_json::Value>) {
     (
         axum::http::StatusCode::NOT_FOUND,
-        Json(serde_json::json!({"error":{"code":404,"message":"Not found","key":"ROUTE_NOT_FOUND"}})),
+        Json(
+            serde_json::json!({"error":{"code":404,"message":"Not found","key":"ROUTE_NOT_FOUND"}}),
+        ),
     )
 }
 
 /// `GET /metrics` —— Prometheus 指标（连接池 + RFC 调用计数/耗时）。免鉴权（运维探针）。
 async fn metrics_handler() -> impl axum::response::IntoResponse {
-    let body = METRICS_HANDLE
-        .get()
-        .map(|h| h.render())
-        .unwrap_or_default();
+    let body = METRICS_HANDLE.get().map(|h| h.render()).unwrap_or_default();
     (
-        [(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
         body,
     )
 }
@@ -337,10 +375,18 @@ pub async fn run(
     };
     tracing::info!("✅ 服务就绪！");
     tracing::info!("   👉 浏览器打开:         http://{}", display_host);
-    tracing::info!("   👉 给 AI/Agent 的文档: http://{}/agents.md", display_host);
-    tracing::info!("   👉 OpenAPI 规范:       http://{}/openapi.json", display_host);
+    tracing::info!(
+        "   👉 给 AI/Agent 的文档: http://{}/agents.md",
+        display_host
+    );
+    tracing::info!(
+        "   👉 OpenAPI 规范:       http://{}/openapi.json",
+        display_host
+    );
     tracing::info!("   👉 交互式文档:         http://{}/docs", display_host);
-    tracing::info!("   端点速览: POST /api/rfc | GET /api/functions/:name | POST /api/functions/search");
+    tracing::info!(
+        "   端点速览: POST /api/rfc | GET /api/functions/:name | POST /api/functions/search"
+    );
     tracing::info!("           GET /api/functions/:name/doc | GET /api/ddic/type/:name | GET /api/ddic/field/:t/:f");
     axum::serve(
         listener,
@@ -352,7 +398,24 @@ pub async fn run(
 
 /// GET /health —— 不触碰 SAP，便于外部探活（liveness）
 async fn health_handler() -> Json<serde_json::Value> {
-    Json(serde_json::json!({ "status": "ok" }))
+    Json(serde_json::json!({
+        "status": "ok",
+        // 附带网关版本（additive）：轮询探活的系统免费拿到版本，
+        // 无需再打一次 /api/version
+        "version": env!("CARGO_PKG_VERSION"),
+    }))
+}
+
+/// `GET /api/version` —— 版本与能力自描述（公开、免鉴权）。
+///
+/// 网关自身信息（版本/commit/能力开关）全部本地读取、秒回；SAP 系统信息
+/// 首次请求懒加载一次并永久缓存（生命周期内不变），取不到时 `sap` 为
+/// `null` + `sap_error` 带原因，端点仍 200——SAP 宕机时恰恰最需要这份自描述。
+/// 详见 `version` 模块。
+async fn version_handler(
+    axum::extract::State(pool): axum::extract::State<SharedPool>,
+) -> Json<serde_json::Value> {
+    Json(crate::version::gateway_info(&pool).await)
 }
 
 /// `GET /ready` —— readiness 探针：借连接池调 `RFC_PING` 验证 SAP 可达（带 5s 超时）。
@@ -365,14 +428,10 @@ async fn health_handler() -> Json<serde_json::Value> {
 /// 最坏占用一个连接几秒，探针频率（默认 10s）下可接受。
 async fn ready_handler(
     axum::extract::State(pool): axum::extract::State<SharedPool>,
-) -> (
-    axum::http::StatusCode,
-    Json<serde_json::Value>,
-) {
+) -> (axum::http::StatusCode, Json<serde_json::Value>) {
     const READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-    let ping =
-        tokio::time::timeout(READY_TIMEOUT, run_blocking(pool, |conn| conn.ping())).await;
+    let ping = tokio::time::timeout(READY_TIMEOUT, run_blocking(pool, |conn| conn.ping())).await;
 
     match ping {
         Ok(Ok(())) => (
@@ -401,7 +460,10 @@ async fn ready_handler(
 /// 编译期 include_str! 嵌入，预编译包也自带，不依赖磁盘文件。
 async fn agents_handler() -> axum::response::Response {
     (
-        [(axum::http::header::CONTENT_TYPE, "text/markdown; charset=utf-8")],
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/markdown; charset=utf-8",
+        )],
         include_str!("../AGENTS.md"),
     )
         .into_response()
@@ -442,7 +504,10 @@ async fn index_handler(req: axum::http::Request<axum::body::Body>) -> axum::resp
             .headers()
             .get(axum::http::header::ACCEPT_LANGUAGE)
             .and_then(|h| h.to_str().ok())
-            .map(|al| al.split(',').any(|r| r.trim().to_lowercase().starts_with("zh")))
+            .map(|al| {
+                al.split(',')
+                    .any(|r| r.trim().to_lowercase().starts_with("zh"))
+            })
             .unwrap_or(false),
     };
     let template = if prefer_zh {
@@ -497,7 +562,13 @@ fn summarize_params(req: &InvokeRequest) -> String {
 /// 脱敏 + 截断单个标量值（用于审计摘要）。敏感 key（密码/token 等）→ `***`，长值截断 80 字符。
 fn mask_value(key: &str, value: &ScalarValue) -> String {
     const SENSITIVE: &[&str] = &[
-        "PASSWD", "PASSWORD", "PASS", "SECRET", "TOKEN", "CREDENTIAL", "KEY",
+        "PASSWD",
+        "PASSWORD",
+        "PASS",
+        "SECRET",
+        "TOKEN",
+        "CREDENTIAL",
+        "KEY",
     ];
     let upper = key.to_uppercase();
     if SENSITIVE.iter().any(|s| upper.contains(s)) {
@@ -604,7 +675,8 @@ async fn run_invoke_and_log(
     match result {
         Ok(resp) => {
             counter!("rfc_calls_total", "func" => func_name.clone(), "result" => "ok").increment(1);
-            histogram!("rfc_call_duration_ms", "func" => func_name.clone()).record(elapsed_ms as f64);
+            histogram!("rfc_call_duration_ms", "func" => func_name.clone())
+                .record(elapsed_ms as f64);
             tracing::info!(
                 func = %func_name,
                 caller_ip = %caller_ip,
@@ -615,8 +687,10 @@ async fn run_invoke_and_log(
             Ok(Json(resp))
         }
         Err(e) => {
-            counter!("rfc_calls_total", "func" => func_name.clone(), "result" => "err").increment(1);
-            histogram!("rfc_call_duration_ms", "func" => func_name.clone()).record(elapsed_ms as f64);
+            counter!("rfc_calls_total", "func" => func_name.clone(), "result" => "err")
+                .increment(1);
+            histogram!("rfc_call_duration_ms", "func" => func_name.clone())
+                .record(elapsed_ms as f64);
             tracing::warn!(
                 func = %func_name,
                 caller_ip = %caller_ip,
@@ -668,7 +742,9 @@ async fn openapi_dynamic_handler(
         return Err(RfcError {
             code: -1,
             status: 400,
-            message: "functions 不能为空（逗号分隔的函数名列表，如 STFC_CONNECTION,BAPI_USER_GETLIST）".into(),
+            message:
+                "functions 不能为空（逗号分隔的函数名列表，如 STFC_CONNECTION,BAPI_USER_GETLIST）"
+                    .into(),
             key: "SPEC_FUNCTIONS_EMPTY".into(),
         });
     }
@@ -689,22 +765,21 @@ async fn openapi_dynamic_handler(
     }
 
     // (函数名, Ok<(path, operation)> | Err(错误消息))：单函数失败不拖垮整个规范
-    let results: Vec<(String, (String, serde_json::Value))> =
-        run_blocking(pool, move |conn| {
-            let ops: Vec<(String, (String, serde_json::Value))> = names
-                .iter()
-                .map(|n| {
-                    let r = collect_function_params(conn, n);
-                    let op = match r {
-                        Ok(params) => crate::openapi::function_operation(n, &params),
-                        Err(e) => crate::openapi::function_operation_failed(n, &e.message),
-                    };
-                    (n.clone(), op)
-                })
-                .collect();
-            Ok(ops)
-        })
-        .await?;
+    let results: Vec<(String, (String, serde_json::Value))> = run_blocking(pool, move |conn| {
+        let ops: Vec<(String, (String, serde_json::Value))> = names
+            .iter()
+            .map(|n| {
+                let r = collect_function_params(conn, n);
+                let op = match r {
+                    Ok(params) => crate::openapi::function_operation(n, &params),
+                    Err(e) => crate::openapi::function_operation_failed(n, &e.message),
+                };
+                (n.clone(), op)
+            })
+            .collect();
+        Ok(ops)
+    })
+    .await?;
 
     let mut spec = crate::openapi::build_spec(&format!("http://{host}"), crate::auth::is_enabled());
     if let Some(paths) = spec["paths"].as_object_mut() {
@@ -727,11 +802,8 @@ fn default_lang() -> String {
 }
 
 /// 把 ParamInfo 转成 FieldDef，STRUCTURE/TABLE 类型递归展开子字段（深度上限由 get_field_infos 的句柄链决定）。
-fn param_info_to_field_def(
-    p: &crate::connection::ParamInfo,
-) -> Result<FieldDef, RfcError> {
-    let fields = if p.type_ == crate::ffi::RFCTYPE_TABLE
-        || p.type_ == crate::ffi::RFCTYPE_STRUCTURE
+fn param_info_to_field_def(p: &crate::connection::ParamInfo) -> Result<FieldDef, RfcError> {
+    let fields = if p.type_ == crate::ffi::RFCTYPE_TABLE || p.type_ == crate::ffi::RFCTYPE_STRUCTURE
     {
         if let Some(handle) = p.type_desc_handle {
             // SAFETY: handle 来自刚拉取的有效元数据，连接仍有效
@@ -830,8 +902,7 @@ async fn function_interface_handler(
 ) -> Result<Json<FunctionInterface>, RfcError> {
     crate::api::validate_func_name(&name)?;
     let req_name = name.clone();
-    let result = run_blocking(pool, move |conn| collect_function_params(conn, &name))
-        .await?;
+    let result = run_blocking(pool, move |conn| collect_function_params(conn, &name)).await?;
     Ok(Json(FunctionInterface {
         name: req_name,
         params: result,
@@ -923,8 +994,10 @@ async fn ddic_type_handler(
     axum::extract::Path(name): axum::extract::Path<String>,
 ) -> Result<Json<DdicTypeResponse>, RfcError> {
     let req_name = name.clone();
-    let result =
-        run_blocking(pool, move |conn| crate::metadata::get_type_fields(conn, &name)).await?;
+    let result = run_blocking(pool, move |conn| {
+        crate::metadata::get_type_fields(conn, &name)
+    })
+    .await?;
     let fields = result.iter().map(FieldDef::from_type_field).collect();
     Ok(Json(DdicTypeResponse {
         name: req_name,
@@ -1268,8 +1341,10 @@ async fn dump_detail_handler(
 
 /// 解析 `/api/objects/{type}/{name...}/{action}` 通配路径。
 /// name 可含 `/`（命名空间对象，如 `/UI5/CL_X`）；action 取最后一段。
-fn split_object_path(
+/// `action_optional` 为 true 时（DELETE 语义）允许无 action 段：全部视为对象名。
+fn split_object_path_opts(
     path: &str,
+    action_optional: bool,
 ) -> Result<(crate::objects::ObjectType, String, &'static str), RfcError> {
     let bad = |msg: &str| RfcError {
         code: -1,
@@ -1279,28 +1354,46 @@ fn split_object_path(
     };
     let (type_seg, rest) = path.split_once('/').ok_or_else(|| bad("缺少类型段"))?;
     let obj_type = crate::objects::ObjectType::parse(type_seg)
-        .ok_or_else(|| bad("类型须为 prog/class/func"))?;
-    let (name, action) = rest.rsplit_once('/').ok_or_else(|| bad("缺少动作段"))?;
-    let action = match action {
-        "source" => "source",
-        "replace" => "replace",
-        "syntax" => "syntax",
-        _ => return Err(bad("动作须为 source/replace/syntax")),
+        .ok_or_else(|| bad("类型须为 prog/incl/class/intf/func/fugr/cds/package"))?;
+    // action_optional（DELETE 语义）：整个 rest 都是对象名；误带的 action 尾段剥掉
+    let (name, action) = if action_optional {
+        let name = match rest.rsplit_once('/') {
+            Some((n, "source" | "replace" | "syntax" | "create" | "delete")) => n,
+            _ => rest,
+        };
+        (name, "")
+    } else {
+        let (n, a) = rest.rsplit_once('/').ok_or_else(|| bad("缺少动作段"))?;
+        let act = match a {
+            "source" => "source",
+            "replace" => "replace",
+            "syntax" => "syntax",
+            "create" => "create",
+            _ => return Err(bad("动作须为 source/replace/syntax/create")),
+        };
+        (n, act)
     };
-    if name.is_empty() || name.len() > 60 || name.split('/').any(|s| s.is_empty() && s != name) {
-        // 允许整体以 / 开头（命名空间），但不允许内部空段（/UI5//X）
-        let has_empty_inner = name
-            .strip_prefix('/')
-            .map(|r| r.split('/').any(|s| s.is_empty()))
-            .unwrap_or_else(|| name.split('/').any(|s| s.is_empty()));
-        if name.is_empty() || name.len() > 60 || has_empty_inner {
-            return Err(bad("对象名为空/超长/含空段"));
-        }
+    if name.is_empty() || name.len() > 60 {
+        return Err(bad("对象名为空/超长"));
+    }
+    // 允许整体以 / 开头（命名空间），但不允许内部空段（/UI5//X）
+    let has_empty_inner = name
+        .strip_prefix('/')
+        .map(|r| r.split('/').any(|s| s.is_empty()))
+        .unwrap_or_else(|| name.split('/').any(|s| s.is_empty()));
+    if name.is_empty() || has_empty_inner {
+        return Err(bad("对象名含空段"));
     }
     if name.chars().any(|c| c.is_control()) || name.contains("..") {
         return Err(bad("对象名含控制字符或 .."));
     }
     Ok((obj_type, name.to_string(), action))
+}
+/// 解析带动作段的路径（GET/PUT/POST 共用）。
+fn split_object_path(
+    path: &str,
+) -> Result<(crate::objects::ObjectType, String, &'static str), RfcError> {
+    split_object_path_opts(path, false)
 }
 
 /// 对象名宽松校验（类/程序名长于 FM 名上限，不走 validate_func_name）。
@@ -1351,6 +1444,19 @@ struct ObjectWriteBody {
     /// 函数对象的组名（可选，缺省自动反解）
     #[serde(default)]
     group: Option<String>,
+    /// 对象不存在时自动创建壳再写（默认 false）。丝滑写入的推荐方式：
+    /// 新对象首次写入带上 create:true + description。
+    #[serde(default)]
+    create: Option<bool>,
+    /// 自动创建时的对象描述（title；create:true 时必填）
+    #[serde(default)]
+    description: Option<String>,
+    /// 自动创建时的开发包（默认 $TMP；package 类型时为父包）
+    #[serde(default)]
+    devclass: Option<String>,
+    /// 函数模块写后设为 remote-enabled（processingType=rfc；仅 func）
+    #[serde(default)]
+    rfc_enabled: Option<bool>,
 }
 
 fn default_true() -> bool {
@@ -1390,16 +1496,103 @@ async fn object_write_handler(
         });
     }
     let group = resolve_group_if_needed(&pool, obj_type, &name, body.group.clone()).await?;
-    let outcome = crate::objects::write_object_source(
+    let rfc = body.rfc_enabled.unwrap_or(false);
+    let outcome = match crate::objects::write_object_source(
         obj_type,
         &name,
         &group,
         &body.source,
         body.transport.as_deref(),
         body.activate,
+        rfc,
     )
-    .await?;
+    .await
+    {
+        Ok(o) => o,
+        Err(e) if body.create.unwrap_or(false) && crate::objects::is_object_not_exist(&e) => {
+            // 对象不存在且允许创建：建壳后重试一次写入
+            let spec = crate::objects::CreateSpec {
+                description: body.description.clone().unwrap_or_default(),
+                devclass: body.devclass.clone().unwrap_or_default(),
+                transport: body.transport.clone(),
+                software_component: None,
+            };
+            crate::objects::create_object(&pool, obj_type, &name, &group, &spec).await?;
+            crate::objects::write_object_source(
+                obj_type,
+                &name,
+                &group,
+                &body.source,
+                body.transport.as_deref(),
+                body.activate,
+                rfc,
+            )
+            .await?
+        }
+        Err(e) => return Err(e),
+    };
     Ok(Json(serde_json::to_value(outcome).unwrap_or_default()))
+}
+
+/// GET /api/objects/{type}/{name}/source —— 读对象源码（ADT 通道，原文大小写）。
+/// 新类型（intf/incl/cds/fugr）的读取入口；prog/func 也可用（等价既有端点）。
+async fn object_get_handler(
+    axum::extract::State(pool): axum::extract::State<SharedPool>,
+    axum::extract::Path(path): axum::extract::Path<String>,
+) -> Result<Json<serde_json::Value>, RfcError> {
+    let (obj_type, name, action) = split_object_path(&path)?;
+    if action != "source" {
+        return Err(RfcError {
+            code: -1,
+            status: 400,
+            message: "GET 仅支持 /source".into(),
+            key: "METHOD_ACTION_MISMATCH".into(),
+        });
+    }
+    validate_object_name(&name)?;
+    if !obj_type.has_source() {
+        return Err(RfcError {
+            code: -1,
+            status: 400,
+            message: "该对象类型无源码资源（package 只有元数据）".into(),
+            key: "NO_SOURCE_RESOURCE".into(),
+        });
+    }
+    let group = resolve_group_if_needed(&pool, obj_type, &name, None).await?;
+    let source = crate::objects::read_current_source(obj_type, &name, &group).await?;
+    Ok(Json(serde_json::json!({
+        "type": obj_type.api_name(),
+        "name": name.trim().to_uppercase(),
+        "group": (obj_type.needs_group() && !group.is_empty()).then(|| group.to_uppercase()),
+        "count": source.split('\n').count(),
+        "lines": source.split('\n').map(str::to_string).collect::<Vec<_>>(),
+        "source": source,
+        "source_via": "adt",
+    })))
+}
+
+/// DELETE /api/objects/{type}/{name}[?group=&transport=] —— 删除对象。
+/// 锁 → DELETE → 弃会话（删除消耗锁柄）；函数组删除连带其函数模块。
+async fn object_delete_handler(
+    axum::extract::State(pool): axum::extract::State<SharedPool>,
+    axum::extract::Path(path): axum::extract::Path<String>,
+    axum::extract::Query(q): axum::extract::Query<ObjectDeleteQuery>,
+) -> Result<Json<serde_json::Value>, RfcError> {
+    let (obj_type, name, _action) = split_object_path_opts(&path, true)?;
+    validate_object_name(&name)?;
+    let group = resolve_group_if_needed(&pool, obj_type, &name, q.group).await?;
+    let outcome =
+        crate::objects::delete_object(obj_type, &name, &group, q.transport.as_deref()).await?;
+    Ok(Json(serde_json::to_value(outcome).unwrap_or_default()))
+}
+
+/// DELETE /api/objects/** 的查询参数。
+#[derive(serde::Deserialize)]
+struct ObjectDeleteQuery {
+    #[serde(default)]
+    group: Option<String>,
+    #[serde(default)]
+    transport: Option<String>,
 }
 
 /// POST /api/objects/{type}/{name}/replace 与 /syntax 的分发。
@@ -1431,7 +1624,23 @@ async fn object_post_handler(
                 message: format!("请求体字段非法（old_string/new_string 必填）: {}", e),
                 key: "JSON_INVALID".into(),
             })?;
-            let current = crate::objects::read_current_source(obj_type, &name, &group).await?;
+            let current = match crate::objects::read_current_source(obj_type, &name, &group).await {
+                Ok(c) => c,
+                Err(e)
+                    if body.create.unwrap_or(false) && crate::objects::is_object_not_exist(&e) =>
+                {
+                    // 对象不存在且允许创建：建壳，从空源码开始（new_string 即初始内容）
+                    let spec = crate::objects::CreateSpec {
+                        description: body.description.clone().unwrap_or_default(),
+                        devclass: body.devclass.clone().unwrap_or_default(),
+                        transport: body.transport.clone(),
+                        software_component: None,
+                    };
+                    crate::objects::create_object(&pool, obj_type, &name, &group, &spec).await?;
+                    String::new()
+                }
+                Err(e) => return Err(e),
+            };
             let updated =
                 crate::objects::find_and_replace(&current, &body.old_string, &body.new_string)
                     .map_err(|m| RfcError {
@@ -1455,6 +1664,7 @@ async fn object_post_handler(
                 &updated,
                 body.transport.as_deref(),
                 body.activate,
+                body.rfc_enabled.unwrap_or(false),
             )
             .await?;
             let mut v = serde_json::to_value(&outcome).unwrap_or_default();
@@ -1462,6 +1672,63 @@ async fn object_post_handler(
             Ok(Json(v))
         }
         // ⑭ 语法检查（不写库：源码内嵌提交）
+        "create" => {
+            // ⓯ 创建对象壳（ADT-first，prog/func 带 RFC 回退），可选顺带首版源码写入+激活
+            let description = raw
+                .get("description")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let devclass = raw
+                .get("devclass")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let transport = raw
+                .get("transport")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let software_component = raw
+                .get("software_component")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let activate = raw
+                .get("activate")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+            let spec = crate::objects::CreateSpec {
+                description,
+                devclass,
+                transport: transport.clone(),
+                software_component,
+            };
+            crate::objects::create_object(&pool, obj_type, &name, &group, &spec).await?;
+            // 可选首版源码：有则直接走写入编排（一步到位）
+            let first_source = raw.get("source").and_then(|v| v.as_str());
+            let rfc = raw
+                .get("rfc_enabled")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let mut v = serde_json::json!({
+                "created": true,
+                "type": obj_type.api_name(),
+                "name": name.trim().to_uppercase(),
+            });
+            if let Some(src) = first_source.filter(|s| !s.trim().is_empty()) {
+                let outcome = crate::objects::write_object_source(
+                    obj_type,
+                    &name,
+                    &group,
+                    src,
+                    transport.as_deref(),
+                    activate,
+                    rfc,
+                )
+                .await?;
+                v["write"] = serde_json::to_value(outcome).unwrap_or_default();
+            }
+            Ok(Json(v))
+        }
         "syntax" => {
             let source = raw
                 .get("source")
@@ -1472,6 +1739,22 @@ async fn object_post_handler(
                     message: "source 必填（要检查的源码全文）".into(),
                     key: "SOURCE_MISSING".into(),
                 })?;
+            if !obj_type.has_source() {
+                return Err(RfcError {
+                    code: -1,
+                    status: 400,
+                    message: "该对象类型无源码资源（package 只有元数据）".into(),
+                    key: "NO_SOURCE_RESOURCE".into(),
+                });
+            }
+            // FM 语法检查同样要求 SEDI 形态（规范化与写入同口径）
+            let normalized: String;
+            let source = if obj_type == crate::objects::ObjectType::Function {
+                normalized = crate::objects::normalize_function_source(source);
+                normalized.as_str()
+            } else {
+                source
+            };
             let base = obj_type.base_rel(&name, &group);
             let issues = crate::objects::syntax_check(&base, source).await?;
             Ok(Json(serde_json::json!({
@@ -1484,7 +1767,7 @@ async fn object_post_handler(
         _ => Err(RfcError {
             code: -1,
             status: 400,
-            message: "POST 仅支持 /replace 与 /syntax；全量写用 PUT /source".into(),
+            message: "POST 仅支持 /replace、/syntax 与 /create；全量写用 PUT /source".into(),
             key: "METHOD_ACTION_MISMATCH".into(),
         }),
     }
@@ -1500,6 +1783,16 @@ struct ObjectReplaceBody {
     transport: Option<String>,
     #[serde(default = "default_true")]
     activate: bool,
+    /// 对象不存在时自动创建（空对象 + new_string 作为初始内容）
+    #[serde(default)]
+    create: Option<bool>,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    devclass: Option<String>,
+    /// 函数模块写后设为 remote-enabled（仅 func）
+    #[serde(default)]
+    rfc_enabled: Option<bool>,
 }
 
 /// ⑤ GET /api/functions/:name/doc —— 查函数文档（短文本 + SE37 长文本 + 参数说明）
@@ -1548,11 +1841,7 @@ mod tests {
     fn timeout_error_is_504() {
         let e = timeout_error(Duration::from_secs(60));
         assert_eq!(e.status, 504, "超时错误应为 504");
-        assert!(
-            e.message.contains("60"),
-            "消息应含超时秒数: {}",
-            e.message
-        );
+        assert!(e.message.contains("60"), "消息应含超时秒数: {}", e.message);
     }
 
     #[test]
@@ -1563,25 +1852,88 @@ mod tests {
         assert_eq!(mask_value("API_KEY", &secret), "***");
         assert_eq!(mask_value("TOKEN", &secret), "***");
         // 非敏感 key 保留值
-        assert_eq!(mask_value("REQUTEXT", &ScalarValue::Chars("hi".into())), "hi");
+        assert_eq!(
+            mask_value("REQUTEXT", &ScalarValue::Chars("hi".into())),
+            "hi"
+        );
         assert_eq!(mask_value("MAX_ROWS", &ScalarValue::Int(100)), "100");
     }
 
     #[test]
     fn read_only_blocks_gateway_writes_only() {
         use axum::http::Method;
-        // 拦：objects 全量写 + replace + ADT 写方法
-        assert!(is_read_only_blocked(&Method::PUT, "/api/objects/prog/Z/report/source"));
-        assert!(is_read_only_blocked(&Method::POST, "/api/objects/prog/Z/replace"));
-        assert!(is_read_only_blocked(&Method::POST, "/api/adt/oo/classes/zcl_foo/source/main"));
-        assert!(is_read_only_blocked(&Method::DELETE, "/api/adt/oo/classes/zcl_foo"));
-        // 放行：syntax（不落库）、objects 读、ADT 读、rfc、其他端点
-        assert!(!is_read_only_blocked(&Method::POST, "/api/objects/prog/Z/syntax"));
-        assert!(!is_read_only_blocked(&Method::GET, "/api/objects/prog/Z/source"));
-        assert!(!is_read_only_blocked(&Method::GET, "/api/adt/runtime/dumps"));
+        // 拦：objects 全量写 + replace + create + DELETE + ADT 写方法
+        assert!(is_read_only_blocked(
+            &Method::PUT,
+            "/api/objects/prog/Z/report/source"
+        ));
+        assert!(is_read_only_blocked(
+            &Method::POST,
+            "/api/objects/prog/Z/replace"
+        ));
+        assert!(is_read_only_blocked(
+            &Method::POST,
+            "/api/objects/prog/Z/create"
+        ));
+        assert!(is_read_only_blocked(&Method::DELETE, "/api/objects/prog/Z"));
+        assert!(is_read_only_blocked(
+            &Method::DELETE,
+            "/api/objects/func/Z_FM?group=ZG"
+        ));
+        assert!(is_read_only_blocked(
+            &Method::POST,
+            "/api/adt/oo/classes/zcl_foo/source/main"
+        ));
+        assert!(is_read_only_blocked(
+            &Method::DELETE,
+            "/api/adt/oo/classes/zcl_foo"
+        ));
+        // 放行：syntax（不落库）、objects 读（GET source）、ADT 读、rfc、其他端点
+        assert!(!is_read_only_blocked(
+            &Method::POST,
+            "/api/objects/prog/Z/syntax"
+        ));
+        assert!(!is_read_only_blocked(
+            &Method::GET,
+            "/api/objects/prog/Z/source"
+        ));
+        assert!(!is_read_only_blocked(
+            &Method::GET,
+            "/api/adt/runtime/dumps"
+        ));
         assert!(!is_read_only_blocked(&Method::POST, "/api/rfc"));
-        assert!(!is_read_only_blocked(&Method::POST, "/api/functions/search"));
+        assert!(!is_read_only_blocked(
+            &Method::POST,
+            "/api/functions/search"
+        ));
         assert!(!is_read_only_blocked(&Method::POST, "/api/table/read"));
+    }
+
+    #[test]
+    fn object_path_parses_delete_and_actions() {
+        // 常规动作段
+        let (t, n, a) = split_object_path("prog/ZREPORT/source").unwrap();
+        assert_eq!(t, crate::objects::ObjectType::Program);
+        assert_eq!(n, "ZREPORT");
+        assert_eq!(a, "source");
+        // DELETE 语义：无动作段，全部视作对象名
+        let (t, n, a) = split_object_path_opts("class/ZCL_FOO", true).unwrap();
+        assert_eq!(t, crate::objects::ObjectType::Class);
+        assert_eq!(n, "ZCL_FOO");
+        assert_eq!(a, "");
+        // DELETE 误带动作尾段：剥掉
+        let (_, n, _) = split_object_path_opts("class/ZCL_FOO/source", true).unwrap();
+        assert_eq!(n, "ZCL_FOO");
+        // 命名空间对象名（原始斜杠形态）
+        let (_, n, _) = split_object_path_opts("class//UI5/CL_X", true).unwrap();
+        assert_eq!(n, "/UI5/CL_X");
+        // 新类型别名
+        let (t, _, _) = split_object_path_opts("cds/ZCDS_V/source", false).unwrap();
+        assert_eq!(t, crate::objects::ObjectType::CdsView);
+        let (t, _, _) = split_object_path_opts("package/ZPKG", true).unwrap();
+        assert_eq!(t, crate::objects::ObjectType::Package);
+        // 非法类型
+        assert!(split_object_path("table/ZT/source").is_err());
     }
 
     #[test]
@@ -1635,6 +1987,9 @@ mod tests {
         assert_eq!(resp.status(), axum::http::StatusCode::OK);
         let body = body_string(resp.into_body()).await;
         assert!(body.contains("\"status\":\"ok\""));
+        // 版本随 liveness 免费带出（additive 字段）
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["version"], env!("CARGO_PKG_VERSION"));
     }
 
     #[tokio::test]
@@ -1682,7 +2037,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), axum::http::StatusCode::OK);
-        let ct = resp.headers().get(axum::http::header::CONTENT_TYPE).unwrap();
+        let ct = resp
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .unwrap();
         assert!(ct.to_str().unwrap().contains("text/markdown"));
         let body = body_string(resp.into_body()).await;
         assert!(!body.is_empty());

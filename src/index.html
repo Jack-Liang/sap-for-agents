@@ -173,7 +173,7 @@ tailwind.config = {
         <h1 class="font-display-lg text-display-lg text-on-surface mb-sm">sap-for-agents</h1>
         <p class="font-headline-md text-headline-md text-primary mb-md">SAP NWRFC → REST Gateway</p>
         <p class="font-body-lg text-body-lg text-on-surface-variant max-w-2xl">
-            One endpoint invokes any BAPI; 14 metadata endpoints (incl. ST22 dumps & code editing) let AI explore autonomously
+            One endpoint invokes any BAPI; 15 metadata endpoints (incl. self-description, ST22 dumps & code editing) let AI explore autonomously
         </p>
     </section>
 
@@ -234,6 +234,11 @@ tailwind.config = {
                 AI-facing Metadata API
             </h3>
             <ul class="space-y-sm">
+                <li class="flex items-center gap-md py-sm border-b border-outline-variant/30 last:border-0">
+                    <span class="font-code-sm text-code-sm px-sm py-xs rounded method-get w-16 text-center">GET</span>
+                    <code class="font-code-sm text-code-sm text-on-surface flex-grow">/api/version</code>
+                    <span class="font-body-sm text-body-sm text-on-surface-variant whitespace-nowrap">Self-description (capabilities + SAP release)</span>
+                </li>
                 <li class="flex items-center gap-md py-sm border-b border-outline-variant/30 last:border-0">
                     <span class="font-code-sm text-code-sm px-sm py-xs rounded method-get w-16 text-center">GET</span>
                     <code class="font-code-sm text-code-sm text-on-surface flex-grow">/api/functions/{name}</code>

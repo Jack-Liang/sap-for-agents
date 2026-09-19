@@ -18,6 +18,7 @@ mod server;
 mod server_config;
 mod server_rfc;
 mod string_utils;
+mod version;
 
 use crate::pool::RfcConnectionPool;
 use std::sync::Arc;
@@ -97,6 +98,16 @@ async fn run_client() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("   （详见 README §Quick Start）");
         std::process::exit(255);
     }
+
+    // 版本自描述（/api/version）：客户端号来自本地配置，零 RFC 成本
+    // （须在 conn_params move 进连接池之前取出）
+    let sap_client = cfg
+        .conn_params
+        .iter()
+        .find(|(k, _)| *k == "CLIENT")
+        .map(|(_, v)| v.clone())
+        .unwrap_or_default();
+    version::init_sap_client(sap_client);
 
     let pool = RfcConnectionPool::with_max_size(
         cfg.conn_params,
