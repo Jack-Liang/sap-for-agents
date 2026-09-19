@@ -329,7 +329,8 @@ Fields you don't read (e.g. you didn't pass `table_outputs`) do **not** appear i
 | `GET /api/dumps` | Structured short-dump list (parsed from the ADT Atom feed) | `/api/dumps?limit=50` |
 | `GET /api/dumps/grouped` | Dumps grouped by (error type, terminated program) — what keeps failing | `/api/dumps/grouped` |
 | `GET /api/dumps/:key/detail` | One dump's parsed detail: header, termination point, call stack | `/api/dumps/<key>/detail` |
-| `PUT /api/objects/:type/:name/source` | Write full source (lock→put→unlock→activate orchestrated in one request) | `{"source":"REPORT z..."}` |
+| `POST /api/objects/:type/:name/create` | Create an ABAP object (optional first `source` written + activated in the same call; `create:true` also available on PUT/replace for auto-create) | `{"description":"...","source":"REPORT z..."}` |
+| `PUT /api/objects/:type/:name/source` | Write full source (lock→put→unlock→activate orchestrated in one request; supports `create:true` auto-creation) | `{"source":"REPORT z..."}` |
 | `POST /api/objects/:type/:name/replace` | AI-style unique find-and-replace + activate | `{"old_string":"...","new_string":"..."}` |
 | `POST /api/objects/:type/:name/syntax` | Syntax-check source without writing it | `{"source":"REPORT z..."}` |
 | `ANY /api/adt/:path` | Generic ADT REST proxy (`/sap/bc/adt/**` 1:1): dumps, class sources, anything Eclipse ADT exposes; CSRF handled for write methods | `/api/adt/runtime/dumps` |

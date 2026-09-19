@@ -42,6 +42,7 @@ curl -H "Authorization: Bearer <SAP_API_KEY>" http://127.0.0.1:3000/api/function
 | 想知道**什么在反复失败**（按错误类型 + 终止程序聚合） | `GET /api/dumps/grouped` |
 | 想看某个转储的调用栈/出错行/组件（免拉 45KB–1MB 的 ST22 正文） | `GET /api/dumps/{key}/detail` |
 | 想要原始的完整 ST22 正文（发生了什么/错误分析） | `GET /api/adt/runtime/dump/{key}/formatted` |
+| 想**创建** ABAP 对象（程序/类/函数），可顺带首版源码 | `POST /api/objects/{type}/{name}/create` |
 | 想**修改** ABAP 代码（函数/类/程序） | `PUT /api/objects/{type}/{name}/source` |
 | AI 式编辑（唯一匹配查找替换 + 自动激活） | `POST /api/objects/{type}/{name}/replace` |
 | 语法检查（**不写库**，源码内嵌提交） | `POST /api/objects/{type}/{name}/syntax` |
@@ -241,7 +242,10 @@ curl -X POST http://127.0.0.1:3000/api/objects/prog/ZMY_REPORT/syntax \
 - 响应里的 `activated.success` 是**逻辑结果**：激活失败时 HTTP 仍为 200，带 `activated.messages[]` / `problems[]`（"Line N: 文本"）——读它、改源码、重试。传输层错误（网络/会话）才走 4xx/5xx。
 - 锁冲突（他人正在编辑）→ 409 `OBJECT_LOCKED`，消息来自 SAP 原文。
 - **函数模块**：FM 源码的参数块（`FUNCTION 名.` 到 `EXCEPTIONS … .`）由参数元数据再生成——锚定在此区域的编辑会被**静默丢弃**，请把 `old_string` 锚定在函数**体**内；参数增删需元数据接口（尚未提供）。
-- 写入要求对象已存在（对象创建尚未提供）且 ADT 已启用；写入失败也会尽力 UNLOCK，不留孤儿锁。
+- **对象创建**：`POST /api/objects/{type}/{name}/create`（body：`description` 必填；可选 `devclass`——on-prem 默认 `$TMP`、ABAP Cloud Trial 用 `ZLOCAL`、`transport`、`source` 首版源码一步写入+激活）。更丝滑的形态：`PUT .../source` 与 `POST .../replace` 支持 `"create": true` + `"description"`——对象不存在时网关自动建壳并重试。注意：**ABAP Cloud Trial 的函数组**抵抗来自后台/RFC 会话的自动化创建——`RS_FUNCTION_POOL_INSERT` 返回成功却不注册 TADIR（实证：abapGit 的组建于*对话*会话而非 RFC；实测 12+ 参数组合均如此）。网关会检出未注册的组并提示先在 SE80/ADT 手工建一次。on-prem 系统不受影响。
+- 写入需 ADT 已启用；写入失败也会尽力 UNLOCK，不留孤儿锁。
+- **replace 匹配容忍阶梯**（依次）：精确 → CRLF/LF 归一 → 末尾 `\n` 修剪（末行锚点）→ **大小写不敏感唯一匹配**。SAP 存储源码原文，而部分读取路径曾返回大写化视图——兜底吸收这个漂移；大小写不敏感多命中仍按命中数报错。
+- **读回保留原文大小写**：`/api/programs/{name}/source` 现以 `WITH_LOWERCASE` 请求——读到即存到，从读回内容取的锚点必然匹配。
 - **只读部署**：部署者可能以 `SAP_READ_ONLY=1` 运行网关——写端点（`PUT .../source`、`POST .../replace`、`/api/adt` 非读方法）此时返回 403 `READ_ONLY`。这是刻意为之：不要重试写操作，改为只读操作与 `POST .../syntax`（仍可用，不落库）。`POST /api/rfc` 不受该开关影响。
 
 ## 关键约束（避坑）

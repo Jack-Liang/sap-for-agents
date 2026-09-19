@@ -139,6 +139,33 @@ pub fn tools_manifest() -> Vec<Value> {
             }, "required": ["name"] }
         }),
         json!({
+            "name": "write_source",
+            "description": "Write FULL source of an ABAP object (program/class/function) and activate. Destructive: overwrites everything. Pass create:true + description to create the object when missing. For surgical edits prefer edit_code.",
+            "inputSchema": { "type": "object", "properties": {
+                "type": { "type": "string", "enum": ["prog", "class", "func"], "description": "Object type" },
+                "name": str_param("Object name (uppercase)"),
+                "source": str_param("Full ABAP source"),
+                "group": { "type": "string", "description": "Function group (func only; auto-resolved when omitted)" },
+                "transport": { "type": "string", "description": "Transport request (optional)" },
+                "create": { "type": "boolean", "description": "Create the object when missing (default false)" },
+                "description": { "type": "string", "description": "Title for auto-creation (required with create:true)" }
+            }, "required": ["type", "name", "source"] }
+        }),
+        json!({
+            "name": "edit_code",
+            "description": "Surgical edit of an existing ABAP object: unique find-and-replace + activate. old_string must match exactly one place; CRLF differences are normalized and a case-insensitive unique fallback applies (SAP stores original case). Empty old_string only works on an empty/new object (with create:true it initializes a new object with new_string).",
+            "inputSchema": { "type": "object", "properties": {
+                "type": { "type": "string", "enum": ["prog", "class", "func"], "description": "Object type" },
+                "name": str_param("Object name"),
+                "old_string": str_param("Text to replace (match exactly one place; empty only for empty/new objects)"),
+                "new_string": str_param("Replacement text"),
+                "group": { "type": "string", "description": "Function group (func only)" },
+                "transport": { "type": "string", "description": "Transport request (optional)" },
+                "create": { "type": "boolean", "description": "Create the object when missing; new_string becomes the initial source (default false)" },
+                "description": { "type": "string", "description": "Title for auto-creation" }
+            }, "required": ["type", "name", "old_string", "new_string"] }
+        }),
+        json!({
             "name": "syntax_check",
             "description": "Syntax-check ABAP source WITHOUT storing it (object name anchors the check; use a Z name for scratch checks)",
             "inputSchema": { "type": "object", "properties": {
@@ -411,6 +438,49 @@ async fn call_tool(pool: SharedPool, name: &str, args: Value) -> Result<Value, R
             let key = req_str(&args, "key")?;
             let detail = crate::dumps::fetch_detail(&key).await?;
             Ok(serde_json::to_value(detail).unwrap_or(json!({})))
+        }
+        "write_source" | "edit_code" => {
+            use crate::objects::ObjectType;
+            let tool = name; // 工具名（下方 name 会被对象名遮蔽）
+            let otype = req_str(&args, "type")?;
+            let name = req_str(&args, "name")?.to_uppercase();
+            let group_hint = args.get("group").and_then(|v| v.as_str()).map(String::from);
+            let transport = args.get("transport").and_then(|v| v.as_str()).map(String::from);
+            let create = args.get("create").and_then(|v| v.as_bool()).unwrap_or(false);
+            let description = args
+                .get("description")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let obj_type = ObjectType::parse(&otype).ok_or_else(|| RfcError {
+                code: -1,
+                status: 400,
+                message: format!("type 必须是 prog/class/func，收到: {otype}"),
+                key: "OBJECT_TYPE_INVALID".into(),
+            })?;
+            crate::server::validate_object_name(&name)?;
+            let group =
+                crate::server::resolve_group_if_needed(&pool, obj_type, &name, group_hint).await?;
+
+            let opts = crate::objects::WriteOpts {
+                transport: transport.as_deref(),
+                activate: true,
+                create_desc: create.then_some(description.as_str()),
+            };
+            let outcome: serde_json::Value = if tool == "write_source" {
+                let source = req_str(&args, "source")?;
+                let o = crate::objects::write_object_maybe_create(
+                    &pool, obj_type, &name, &group, &source, &opts,
+                ).await?;
+                serde_json::to_value(&o).unwrap_or_default()
+            } else {
+                let old_string = args.get("old_string").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let new_string = args.get("new_string").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                crate::objects::replace_object_maybe_create(
+                    &pool, obj_type, &name, &group, &old_string, &new_string, &opts,
+                ).await?
+            };
+            Ok(outcome)
         }
         "where_used" => {
             let fname = req_str(&args, "name")?.to_uppercase();

@@ -329,6 +329,10 @@ curl -H "Authorization: Bearer $SAP_API_KEY" \
 | `GET /api/dumps` | 短转储结构化列表（解析自 ADT Atom feed） | `/api/dumps?limit=50` |
 | `GET /api/dumps/grouped` | 按（错误类型、终止程序）聚合——什么在反复失败 | `/api/dumps/grouped` |
 | `GET /api/dumps/:key/detail` | 单个转储的解析详情：头表/终止点/调用栈 | `/api/dumps/<key>/detail` |
+| `POST /api/objects/:type/:name/create` | 创建 ABAP 对象（可带首版 `source` 一步写入+激活；PUT/replace 也支持 `create:true` 自动建壳——on-prem 默认包 `$TMP`，ABAP Cloud Trial 建议传 `devclass=ZLOCAL`） | `{"description":"...","source":"REPORT z..."}` |
+| `PUT /api/objects/:type/:name/source` | 全量写源码（锁→写→解锁→激活一体；支持 `create:true` 自动创建） | `{"source":"REPORT z..."}` |
+| `POST /api/objects/:type/:name/replace` | AI 式唯一匹配查找替换 + 激活（匹配容忍阶梯：精确 → CRLF 归一 → 末行 \n 修剪 → 大小写不敏感唯一匹配） | `{"old_string":"...","new_string":"..."}` |
+| `POST /api/objects/:type/:name/syntax` | 语法检查（不写库，源码内嵌提交） | `{"source":"REPORT z..."}` |
 | `ANY /api/adt/:path` | ADT REST 通用代理（1:1 透传 `/sap/bc/adt/**`）：dump 正文、类源码等 Eclipse ADT 暴露的一切资源；写方法 CSRF 自动处理 | `/api/adt/runtime/dumps` |
 | `POST /api/functions/:name/invoke` | 类型化调用：函数名来自路径，请求体与 `/api/rfc` 同构（免填 `func_name`） | `{"inputs":{"REQUTEXT":"hi"}}` |
 | `GET /openapi.json` | 全网关 OpenAPI 3.0.3 规范（免鉴权公开页）：20 端点 + 33 schema + 认证方案，喂给代码生成器 / Postman / Agent 工具注册表 | `/openapi.json` |

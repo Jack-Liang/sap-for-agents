@@ -21,6 +21,9 @@
 use crate::adt::{
     adt_get_text_lines, adt_request_raw, encode_path_segment, establish_stateful, AdtRawResponse,
 };
+use std::collections::HashMap;
+
+use crate::api::{InvokeRequest, ScalarValue};
 use crate::error::RfcError;
 
 // ========================================================================
@@ -682,6 +685,353 @@ pub struct WriteOutcome {
     pub warnings: Vec<String>,
 }
 
+// ========================================================================
+// 对象创建（prog/class/func 的壳；源码随后走正常写入管线）
+// ========================================================================
+
+/// 创建请求的可选项。
+#[derive(Default)]
+pub struct CreateSpec {
+    /// 对象短描述（title）——SAP 必填
+    pub description: String,
+    /// 开发包（默认 $TMP；生产包需配合 transport）
+    pub devclass: String,
+    /// 传输请求号（可选）
+    pub transport: Option<String>,
+}
+
+/// 创建对象壳。成功后对象存在（可能为空源码），随后的 PUT/replace 走既有
+/// 写入编排。prog/func 走 RPY insert（实测可用、无 schema 猜谜）；class 走
+/// ADT 标准创建（POST oo/classes，v5 schema——Eclipse 同款契约）。
+pub async fn create_object(
+    pool: &std::sync::Arc<crate::pool::RfcConnectionPool>,
+    obj_type: ObjectType,
+    name: &str,
+    group: &str,
+    spec: &CreateSpec,
+) -> Result<(), RfcError> {
+    if spec.description.trim().is_empty() {
+        return Err(RfcError {
+            code: -1,
+            status: 400,
+            message: "description 必填（SAP 对象需要 title/short text）".into(),
+            key: "CREATE_DESC_REQUIRED".into(),
+        });
+    }
+    match obj_type {
+        ObjectType::Program => {
+            let pname = name.to_uppercase();
+            let title = spec.description.clone();
+            let devclass = if spec.devclass.trim().is_empty() {
+                "$TMP".to_string()
+            } else {
+                spec.devclass.trim().to_uppercase()
+            };
+            let transport = spec.transport.clone().unwrap_or_default();
+            crate::server::run_blocking(std::sync::Arc::clone(pool), move |conn| {
+                let req = crate::api::InvokeRequest {
+                    func_name: "RPY_PROGRAM_INSERT".to_string(),
+                    inputs: HashMap::from([
+                        ("PROGRAM_NAME".to_string(), ScalarValue::Chars(pname.clone())),
+                        ("PROGRAM_TYPE".to_string(), ScalarValue::Chars("1".to_string())),
+                        ("TITLE_STRING".to_string(), ScalarValue::Chars(title.clone())),
+                        ("DEVELOPMENT_CLASS".to_string(), ScalarValue::Chars(devclass.clone())),
+                        // 免交互 + 直接保存
+                        ("SUPPRESS_DIALOG".to_string(), ScalarValue::Chars("X".to_string())),
+                        ("SAVE_INACTIVE".to_string(), ScalarValue::Chars(" ".to_string())),
+                        ("TEMPORARY".to_string(), ScalarValue::Chars(" ".to_string())),
+                        ("STATUS".to_string(), ScalarValue::Chars("A".to_string())),
+                        ("APPLICATION".to_string(), ScalarValue::Chars(" ".to_string())),
+                        ("AUTHORIZATION_GROUP".to_string(), ScalarValue::Chars(" ".to_string())),
+                        ("EDIT_LOCK".to_string(), ScalarValue::Chars(" ".to_string())),
+                        ("TRANSPORT_NUMBER".to_string(), ScalarValue::Chars(transport.clone())),
+                    ]),
+                    ..Default::default()
+                };
+                let _ = crate::executor::execute_collect(conn, &req)?;
+                // SOURCE 不在此写（实测 trial 上 INSERT 的 SOURCE 表不落盘）——
+                // 壳建好后由调用方走 PUT source/main 写入并激活
+                Ok::<(), RfcError>(())
+            })
+            .await
+        }
+        ObjectType::Function => {
+            if group.trim().is_empty() {
+                return Err(RfcError {
+                    code: -1,
+                    status: 400,
+                    message: "func 创建需要 group（函数组），或传 group_hint 由网关反解".into(),
+                    key: "CREATE_GROUP_REQUIRED".into(),
+                });
+            }
+            let fname = name.to_uppercase();
+            let fgroup = group.trim().to_uppercase();
+            let short = spec.description.clone();
+            let transport = spec.transport.clone().unwrap_or_default();
+            let devclass = if spec.devclass.trim().is_empty() {
+                "$TMP".to_string()
+            } else {
+                spec.devclass.trim().to_uppercase()
+            };
+            let fm_insert = |fname: String, fgroup: String, short: String, transport: String| {
+                move |conn: &crate::connection::RfcConnection| -> Result<(), RfcError> {
+                    let req = InvokeRequest {
+                        func_name: "RPY_FUNCTIONMODULE_INSERT".to_string(),
+                        inputs: HashMap::from([
+                            ("FUNCNAME".to_string(), ScalarValue::Chars(fname.clone())),
+                            ("FUNCTION_POOL".to_string(), ScalarValue::Chars(fgroup.clone())),
+                            ("SHORT_TEXT".to_string(), ScalarValue::Chars(short.clone())),
+                            ("CORRNUM".to_string(), ScalarValue::Chars(transport.clone())),
+                        ]),
+                        ..Default::default()
+                    };
+                    let _ = crate::executor::execute_collect(conn, &req)?;
+                    Ok(())
+                }
+            };
+            match crate::server::run_blocking(
+                std::sync::Arc::clone(pool),
+                fm_insert(fname.clone(), fgroup.clone(), short.clone(), transport.clone()),
+            )
+            .await
+            {
+                Ok(()) => Ok(()),
+                // 组不存在 → 自动建组（RS_FUNCTION_POOL_INSERT）后重试一次。
+                // 包按序尝试：显式传入 → ZLOCAL（ABAP Cloud Trial 的本地包，
+                // 该环境禁止 $TMP 的 FUGR："cannot be created without a package"）
+                // → $TMP（on-prem 常规默认）。
+                Err(e) if e.key.contains("INVALID_FUNCTION_POOL") || e.message.contains("652") => {
+                    let pool_insert = |g: String, desc: String, dev: String, tr: String| {
+                        move |conn: &crate::connection::RfcConnection| -> Result<(), RfcError> {
+                            let req = InvokeRequest {
+                                func_name: "RS_FUNCTION_POOL_INSERT".to_string(),
+                                inputs: HashMap::from([
+                                    ("FUNCTION_POOL".to_string(), ScalarValue::Chars(g.clone())),
+                                    ("SHORT_TEXT".to_string(), ScalarValue::Chars(desc.clone())),
+                                    ("DEVCLASS".to_string(), ScalarValue::Chars(dev.clone())),
+                                    ("CORRNUM".to_string(), ScalarValue::Chars(tr.clone())),
+                                    ("SUPPRESS_CORR_CHECK".to_string(), ScalarValue::Chars("X".to_string())),
+                                    ("SUPPRESS_LANGUAGE_CHECK".to_string(), ScalarValue::Chars("X".to_string())),
+                                    ("AUTHORITY_CHECK".to_string(), ScalarValue::Chars(" ".to_string())),
+                                    ("NAMESPACE".to_string(), ScalarValue::Chars(" ".to_string())),
+                                    ("RESPONSIBLE".to_string(), ScalarValue::Chars(" ".to_string())),
+                                    ("UNICODE_CHECKS".to_string(), ScalarValue::Chars(" ".to_string())),
+                                ]),
+                                ..Default::default()
+                            };
+                            let _ = crate::executor::execute_collect(conn, &req)?;
+                            Ok(())
+                        }
+                    };
+                    let mut last_err: Option<RfcError> = None;
+                    let mut candidates: Vec<String> = vec![devclass.clone()];
+                    for fallback in ["ZLOCAL", "$TMP"] {
+                        if !candidates.iter().any(|c| c.eq_ignore_ascii_case(fallback)) {
+                            candidates.push(fallback.to_string());
+                        }
+                    }
+                    for dev in candidates {
+                        match crate::server::run_blocking(
+                            std::sync::Arc::clone(pool),
+                            pool_insert(fgroup.clone(), short.clone(), dev, transport.clone()),
+                        )
+                        .await
+                        {
+                            Ok(()) => {
+                                last_err = None;
+                                break;
+                            }
+                            // 组已存在的场景不算失败（并发/重复创建）
+                            Err(e2) if e2.key.contains("POOL") && e2.message.contains("exist") => {
+                                last_err = None;
+                                break;
+                            }
+                            Err(e2) => last_err = Some(e2),
+                        }
+                    }
+                    if let Some(e2) = last_err {
+                        return Err(e2);
+                    }
+                    let resp_group = fgroup.clone();
+                    let r = crate::server::run_blocking(
+                        std::sync::Arc::clone(pool),
+                        fm_insert(fname, fgroup.clone(), short, transport),
+                    )
+                    .await;
+                    let fgroup = resp_group;
+                    // ABAP Cloud Trial 自检：RS_FUNCTION_POOL_INSERT 可能返回成功
+                    // 却不写 TADIR（组对象实际不存在）——后续 ADT 写入会以
+                    // "FUGR cannot be created without a package" 失败。提前检出，
+                    // 给出可操作的错误而不是静默假成功。
+                    if r.is_ok() {
+                        let g_chk = fgroup.clone();
+                        let registered = crate::server::run_blocking(
+                            std::sync::Arc::clone(pool),
+                            move |conn| {
+                                let rows = crate::discovery::read_table(
+                                    conn, "TADIR",
+                                    &["OBJECT".to_string(), "OBJ_NAME".to_string()],
+                                    &[format!("OBJECT = 'FUGR' AND OBJ_NAME = '{}'", g_chk)],
+                                    1, '\u{1}',
+                                )
+                                .unwrap_or_default();
+                                Ok::<bool, RfcError>(!rows.is_empty())
+                            },
+                        )
+                        .await
+                        .unwrap_or(true);
+                        if !registered {
+                            return Err(RfcError {
+                                code: -1,
+                                status: 502,
+                                message: format!(
+                                    "函数组 {fgroup} 创建后未在 TADIR 注册（ABAP Cloud Trial 上 RPY 建组受限）。\
+请在 SE80/ADT 手工创建该组（package 如 ZLOCAL）后重试"
+                                ),
+                                key: "FUGR_NOT_REGISTERED".into(),
+                            });
+                        }
+                    }
+                    r
+                }
+                Err(e) => Err(e),
+            }
+        }
+        ObjectType::Class => {
+            // ADT 标准创建（Eclipse 同款）：POST oo/classes?name=Z...&package=...
+            let rel = "oo/classes";
+            let query: Vec<(&str, &str)> = vec![
+                ("name", name),
+                ("package", if spec.devclass.trim().is_empty() { "$TMP" } else { spec.devclass.trim() }),
+            ];
+            // body 按该服务读取实例反推的 schema：abapClass root + adtcore: 前缀属性
+            // （这台 ABAP Cloud Trial 实测：无前缀属性 → "could not be converted"；
+            //   adtcore 属性 → 进到对象校验层。on-prem 标准版为 class:class。）
+            let body = format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+<class:abapClass xmlns:class=\"http://www.sap.com/adt/oo/classes\" \
+ xmlns:adtcore=\"http://www.sap.com/adt/core\" adtcore:name=\"{name}\" \
+ adtcore:description=\"{}\" class:final=\"true\" class:visibility=\"public\"/>",
+                xml_escape(&spec.description)
+            );
+            let resp = adt_request_raw(
+                axum::http::Method::POST,
+                rel,
+                &query,
+                Some(body.as_bytes()),
+                Some("application/vnd.sap.adt.oo.classes.v5+xml"),
+                "*/*",
+                &[], // 无额外头；CSRF 由网关自动处理
+                None,
+                None,
+            )
+            .await?;
+            if !(200..300).contains(&resp.status) {
+                return Err(RfcError {
+                    code: -1,
+                    status: 502,
+                    message: format!("ADT 创建失败: {}", String::from_utf8_lossy(&resp.body)),
+                    key: "CREATE_FAILED".into(),
+                });
+            }
+            Ok(())
+        }
+    }
+}
+
+/// 写入（可选对象不存在时先建壳）：PUT source 语义的共享入口。
+/// `create_desc` 为 Some 时启用自动创建（描述即 title）。
+/// 写入选项（maybe_create 系列共用）
+pub struct WriteOpts<'a> {
+    pub transport: Option<&'a str>,
+    pub activate: bool,
+    /// Some(description) 启用「对象不存在时自动创建」
+    pub create_desc: Option<&'a str>,
+}
+
+pub async fn write_object_maybe_create(
+    pool: &std::sync::Arc<crate::pool::RfcConnectionPool>,
+    obj_type: ObjectType,
+    name: &str,
+    group: &str,
+    source: &str,
+    opts: &WriteOpts<'_>,
+) -> Result<WriteOutcome, RfcError> {
+    let WriteOpts { transport, activate, create_desc } = *opts;
+    match write_object_source(obj_type, name, group, source, transport, activate).await {
+        Ok(o) => Ok(o),
+        Err(e) if create_desc.is_some() && is_object_not_exist(&e) => {
+            let spec = CreateSpec {
+                description: create_desc.unwrap_or_default().to_string(),
+                devclass: String::new(),
+                transport: transport.map(str::to_string),
+            };
+            create_object(pool, obj_type, name, group, &spec).await?;
+            write_object_source(obj_type, name, group, source, transport, activate).await
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// 唯一匹配查找替换（可选对象不存在时先建壳）：POST replace 语义的共享入口。
+/// 返回写入 outcome（外加 replaced 标记在 `replaced` 字段）。
+pub async fn replace_object_maybe_create(
+    pool: &std::sync::Arc<crate::pool::RfcConnectionPool>,
+    obj_type: ObjectType,
+    name: &str,
+    group: &str,
+    old_string: &str,
+    new_string: &str,
+    opts: &WriteOpts<'_>,
+) -> Result<serde_json::Value, RfcError> {
+    let WriteOpts { transport, activate, create_desc } = *opts;
+    let current = match read_current_source(obj_type, name, group).await {
+        Ok(c) => c,
+        Err(e) if create_desc.is_some() && is_object_not_exist(&e) => {
+            let spec = CreateSpec {
+                description: create_desc.unwrap_or_default().to_string(),
+                devclass: String::new(),
+                transport: transport.map(str::to_string),
+            };
+            create_object(pool, obj_type, name, group, &spec).await?;
+            String::new()
+        }
+        Err(e) => return Err(e),
+    };
+    let updated = find_and_replace(&current, old_string, new_string).map_err(|m| RfcError {
+        code: -1,
+        status: 400,
+        message: m,
+        key: "REPLACE_FAILED".into(),
+    })?;
+    if updated == current {
+        return Err(RfcError {
+            code: -1,
+            status: 400,
+            message: "替换后内容与原文相同".into(),
+            key: "REPLACE_NO_CHANGE".into(),
+        });
+    }
+    let outcome = write_object_source(obj_type, name, group, &updated, transport, activate).await?;
+    let mut v = serde_json::to_value(&outcome).unwrap_or_default();
+    v["replaced"] = serde_json::json!(true);
+    Ok(v)
+}
+
+/// 判断写入错误是否为「对象不存在」（可配合 create:true 自动建壳重试）。
+pub fn is_object_not_exist(err: &RfcError) -> bool {
+    (err.status == 409 && err.key == "ADT_ExceptionResourceNotFound")
+        || err.message.contains("does not exist")
+}
+
+/// XML 属性转义（创建 body 用）。
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
 /// 编排写入：锁 → PUT 源码 → 解锁 → 激活。
 ///
 /// - `transport`: 调用方指定的传输请求号；未指定时复用对象已绑定的
@@ -842,29 +1192,73 @@ pub fn find_and_replace(content: &str, old: &str, new: &str) -> Result<String, S
         return Err("old_string 与 new_string 相同，不会有任何变化".into());
     }
     let count = content.matches(old).count();
-    match count {
-        0 => {
-            // EOL 归一化重试（源码 LF、调用方给 CRLF 是最常见的失配原因）
-            let norm_content = content.replace("\r\n", "\n");
-            let norm_old = old.replace("\r\n", "\n");
-            if norm_content.contains(&norm_old) {
-                let norm_new = new.replace("\r\n", "\n");
-                let updated = norm_content.replace(&norm_old, &norm_new);
-                return Ok(if content.contains("\r\n") {
-                    // 原文是 CRLF 风格则还原
-                    restored_crlf(&updated)
-                } else {
-                    updated
-                });
-            }
-            Err("找不到 old_string；请先读当前源码，按原文精确匹配（含缩进与空格）".into())
-        }
-        1 => Ok(content.replacen(old, new, 1)),
-        n => Err(format!(
-            "old_string 命中 {} 处，必须恰好 1 处；请附带更多上下文行使其唯一",
-            n
-        )),
+    if count == 1 {
+        return Ok(content.replacen(old, new, 1));
     }
+    if count > 1 {
+        return Err(format!(
+            "old_string 命中 {} 处，必须恰好 1 处；请附带更多上下文行使其唯一",
+            count
+        ));
+    }
+    // ===== 精确匹配 0 命中的兜底阶梯（每级都保持「恰好 1 处」约束）=====
+    // 统一到 LF 空间做（源码 LF、调用方 CRLF 是最常见失配原因；写回按原文风格还原）
+    let crlf = content.contains("\r\n");
+    let norm_content = content.replace("\r\n", "\n");
+    let norm_old_full = old.replace("\r\n", "\n");
+    let norm_new = new.replace("\r\n", "\n");
+    let apply = |hit_old: &str| -> Option<String> {
+        // 命中数在归一化内容上复核，唯一才替换
+        let n = norm_content.matches(hit_old).count();
+        if n == 1 {
+            Some(norm_content.replacen(hit_old, &norm_new, 1))
+        } else {
+            None
+        }
+    };
+    // 阶梯 1：EOL 归一化后的精确匹配
+    if let Some(updated) = apply(&norm_old_full) {
+        return Ok(if crlf { restored_crlf(&updated) } else { updated });
+    }
+    // 阶梯 2：末尾 \n 修剪（锚点是最后一行时，调用方常多带一个换行）
+    let old_trim = norm_old_full.trim_end_matches('\n');
+    if !old_trim.is_empty() && old_trim != norm_old_full {
+        if let Some(updated) = apply(old_trim) {
+            return Ok(if crlf { restored_crlf(&updated) } else { updated });
+        }
+    }
+    // 阶梯 3：大小写不敏感唯一匹配——Agent 按大写化视图做锚点、SAP 存的却是
+    // 原文（或反之）的漂移陷阱（实测：RPY 读回会大写化、ADT 写路径读原文）。
+    // 仅当 lower 后字节长度不变（ASCII 系源码）才启用，避免 Unicode 变长错位。
+    let lc_content = norm_content.to_lowercase();
+    if lc_content.len() == norm_content.len() {
+        for cand in [old_trim, norm_old_full.as_str()] {
+            if cand.is_empty() {
+                continue;
+            }
+            let lc_old = cand.to_lowercase();
+            if lc_old.len() != cand.len() {
+                continue; // 变长字符防御：无法按字节定位，跳过
+            }
+            let n = lc_content.matches(&lc_old).count();
+            if n == 1 {
+                let idx = lc_content.find(&lc_old).unwrap();
+                let mut updated = String::with_capacity(norm_content.len());
+                updated.push_str(&norm_content[..idx]);
+                updated.push_str(&norm_new);
+                updated.push_str(&norm_content[idx + lc_old.len()..]);
+                return Ok(if crlf { restored_crlf(&updated) } else { updated });
+            }
+            if n > 1 {
+                return Err(format!(
+                    "old_string（大小写不敏感）命中 {} 处，必须恰好 1 处；请附带更多上下文行使其唯一",
+                    n
+                ));
+            }
+        }
+    }
+
+    Err("找不到 old_string；已尝试精确/CRLF 归一/末行换行修剪/大小写不敏感唯一匹配。请先 GET 当前源码，按原文精确匹配（含缩进与空格）".into())
 }
 
 /// 把归一化后的纯 LF 文本还原为 CRLF 风格（原文是 CRLF 时）。
@@ -1047,6 +1441,34 @@ mod tests {
         let content = "REPORT zt.\nWRITE 'x'.\n";
         let out = find_and_replace(content, "WRITE 'x'.\r\n", "WRITE 'y'.\r\n").unwrap();
         assert!(out.contains("WRITE 'y'."));
+    }
+    #[test]
+    fn find_and_replace_case_insensitive_fallback() {
+        // 大小写漂移：源码小写原文、锚点按大写化视图给（实测痛点）
+        let content = "REPORT zprog.\nDATA lv_x TYPE i.\nlv_x = 1.";
+        // 唯一命中（大小写不敏感）→ 兜底成功，new_string 原样写入
+        let out = find_and_replace(content, "LV_X = 1.", "lv_x = 42.").unwrap();
+        assert!(out.contains("lv_x = 42."), "{out}");
+        assert!(out.contains("DATA lv_x"), "其余行保持原文: {out}");
+        // 大小写不敏感多命中 → 明确报错
+        let err = find_and_replace(content, "LV_X", "X").unwrap_err();
+        assert!(err.contains("2 处"), "{err}");
+    }
+
+    #[test]
+    fn find_and_replace_trailing_newline_fallback() {
+        // 末行锚点多带 \n（历史必失败形态）
+        let content = "REPORT zprog.\nWRITE 'end'.";
+        let out = find_and_replace(content, "WRITE 'end'.\n", "WRITE 'new end'.").unwrap();
+        assert_eq!(out, "REPORT zprog.\nWRITE 'new end'.");
+    }
+
+    #[test]
+    fn find_and_replace_case_insensitive_with_crlf_restore() {
+        // CRLF 原文 + 大小写兜底：写回时还原 CRLF 风格
+        let content = "REPORT zprog.\r\nwrite 'x'.";
+        let out = find_and_replace(content, "WRITE 'X'.", "WRITE 'y'.").unwrap();
+        assert_eq!(out, "REPORT zprog.\r\nWRITE 'y'.");
     }
 
     #[test]

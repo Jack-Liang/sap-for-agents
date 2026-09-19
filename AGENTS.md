@@ -42,6 +42,7 @@ curl -H "Authorization: Bearer <SAP_API_KEY>" http://127.0.0.1:3000/api/function
 | Want to know **what keeps failing** (dumps grouped by error type + program) | `GET /api/dumps/grouped` |
 | Want one dump's call stack / failing line / component (without the 45KB–1MB ST22 text) | `GET /api/dumps/{key}/detail` |
 | Want the raw full ST22 text (What happened/Error analysis) | `GET /api/adt/runtime/dump/{key}/formatted` |
+| Want to **create** an ABAP object (program / class / function), optionally with first source | `POST /api/objects/{type}/{name}/create` |
 | Want to **modify** ABAP code (function / class / program) | `PUT /api/objects/{type}/{name}/source` |
 | Want AI-style editing (unique find-and-replace, verified) | `POST /api/objects/{type}/{name}/replace` |
 | Want to syntax-check source **without** writing it | `POST /api/objects/{type}/{name}/syntax` |
@@ -241,7 +242,10 @@ curl -X POST http://127.0.0.1:3000/api/objects/prog/ZMY_REPORT/syntax \
 - Response `activated.success` is the **logical** result: an activation failure is HTTP 200 with `activated.messages[]` / `problems[]` ("Line N: text") — read them, fix the source, retry. Transport errors (network, session) are 4xx/5xx as usual.
 - Lock conflict (someone else editing) → 409 `OBJECT_LOCKED` with SAP's own message.
 - **Function modules**: in the FM source the parameter block (`FUNCTION name.` down to `EXCEPTIONS ... .`) is **regenerated from parameter metadata** — edits anchored there are silently dropped. Anchor `old_string` in the function **body**. Parameter changes need the metadata API (not built yet).
-- Writes need the object to exist (creation is not built yet) and ADT enabled; a failed write still attempts UNLOCK so no orphan lock is left behind.
+- **Creation**: `POST /api/objects/{type}/{name}/create` (body: `description` required, optional `devclass` default `$TMP` on-prem / `ZLOCAL` on ABAP Cloud trials, `transport`, and `source` for a first write+activate in one call). Even smoother: `PUT .../source` and `POST .../replace` accept `"create": true` + `"description"` — when the object is missing, the gateway creates the shell and retries automatically. Note: **function groups on ABAP Cloud trials** resist automated creation from background/RFC sessions — `RS_FUNCTION_POOL_INSERT` returns success without registering TADIR (verified: abapGit created its groups from a *dialog* session, not RFC; 12+ parameter combinations tested). The gateway detects the non-registered group and tells you to create it once in SE80/ADT. On-prem systems are unaffected.
+- Writes need ADT enabled; a failed write still attempts UNLOCK so no orphan lock is left behind.
+- **Match tolerance in `replace`** (in order): exact → CRLF/LF normalization → trailing-`\n` trim (last-line anchors) → **case-insensitive unique match**. SAP stores the source in its original case while some read paths used to return an uppercased view — the fallback absorbs that drift. Multiple case-insensitive hits still fail with a count.
+- **Reads return the original case**: `/api/programs/{name}/source` now requests `WITH_LOWERCASE` — what you read is what is stored, so anchors taken from a previous read always match.
 - **Read-only deployments**: the deployer may run the gateway with `SAP_READ_ONLY=1` — write endpoints (`PUT .../source`, `POST .../replace`, non-read `/api/adt` methods) then return 403 `READ_ONLY`. This is intentional: don't retry writes, stick to reads and `POST .../syntax` (still allowed, nothing is stored). `POST /api/rfc` is unaffected by the switch.
 
 ## Key constraints (pitfalls to avoid)

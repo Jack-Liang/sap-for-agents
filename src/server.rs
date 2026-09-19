@@ -1285,7 +1285,8 @@ fn split_object_path(
         "source" => "source",
         "replace" => "replace",
         "syntax" => "syntax",
-        _ => return Err(bad("动作须为 source/replace/syntax")),
+        "create" => "create",
+        _ => return Err(bad("动作须为 source/replace/syntax/create")),
     };
     if name.is_empty() || name.len() > 60 || name.split('/').any(|s| s.is_empty() && s != name) {
         // 允许整体以 / 开头（命名空间），但不允许内部空段（/UI5//X）
@@ -1351,6 +1352,16 @@ struct ObjectWriteBody {
     /// 函数对象的组名（可选，缺省自动反解）
     #[serde(default)]
     group: Option<String>,
+    /// 对象不存在时自动创建壳再写（默认 false）。丝滑写入的推荐方式：
+    /// 新对象首次写入带上 create:true + description。
+    #[serde(default)]
+    create: Option<bool>,
+    /// 自动创建时的对象描述（title；create:true 时必填）
+    #[serde(default)]
+    description: Option<String>,
+    /// 自动创建时的开发包（默认 $TMP）
+    #[serde(default)]
+    devclass: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -1390,7 +1401,7 @@ async fn object_write_handler(
         });
     }
     let group = resolve_group_if_needed(&pool, obj_type, &name, body.group.clone()).await?;
-    let outcome = crate::objects::write_object_source(
+    let outcome = match crate::objects::write_object_source(
         obj_type,
         &name,
         &group,
@@ -1398,7 +1409,29 @@ async fn object_write_handler(
         body.transport.as_deref(),
         body.activate,
     )
-    .await?;
+    .await
+    {
+        Ok(o) => o,
+        Err(e) if body.create.unwrap_or(false) && crate::objects::is_object_not_exist(&e) => {
+            // 对象不存在且允许创建：建壳后重试一次写入
+            let spec = crate::objects::CreateSpec {
+                description: body.description.clone().unwrap_or_default(),
+                devclass: body.devclass.clone().unwrap_or_default(),
+                transport: body.transport.clone(),
+            };
+            crate::objects::create_object(&pool, obj_type, &name, &group, &spec).await?;
+            crate::objects::write_object_source(
+                obj_type,
+                &name,
+                &group,
+                &body.source,
+                body.transport.as_deref(),
+                body.activate,
+            )
+            .await?
+        }
+        Err(e) => return Err(e),
+    };
     Ok(Json(serde_json::to_value(outcome).unwrap_or_default()))
 }
 
@@ -1431,7 +1464,20 @@ async fn object_post_handler(
                 message: format!("请求体字段非法（old_string/new_string 必填）: {}", e),
                 key: "JSON_INVALID".into(),
             })?;
-            let current = crate::objects::read_current_source(obj_type, &name, &group).await?;
+            let current = match crate::objects::read_current_source(obj_type, &name, &group).await {
+                Ok(c) => c,
+                Err(e) if body.create.unwrap_or(false) && crate::objects::is_object_not_exist(&e) => {
+                    // 对象不存在且允许创建：建壳，从空源码开始（new_string 即初始内容）
+                    let spec = crate::objects::CreateSpec {
+                        description: body.description.clone().unwrap_or_default(),
+                        devclass: body.devclass.clone().unwrap_or_default(),
+                        transport: body.transport.clone(),
+                    };
+                    crate::objects::create_object(&pool, obj_type, &name, &group, &spec).await?;
+                    String::new()
+                }
+                Err(e) => return Err(e),
+            };
             let updated =
                 crate::objects::find_and_replace(&current, &body.old_string, &body.new_string)
                     .map_err(|m| RfcError {
@@ -1462,6 +1508,53 @@ async fn object_post_handler(
             Ok(Json(v))
         }
         // ⑭ 语法检查（不写库：源码内嵌提交）
+        "create" => {
+            // ⓯ 创建对象壳（prog/class/func），可选顺带首版源码写入+激活
+            let description = raw
+                .get("description")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let devclass = raw
+                .get("devclass")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let transport = raw
+                .get("transport")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let activate = raw
+                .get("activate")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+            let spec = crate::objects::CreateSpec {
+                description,
+                devclass,
+                transport: transport.clone(),
+            };
+            crate::objects::create_object(&pool, obj_type, &name, &group, &spec).await?;
+            // 可选首版源码：有则直接走写入编排（一步到位）
+            let first_source = raw.get("source").and_then(|v| v.as_str());
+            let mut v = serde_json::json!({
+                "created": true,
+                "type": split_object_path(&path).map(|(_, _, a)| a).unwrap_or_default(),
+                "name": name,
+            });
+            if let Some(src) = first_source.filter(|s| !s.trim().is_empty()) {
+                let outcome = crate::objects::write_object_source(
+                    obj_type,
+                    &name,
+                    &group,
+                    src,
+                    transport.as_deref(),
+                    activate,
+                )
+                .await?;
+                v["write"] = serde_json::to_value(outcome).unwrap_or_default();
+            }
+            Ok(Json(v))
+        }
         "syntax" => {
             let source = raw
                 .get("source")
@@ -1500,6 +1593,13 @@ struct ObjectReplaceBody {
     transport: Option<String>,
     #[serde(default = "default_true")]
     activate: bool,
+    /// 对象不存在时自动创建（空对象 + new_string 作为初始内容）
+    #[serde(default)]
+    create: Option<bool>,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    devclass: Option<String>,
 }
 
 /// ⑤ GET /api/functions/:name/doc —— 查函数文档（短文本 + SE37 长文本 + 参数说明）
