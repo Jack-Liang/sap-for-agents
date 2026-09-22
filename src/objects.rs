@@ -89,6 +89,8 @@ pub enum ObjectType {
     Function,
     FunctionGroup,
     CdsView,
+    /// DDIC 透明表（源码化 DDIC「blue 对象」）：无编辑锁，etag 乐观并发
+    Table,
     Package,
 }
 
@@ -104,6 +106,7 @@ impl ObjectType {
             "func" | "function" | "fm" => Some(Self::Function),
             "fugr" | "fgroup" | "group" => Some(Self::FunctionGroup),
             "cds" | "ddls" => Some(Self::CdsView),
+            "tabl" | "table" | "dtab" => Some(Self::Table),
             "package" | "pkg" | "devclass" => Some(Self::Package),
             _ => None,
         }
@@ -119,6 +122,7 @@ impl ObjectType {
             Self::Function => "func",
             Self::FunctionGroup => "fugr",
             Self::CdsView => "cds",
+            Self::Table => "tabl",
             Self::Package => "package",
         }
     }
@@ -133,6 +137,7 @@ impl ObjectType {
             Self::Function => "FUGR/FF",
             Self::FunctionGroup => "FUGR/F",
             Self::CdsView => "DDLS/DF",
+            Self::Table => "TABL/DT",
             Self::Package => "DEVC/K",
         }
     }
@@ -173,6 +178,7 @@ impl ObjectType {
             ),
             Self::FunctionGroup => format!("functions/groups/{}", self.url_name(name)),
             Self::CdsView => format!("ddic/ddl/sources/{}", self.url_name(name)),
+            Self::Table => format!("ddic/tables/{}", self.url_name(name)),
             Self::Package => format!("packages/{}", self.url_name(name)),
         }
     }
@@ -223,6 +229,14 @@ impl ObjectType {
                 "ddic/ddl/sources".into(),
                 "ddl:ddlSource",
                 "http://www.sap.com/adt/ddic/ddlsources",
+            ),
+            // 表是「源码化 DDIC」（blue 对象）：创建文档的根**就是** blueSource
+            // 本身（adtcore 属性 + packageRef 子元素）——发 tbl:table 根会被
+            // 要求内嵌 blueSource 而内嵌源码又不被接受（A4H 816 真机实证）
+            Self::Table => (
+                "ddic/tables".into(),
+                "blue:blueSource",
+                "http://www.sap.com/wbobj/blue",
             ),
             // Package 走专用富 payload（见 create_package_body），不用通用模板
             Self::Package => (
@@ -1052,6 +1066,12 @@ async fn create_object_adt(
     }
 
     let (rel, _, _) = obj_type.creation(group);
+    // blueSource 创建契约不含 responsible（服务端自动记创建用户），不带更稳
+    let responsible = if obj_type == ObjectType::Table {
+        None
+    } else {
+        responsible
+    };
     let body = create_body_simple(obj_type, name, group, spec, responsible);
     create_post_adt(&rel, &body, transport).await
 }
@@ -1504,6 +1524,10 @@ pub async fn write_object_source(
             key: "NO_SOURCE_RESOURCE".into(),
         });
     }
+    // 表（blue 对象）不走锁编排：etag 乐观并发，单独通道
+    if obj_type == ObjectType::Table {
+        return write_table_source(name, source, transport, activate).await;
+    }
     let type_name = obj_type.api_name();
     let base = obj_type.base_rel(name, group);
     let source_rel = obj_type.source_rel(name, group);
@@ -1640,6 +1664,129 @@ pub async fn write_object_source(
         rfc_enabled: rfc_result,
         activated,
         warnings,
+    })
+}
+
+/// 表（blue 对象）写入编排：GET etag → PUT 源码 → 激活。**全程无锁**。
+///
+/// DDIC 表是「源码化 DDIC」，ADT 对它不用编辑锁而用 etag 乐观并发——
+/// 没有 stateful 会话、没有 lockHandle，也就没有 423 InvalidLockHandle 一族
+/// 的问题（与 prog/class 的锁编排是两套并发模型）。etag 有两个真机实证的
+/// 怪癖，都已在实现里吸收：
+///
+/// - **裸 `text/plain`**：服务端把请求的 content-type 字符串算进 etag，
+///   GET（Accept）与 PUT（Content-Type）不一致就 412——charset 后缀都不行；
+/// - **If-Match 不带引号**：ADT 把引号当作 etag 值的一部分（RFC 7232 反例）。
+///
+/// 对象不存在时 GET 的错误经 [`adt_exception_error`] 归一为
+/// 409/ADT_ExceptionResourceNotFound，与锁编排路径同形态——
+/// `create:true` 的建壳重试因此对表同样生效。
+async fn write_table_source(
+    name: &str,
+    source: &str,
+    transport: Option<&str>,
+    activate: bool,
+) -> Result<WriteOutcome, RfcError> {
+    let base = ObjectType::Table.base_rel(name, "");
+    let source_rel = ObjectType::Table.source_rel(name, "");
+
+    // ① GET 现源拿 etag（裸 text/plain，与 PUT 的 Content-Type 同串）
+    let get_resp = adt_request_raw(
+        axum::http::Method::GET,
+        &source_rel,
+        &[],
+        None,
+        None,
+        "text/plain",
+        &[],
+        None,
+        None,
+    )
+    .await?;
+    if !(200..300).contains(&get_resp.status) {
+        let body = String::from_utf8_lossy(&get_resp.body).to_string();
+        if body.contains("exc:exception") {
+            // 表缺失的 ADT 说法是 "Error while importing object X from the
+            // database"——归一后 is_object_not_exist 可识别
+            return Err(adt_exception_error(&body, "读取表源码失败"));
+        }
+        return Err(RfcError {
+            code: -1,
+            status: 502,
+            message: format!(
+                "读取表源码失败（ADT 返回 {}）: {}",
+                get_resp.status,
+                truncate(&body, 300)
+            ),
+            key: "ADT_SOURCE_UNAVAILABLE".into(),
+        });
+    }
+    let etag = get_resp.etag.ok_or_else(|| RfcError {
+        code: -1,
+        status: 502,
+        message: "表源码读取成功但未返回 ETag（无法做乐观并发写入）".into(),
+        key: "ETAG_MISSING".into(),
+    })?;
+
+    // ② PUT（If-Match 裸值；corrNr 仅显式给 transport 时带——无锁响应可复用）
+    let transport_used = transport
+        .map(str::to_string)
+        .filter(|t| !t.trim().is_empty());
+    let mut query: Vec<(&str, &str)> = Vec::new();
+    if let Some(t) = transport_used.as_deref() {
+        query.push(("corrNr", t));
+    }
+    let put_resp = adt_request_raw(
+        axum::http::Method::PUT,
+        &source_rel,
+        &query,
+        Some(source.as_bytes()),
+        Some("text/plain"),
+        "*/*",
+        &[("If-Match", etag.as_str())],
+        None,
+        None,
+    )
+    .await?;
+    if !(200..300).contains(&put_resp.status) {
+        let body = String::from_utf8_lossy(&put_resp.body).to_string();
+        let (status, key) = if put_resp.status == 412 {
+            (412u16, "ETAG_CONFLICT".to_string())
+        } else if put_resp.status == 409 {
+            (409, "OBJECT_LOCKED".to_string())
+        } else {
+            (502, "ADT_WRITE_FAILED".to_string())
+        };
+        return Err(RfcError {
+            code: -1,
+            status,
+            message: format!(
+                "写入表源码失败（ADT 返回 {}）: {}",
+                put_resp.status,
+                truncate(&body, 300)
+            ),
+            key,
+        });
+    }
+
+    // ③ 激活（与锁编排同一通道；逻辑结果，不升为传输错误）
+    let name_upper = name.trim().to_uppercase();
+    let activated = if activate {
+        Some(activate_object(&base, &name_upper).await?)
+    } else {
+        None
+    };
+
+    Ok(WriteOutcome {
+        obj_type: "tabl".to_string(),
+        name: name_upper,
+        group: None,
+        source_url: source_rel,
+        written: true,
+        transport_used,
+        rfc_enabled: None,
+        activated,
+        warnings: Vec::new(),
     })
 }
 
@@ -1790,6 +1937,58 @@ pub async fn delete_object(
 ) -> Result<DeleteOutcome, RfcError> {
     let base = obj_type.base_rel(name, group);
     let mut warnings = Vec::new();
+    // 表（blue 对象）删除不需要编辑锁：无状态 DELETE 即可（真机实证 200）
+    if obj_type == ObjectType::Table {
+        let transport_used = transport
+            .map(str::to_string)
+            .filter(|t| !t.trim().is_empty());
+        let query: Vec<(&str, &str)> = match transport_used.as_deref() {
+            Some(t) => vec![("corrNr", t)],
+            None => vec![],
+        };
+        let resp = adt_request_raw(
+            axum::http::Method::DELETE,
+            &base,
+            &query,
+            None,
+            None,
+            "*/*",
+            &[],
+            None,
+            None,
+        )
+        .await
+        .map_err(|e| RfcError {
+            code: -1,
+            status: 502,
+            message: format!("删除失败: {}", e.message),
+            key: "ADT_DELETE_FAILED".into(),
+        })?;
+        if !(200..300).contains(&resp.status) {
+            let body = String::from_utf8_lossy(&resp.body).to_string();
+            if body.contains("exc:exception") {
+                return Err(adt_exception_error(&body, "删除对象失败"));
+            }
+            return Err(RfcError {
+                code: -1,
+                status: 502,
+                message: format!(
+                    "删除对象失败（ADT 返回 {}）: {}",
+                    resp.status,
+                    truncate(&body, 300)
+                ),
+                key: "ADT_DELETE_FAILED".into(),
+            });
+        }
+        return Ok(DeleteOutcome {
+            obj_type: obj_type.api_name().to_string(),
+            name: name.trim().to_uppercase(),
+            group: None,
+            deleted: true,
+            transport_used,
+            warnings,
+        });
+    }
     let mut sess = WriteSession::establish(&base).await?;
     let lock = lock_object(&base, &mut sess).await?;
     let transport_used = transport
@@ -2220,9 +2419,12 @@ mod tests {
         assert_eq!(ObjectType::parse("fm"), Some(ObjectType::Function));
         assert_eq!(ObjectType::parse("cds"), Some(ObjectType::CdsView));
         assert_eq!(ObjectType::parse("ddls"), Some(ObjectType::CdsView));
+        assert_eq!(ObjectType::parse("tabl"), Some(ObjectType::Table));
+        assert_eq!(ObjectType::parse("TABLE"), Some(ObjectType::Table));
+        assert_eq!(ObjectType::parse("dtab"), Some(ObjectType::Table));
         assert_eq!(ObjectType::parse("package"), Some(ObjectType::Package));
         assert_eq!(ObjectType::parse("pkg"), Some(ObjectType::Package));
-        assert_eq!(ObjectType::parse("table"), None);
+        assert_eq!(ObjectType::parse("foobar"), None);
 
         assert_eq!(
             ObjectType::Program.base_rel("ztest", ""),
@@ -2249,6 +2451,22 @@ mod tests {
             ObjectType::FunctionGroup.base_rel("zgroup", ""),
             "functions/groups/ZGROUP"
         );
+        // 表：ddic/tables 下，源码在 source/main
+        assert_eq!(
+            ObjectType::Table.base_rel("zagw_t1", ""),
+            "ddic/tables/ZAGW_T1"
+        );
+        assert_eq!(
+            ObjectType::Table.source_rel("zagw_t1", ""),
+            "ddic/tables/ZAGW_T1/source/main"
+        );
+        assert!(ObjectType::Table.has_source());
+        assert!(!ObjectType::Table.needs_group());
+        // 创建契约：根元素是 blue:blueSource（blue 对象，非 tbl:table）
+        let (rel, root, ns) = ObjectType::Table.creation("");
+        assert_eq!(rel, "ddic/tables");
+        assert_eq!(root, "blue:blueSource");
+        assert_eq!(ns, "http://www.sap.com/wbobj/blue");
         assert_eq!(ObjectType::Package.base_rel("zpkg", ""), "packages/ZPKG");
         assert!(!ObjectType::Package.has_source());
         assert!(ObjectType::CdsView.has_source());
@@ -2282,6 +2500,15 @@ mod tests {
         assert!(fbody.contains("adtcore:type=\"FUGR/FF\""));
         assert!(fbody.contains("adtcore:containerRef adtcore:name=\"ZGRP\""));
         assert!(fbody.contains("adtcore:uri=\"/sap/bc/adt/functions/groups/zgrp\""));
+
+        // 表：根是 blue:blueSource，packageRef 为子元素（真机实证契约）
+        let tbody = create_body_simple(ObjectType::Table, "ZAGW_T1", "", &spec, None);
+        assert!(tbody.contains("<blue:blueSource "));
+        assert!(tbody.contains("xmlns:blue=\"http://www.sap.com/wbobj/blue\""));
+        assert!(tbody.contains("adtcore:type=\"TABL/DT\""));
+        assert!(tbody.contains("adtcore:name=\"ZAGW_T1\""));
+        assert!(tbody.contains("<adtcore:packageRef adtcore:name=\"ZPKG\"/>"));
+        assert!(!tbody.contains("<tbl:table"));
     }
 
     #[test]

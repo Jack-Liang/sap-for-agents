@@ -666,7 +666,7 @@ src/
 | Namespaced function modules `/NS/NAME` | ✅ Implemented (validation + wildcard route dispatch, since v0.4.10) |
 | ADT REST proxy | ✅ Implemented (`/api/adt/**` passthrough with automatic CSRF handling, since v0.4.11) |
 | Structured ST22 analysis | ✅ Implemented (`/api/dumps` list/grouped/detail parsed from ADT — no more multi-hundred-KB raw texts; since v0.5.0) |
-| ABAP code modification | ✅ Implemented (`PUT source` / `POST replace` / `POST syntax` / `GET source` / `POST create` / `DELETE` for prog/incl/class/intf/func/fugr/cds/package — full lock→write→activate orchestration with dedicated stateful session; ADT-first creation with RFC fallback, FM signatures writable via source (SEDI form) + `rfc_enabled` remote-enable; since v0.6.0) |
+| ABAP code modification | ✅ Implemented (`PUT source` / `POST replace` / `POST syntax` / `GET source` / `POST create` / `DELETE` for prog/incl/class/intf/func/fugr/cds/tabl/package — full lock→write→activate orchestration with dedicated stateful session (tabl uses the lock-free etag optimistic-concurrency path of source-based DDIC); ADT-first creation with RFC fallback, FM signatures writable via source (SEDI form) + `rfc_enabled` remote-enable; since v0.6.0) |
 | Source dependency prologue | ✅ Implemented (`/api/functions/:name/source?prologue=true` inlines compact signatures of `CALL FUNCTION` targets; since v0.5.0) |
 | Per-IP rate limiting | ✅ Implemented (optional `SAP_RATE_LIMIT_RPS`, `governor`-keyed limiter, 429 on excess) |
 | Per-RFC execution timeout | ✅ Implemented (`run_blocking_with_timeout` wraps `spawn_blocking` with `tokio::time::timeout`; default 60s / `SAP_REQUEST_TIMEOUT_SECS`, per-request `timeout_secs`, 504 on timeout) |

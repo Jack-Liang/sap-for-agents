@@ -1366,7 +1366,7 @@ fn split_object_path_opts(
     };
     let (type_seg, rest) = path.split_once('/').ok_or_else(|| bad("缺少类型段"))?;
     let obj_type = crate::objects::ObjectType::parse(type_seg)
-        .ok_or_else(|| bad("类型须为 prog/incl/class/intf/func/fugr/cds/package"))?;
+        .ok_or_else(|| bad("类型须为 prog/incl/class/intf/func/fugr/cds/tabl/package"))?;
     // action_optional（DELETE 语义）：整个 rest 都是对象名；误带的 action 尾段剥掉
     let (name, action) = if action_optional {
         let name = match rest.rsplit_once('/') {
@@ -1944,8 +1944,13 @@ mod tests {
         assert_eq!(t, crate::objects::ObjectType::CdsView);
         let (t, _, _) = split_object_path_opts("package/ZPKG", true).unwrap();
         assert_eq!(t, crate::objects::ObjectType::Package);
+        // 表类型别名（tabl/table/dtab）
+        let (t, _, _) = split_object_path_opts("tabl/ZAGW_T1/source", false).unwrap();
+        assert_eq!(t, crate::objects::ObjectType::Table);
+        let (t, _, _) = split_object_path_opts("table/ZT", true).unwrap();
+        assert_eq!(t, crate::objects::ObjectType::Table);
         // 非法类型
-        assert!(split_object_path("table/ZT/source").is_err());
+        assert!(split_object_path("foobar/ZT/source").is_err());
     }
 
     #[test]

@@ -43,7 +43,7 @@ curl -H "Authorization: Bearer <SAP_API_KEY>" http://127.0.0.1:3000/api/function
 | 想知道**什么在反复失败**（按错误类型 + 终止程序聚合） | `GET /api/dumps/grouped` |
 | 想看某个转储的调用栈/出错行/组件（免拉 45KB–1MB 的 ST22 正文） | `GET /api/dumps/{key}/detail` |
 | 想要原始的完整 ST22 正文（发生了什么/错误分析） | `GET /api/adt/runtime/dump/{key}/formatted` |
-| 想**创建** ABAP 对象（prog / incl / class / intf / func / fugr / cds / package），可顺带首版源码 | `POST /api/objects/{type}/{name}/create` |
+| 想**创建** ABAP 对象（prog / incl / class / intf / func / fugr / cds / tabl / package），可顺带首版源码 | `POST /api/objects/{type}/{name}/create` |
 | 想**修改** ABAP 代码（上列所有带源码的类型） | `PUT /api/objects/{type}/{name}/source` |
 | AI 式编辑（唯一匹配查找替换 + 自动激活） | `POST /api/objects/{type}/{name}/replace` |
 | 语法检查（**不写库**，源码内嵌提交） | `POST /api/objects/{type}/{name}/syntax` |
@@ -220,7 +220,7 @@ curl http://127.0.0.1:3000/api/dumps/20260824012009%20a4h/detail
 
 修改函数 / 类 / 程序 / 接口 / include / 函数组 / CDS 视图。网关在一次 HTTP 请求内跑完 ADT 写序列：**建立 stateful 会话 → LOCK → PUT 源码 → UNLOCK → 激活**；lockHandle 绝不跨请求（ADT 锁绑定 ABAP 会话，跨请求的柄必然失效）。
 
-`{type}` 取 `prog`（程序/报表）、`incl`（include）、`class`、`intf`（接口）、`func`（函数模块，组名自动经 RFC 搜索反解，也可显式传 `"group"`）、`fugr`（函数组）、`cds`（CDS/DDLS 视图，source 即 DDL 文本）、`package`（仅创建/删除——包没有源码）。
+`{type}` 取 `prog`（程序/报表）、`incl`（include）、`class`、`intf`（接口）、`func`（函数模块，组名自动经 RFC 搜索反解，也可显式传 `"group"`）、`fugr`（函数组）、`cds`（CDS/DDLS 视图，source 即 DDL 文本）、`tabl`（DDIC 透明表，source 为 `define table` DDL——见下方无锁写入说明）、`package`（仅创建/删除——包没有源码）。
 
 ```bash
 # AI 式编辑（推荐）：唯一匹配查找替换 + 激活
@@ -260,6 +260,7 @@ curl -X POST http://127.0.0.1:3000/api/objects/prog/ZMY_REPORT/syntax \
 - `syntax` 请求体：`source`。返回 `issues[]`：`severity`（E/W/…）、`line`、`offset`、`text`。
 - 响应里的 `activated.success` 是**逻辑结果**：激活失败时 HTTP 仍为 200，带 `activated.messages[]` / `problems[]`（"Line N: 文本"）——读它、改源码、重试。传输层错误（网络/会话）才走 4xx/5xx。
 - 锁冲突（他人正在编辑）→ 409 `OBJECT_LOCKED`，消息来自 SAP 原文。
+- **`tabl` 写入无锁（etag 乐观并发）**：源码化 DDIC 对象（透明表）完全不用 ADT 编辑锁——网关按 GET etag → PUT（`If-Match`）→ 激活 写入，没有 stateful 会话，也就没有 423 `InvalidLockHandle` 一族的问题。读与写之间被并发修改会以 412 `ETAG_CONFLICT` 暴露——重读源码再试即可。表源码是 `define table` DDL 形态（与 ADT 源码编辑器返回的一致），`syntax` 检查同样适用。DDL 需带注解（`@EndUserText.label`、`@AbapCatalog.enhancement.category`、`@AbapCatalog.tableCategory`、`@AbapCatalog.deliveryClass`、`@AbapCatalog.dataMaintenance`）——缺失会被以 "Can't save due to errors in source; execute check for details" 拒绝（跑一下 `POST .../syntax` 即可看到缺哪个）。
 - **函数模块签名可经源码写入（SEDI 形态）**：参数签名**内联写在 FUNCTION 语句里**——`FUNCTION zfm IMPORTING VALUE(iv) TYPE i EXPORTING VALUE(ev) TYPE i.` … `ENDFUNCTION.`——签名会注册进 FM 接口（已端到端实证）。网关也接受经典 `*" IMPORTING ...` 注释块形态（`/api/functions/{n}/source` 的返回形态）并自动转换。⚠️ 例外：**曾/现 rfc_enabled** 的模块接口被冻结——源码写得进、激活也成功，但参数变化被 SAP 忽略；改签名请删除重建（配合 `create` + `rfc_enabled` 成本很低）。
 - **`rfc_enabled: true`**（create / `PUT source` / `replace`，仅 func）：源码写完后，网关在同一把锁下 PUT 模块元数据（`fmodule:processingType="rfc"`，描述先读回再带上——该 PUT 是整文档替换）。新 FM 立即可经 `POST /api/rfc` 调用。
 - **创建走 ADT-first**：`POST /api/objects/{type}/{name}/create`（body：`description` 必填；可选 `devclass`（默认 `$TMP`）、`transport`、`software_component`（仅 package；缺省按 ZLOCAL→LOCAL→HOME 逐个试）、`source` 首版源码一步写入+激活）。网关按标准 ADT objectcreation XML 创建（Eclipse / vscode_abap_remote_fs / vibing-steampunk 同一契约）；`prog`/`func` 在 ADT 失败时回退 RFC RPY 插入路径。`func` 在组缺失时自动建 `fugr`（ADT 路径——ABAP Cloud Trial 上同样有效，绕开了 RFC 建组不写 TADIR 的限制）。更丝滑的形态：`PUT .../source` 与 `POST .../replace` 支持 `"create": true` + `"description"`——对象不存在时网关自动建壳并重试；建错的壳一个 `DELETE` 即可清掉。

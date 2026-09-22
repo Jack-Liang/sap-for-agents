@@ -140,9 +140,9 @@ pub fn tools_manifest() -> Vec<Value> {
         }),
         json!({
             "name": "write_source",
-            "description": "Write FULL source of an ABAP object (prog/incl/class/intf/func/fugr/cds) and activate. Destructive: overwrites everything. Pass create:true + description to create the object when missing. For func: FM parameter signatures are part of the source (write them inline in the FUNCTION statement: 'FUNCTION zfm IMPORTING VALUE(iv) TYPE string EXPORTING VALUE(ev) TYPE string. ... ENDFUNCTION.'); classic *\" comment blocks are converted automatically. rfc_enabled:true additionally marks the function module remote-enabled. For surgical edits prefer edit_code.",
+            "description": "Write FULL source of an ABAP object (prog/incl/class/intf/func/fugr/cds/tabl; tabl = DDIC table DDL source, 'define table ...' form) and activate. Destructive: overwrites everything. Pass create:true + description to create the object when missing. For func: FM parameter signatures are part of the source (write them inline in the FUNCTION statement: 'FUNCTION zfm IMPORTING VALUE(iv) TYPE string EXPORTING VALUE(ev) TYPE string. ... ENDFUNCTION.'); classic *\" comment blocks are converted automatically. rfc_enabled:true additionally marks the function module remote-enabled. For surgical edits prefer edit_code.",
             "inputSchema": { "type": "object", "properties": {
-                "type": { "type": "string", "enum": ["prog", "incl", "class", "intf", "func", "fugr", "cds"], "description": "Object type" },
+                "type": { "type": "string", "enum": ["prog", "incl", "class", "intf", "func", "fugr", "cds", "tabl"], "description": "Object type" },
                 "name": str_param("Object name (uppercase)"),
                 "source": str_param("Full ABAP source"),
                 "group": { "type": "string", "description": "Function group (func only; auto-resolved when omitted)" },
@@ -157,7 +157,7 @@ pub fn tools_manifest() -> Vec<Value> {
             "name": "edit_code",
             "description": "Surgical edit of an existing ABAP object: unique find-and-replace + activate. old_string must match exactly one place; CRLF differences are normalized and a case-insensitive unique fallback applies (SAP stores original case). Empty old_string only works on an empty/new object (with create:true it initializes a new object with new_string). rfc_enabled:true (func only) marks the module remote-enabled after the edit.",
             "inputSchema": { "type": "object", "properties": {
-                "type": { "type": "string", "enum": ["prog", "incl", "class", "intf", "func", "fugr", "cds"], "description": "Object type" },
+                "type": { "type": "string", "enum": ["prog", "incl", "class", "intf", "func", "fugr", "cds", "tabl"], "description": "Object type" },
                 "name": str_param("Object name"),
                 "old_string": str_param("Text to replace (match exactly one place; empty only for empty/new objects)"),
                 "new_string": str_param("Replacement text"),
@@ -170,9 +170,9 @@ pub fn tools_manifest() -> Vec<Value> {
         }),
         json!({
             "name": "create_object",
-            "description": "Create an ABAP object shell (prog/incl/class/intf/func/fugr/cds/package) via ADT. Optional 'source' writes+activates the first version in one call. package: devclass = parent package, software_component optional (candidates ZLOCAL/LOCAL/HOME tried in order).",
+            "description": "Create an ABAP object shell (prog/incl/class/intf/func/fugr/cds/tabl/package) via ADT. Optional 'source' writes+activates the first version in one call. package: devclass = parent package, software_component optional (candidates ZLOCAL/LOCAL/HOME tried in order).",
             "inputSchema": { "type": "object", "properties": {
-                "type": { "type": "string", "enum": ["prog", "incl", "class", "intf", "func", "fugr", "cds", "package"], "description": "Object type" },
+                "type": { "type": "string", "enum": ["prog", "incl", "class", "intf", "func", "fugr", "cds", "tabl", "package"], "description": "Object type" },
                 "name": str_param("Object name (uppercase)"),
                 "description": str_param("Object title / short text (required)"),
                 "devclass": { "type": "string", "description": "Package (default $TMP); for package type: parent package" },
@@ -187,7 +187,7 @@ pub fn tools_manifest() -> Vec<Value> {
             "name": "delete_object",
             "description": "Delete an ABAP object (lock → DELETE → done). Deleting a fugr removes its function modules too. Use for cleanup of scratch objects; irreversible.",
             "inputSchema": { "type": "object", "properties": {
-                "type": { "type": "string", "enum": ["prog", "incl", "class", "intf", "func", "fugr", "cds", "package"], "description": "Object type" },
+                "type": { "type": "string", "enum": ["prog", "incl", "class", "intf", "func", "fugr", "cds", "tabl", "package"], "description": "Object type" },
                 "name": str_param("Object name"),
                 "group": { "type": "string", "description": "Function group (func only)" },
                 "transport": { "type": "string", "description": "Transport request (optional)" }
@@ -202,7 +202,7 @@ pub fn tools_manifest() -> Vec<Value> {
             "name": "syntax_check",
             "description": "Syntax-check ABAP source WITHOUT storing it (object name anchors the check; use a Z name for scratch checks)",
             "inputSchema": { "type": "object", "properties": {
-                "type": { "type": "string", "enum": ["prog", "incl", "class", "intf", "func", "fugr", "cds"], "description": "Object type" },
+                "type": { "type": "string", "enum": ["prog", "incl", "class", "intf", "func", "fugr", "cds", "tabl"], "description": "Object type" },
                 "name": str_param("Object name (a Z name works for scratch checks)"),
                 "source": str_param("Full ABAP source to check")
             }, "required": ["type", "name", "source"] }
@@ -544,7 +544,7 @@ async fn call_tool(pool: SharedPool, name: &str, args: Value) -> Result<Value, R
                 code: -1,
                 status: 400,
                 message: format!(
-                    "type 必须是 prog/incl/class/intf/func/fugr/cds/package，收到: {otype}"
+                    "type 必须是 prog/incl/class/intf/func/fugr/cds/tabl/package，收到: {otype}"
                 ),
                 key: "OBJECT_TYPE_INVALID".into(),
             })?;
@@ -637,7 +637,7 @@ async fn call_tool(pool: SharedPool, name: &str, args: Value) -> Result<Value, R
                 code: -1,
                 status: 400,
                 message: format!(
-                    "type 必须是 prog/incl/class/intf/func/fugr/cds/package，收到: {otype}"
+                    "type 必须是 prog/incl/class/intf/func/fugr/cds/tabl/package，收到: {otype}"
                 ),
                 key: "OBJECT_TYPE_INVALID".into(),
             })?;

@@ -666,7 +666,7 @@ src/
 | 命名空间函数 `/NS/NAME` | ✅ 已实现（校验放行 + 通配路由分发，v0.4.10 起） |
 | ADT REST 代理 | ✅ 已实现（`/api/adt/**` 透传 + 写方法 CSRF 自动处理，v0.4.11 起） |
 | ST22 结构化分析 | ✅ 已实现（`/api/dumps` 列表/聚合/详情，解析自 ADT——免去几十万字节原始文本，v0.5.0 起） |
-| ABAP 代码修改 | ✅ 已实现（prog/incl/class/intf/func/fugr/cds/package 的 `PUT source` / `POST replace` / `POST syntax` / `GET source` / `POST create` / `DELETE`——专用 stateful 会话内完整锁→写→激活编排；ADT-first 创建 + RFC 回退，FM 签名可经源码写入（SEDI 形态）+ `rfc_enabled` 远程启用，v0.6.0 起） |
+| ABAP 代码修改 | ✅ 已实现（prog/incl/class/intf/func/fugr/cds/tabl/package 的 `PUT source` / `POST replace` / `POST syntax` / `GET source` / `POST create` / `DELETE`——专用 stateful 会话内完整锁→写→激活编排（tabl 走源码化 DDIC 的无锁 etag 乐观并发路径）；ADT-first 创建 + RFC 回退，FM 签名可经源码写入（SEDI 形态）+ `rfc_enabled` 远程启用，v0.6.0 起） |
 | 源码依赖前言 | ✅ 已实现（`/api/functions/:name/source?prologue=true` 内联 `CALL FUNCTION` 目标紧凑签名，v0.5.0 起） |
 | 按 IP 限流 | ✅ 已实现（可选 `SAP_RATE_LIMIT_RPS`，governor 键控限流器，超限 429） |
 | 单次 RFC 执行超时 | ✅ 已实现（`run_blocking_with_timeout` 用 `tokio::time::timeout` 包 `spawn_blocking`；默认 60s / `SAP_REQUEST_TIMEOUT_SECS`，单请求 `timeout_secs`，超时 504） |
