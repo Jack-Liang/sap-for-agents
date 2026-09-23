@@ -834,7 +834,7 @@ const SPEC_JSON: &str = r##"{
           "objects"
         ],
         "summary": "Read an object's source (ADT channel, original casing)",
-        "description": "type ∈ prog|incl|class|intf|func|fugr|cds|tabl (package has no source; tabl returns the DDIC table DDL source 'define table ...' form). For func the group is auto-resolved when not given. Returns lines[] plus the joined source string.",
+        "description": "type ∈ prog|incl|class|intf|func|fugr|cds|tabl (package has no source; tabl returns the DDIC table DDL 'define table ...' form; stru the structure DDL 'define structure ...'). For func the group is auto-resolved when not given. Returns lines[] plus the joined source string.",
         "parameters": [
           {
             "name": "type",
@@ -850,7 +850,8 @@ const SPEC_JSON: &str = r##"{
                 "func",
                 "fugr",
                 "cds",
-                "tabl"
+                "tabl",
+                "stru"
               ]
             }
           },
@@ -892,7 +893,7 @@ const SPEC_JSON: &str = r##"{
           "objects"
         ],
         "summary": "Write an object's full source (lock → put → unlock → activate, orchestrated)",
-        "description": "type ∈ prog|incl|class|intf|func|fugr|cds|tabl (tabl = DDIC table DDL source, written lock-free with etag optimistic concurrency); name may contain / (namespaced objects, e.g. /UI5/CL_X — OpenAPI cannot express multi-segment path params). Activation failure is a logical result (HTTP 200 + activated.messages), not a transport error. For func objects the function group is auto-resolved when not given; FM parameter signatures are part of the source (inline in the FUNCTION statement; classic *\" comment blocks are converted automatically); rfc_enabled:true additionally marks the module remote-enabled.",
+        "description": "type ∈ prog|incl|class|intf|func|fugr|cds|tabl (tabl/stru = DDIC table/structure DDL sources, written lock-free with etag optimistic concurrency); name may contain / (namespaced objects, e.g. /UI5/CL_X — OpenAPI cannot express multi-segment path params). Activation failure is a logical result (HTTP 200 + activated.messages), not a transport error. For func objects the function group is auto-resolved when not given; FM parameter signatures are part of the source (inline in the FUNCTION statement; classic *\" comment blocks are converted automatically); rfc_enabled:true additionally marks the module remote-enabled.",
         "parameters": [
           {
             "name": "type",
@@ -908,7 +909,8 @@ const SPEC_JSON: &str = r##"{
                 "func",
                 "fugr",
                 "cds",
-                "tabl"
+                "tabl",
+                "stru"
               ]
             }
           },
@@ -979,7 +981,8 @@ const SPEC_JSON: &str = r##"{
                 "func",
                 "fugr",
                 "cds",
-                "tabl"
+                "tabl",
+                "stru"
               ]
             }
           },
@@ -1050,7 +1053,8 @@ const SPEC_JSON: &str = r##"{
                 "func",
                 "fugr",
                 "cds",
-                "tabl"
+                "tabl",
+                "stru"
               ]
             }
           },
@@ -1136,7 +1140,7 @@ const SPEC_JSON: &str = r##"{
           "objects"
         ],
         "summary": "Create an object shell (ADT-first; prog/func fall back to RFC)",
-        "description": "type ∈ prog|incl|class|intf|func|fugr|cds|tabl|package. Creates the object via the standard ADT objectcreation XML (Eclipse/vsp/abapfs contract); prog/func fall back to the RFC RPY insert path when ADT fails. func auto-creates its function group when missing. package: devclass = parent package, software_component optional (candidates ZLOCAL→LOCAL→HOME). Optional `source` writes+activates the first version in one call; rfc_enabled marks a func remote-enabled.",
+        "description": "type ∈ prog|incl|class|intf|func|fugr|cds|tabl|stru|package. Creates the object via the standard ADT objectcreation XML (Eclipse/vsp/abapfs contract); prog/func fall back to the RFC RPY insert path when ADT fails. func auto-creates its function group when missing. package: devclass = parent package, software_component optional (candidates ZLOCAL→LOCAL→HOME). Optional `source` writes+activates the first version in one call; rfc_enabled marks a func remote-enabled.",
         "parameters": [
           {
             "name": "type",
@@ -1153,6 +1157,7 @@ const SPEC_JSON: &str = r##"{
                 "fugr",
                 "cds",
                 "tabl",
+                "stru",
                 "package"
               ]
             }
@@ -1238,7 +1243,7 @@ const SPEC_JSON: &str = r##"{
           "objects"
         ],
         "summary": "Delete an object (lock → DELETE → done)",
-        "description": "type ∈ prog|incl|class|intf|func|fugr|cds|tabl|package. Deleting a fugr removes its function modules too. Query params: group (func only), transport. Irreversible.",
+        "description": "type ∈ prog|incl|class|intf|func|fugr|cds|tabl|stru|package. Deleting a fugr removes its function modules too. Query params: group (func only), transport. Irreversible.",
         "parameters": [
           {
             "name": "type",
@@ -1255,6 +1260,7 @@ const SPEC_JSON: &str = r##"{
                 "fugr",
                 "cds",
                 "tabl",
+                "stru",
                 "package"
               ]
             }

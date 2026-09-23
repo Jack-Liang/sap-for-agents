@@ -43,7 +43,7 @@ curl -H "Authorization: Bearer <SAP_API_KEY>" http://127.0.0.1:3000/api/function
 | Want to know **what keeps failing** (dumps grouped by error type + program) | `GET /api/dumps/grouped` |
 | Want one dump's call stack / failing line / component (without the 45KB–1MB ST22 text) | `GET /api/dumps/{key}/detail` |
 | Want the raw full ST22 text (What happened/Error analysis) | `GET /api/adt/runtime/dump/{key}/formatted` |
-| Want to **create** an ABAP object (prog / incl / class / intf / func / fugr / cds / tabl / package), optionally with first source | `POST /api/objects/{type}/{name}/create` |
+| Want to **create** an ABAP object (prog / incl / class / intf / func / fugr / cds / tabl / stru / package), optionally with first source | `POST /api/objects/{type}/{name}/create` |
 | Want to **modify** ABAP code (any source-bearing type above) | `PUT /api/objects/{type}/{name}/source` |
 | Want AI-style editing (unique find-and-replace, verified) | `POST /api/objects/{type}/{name}/replace` |
 | Want to syntax-check source **without** writing it | `POST /api/objects/{type}/{name}/syntax` |
@@ -220,7 +220,7 @@ curl http://127.0.0.1:3000/api/dumps/20260824012009%20a4h/detail
 
 Edit functions / classes / programs / interfaces / includes / function groups / CDS views. The gateway runs the full ADT write sequence — **establish stateful session → LOCK → PUT source → UNLOCK → activate** — inside one HTTP request; the lock handle never crosses requests (ADT locks are bound to the ABAP session, so a cross-request handle is dead on arrival).
 
-`{type}` is one of `prog` (program/report), `incl` (include), `class`, `intf` (interface), `func` (function module; the group is resolved automatically via RFC search, or pass `"group"` explicitly), `fugr` (function group), `cds` (CDS/DDLS view; source = DDL text), `tabl` (DDIC transparent table; source = `define table` DDL — see the lock-free note below), `package` (create/delete only — packages have no source).
+`{type}` is one of `prog` (program/report), `incl` (include), `class`, `intf` (interface), `func` (function module; the group is resolved automatically via RFC search, or pass `"group"` explicitly), `fugr` (function group), `cds` (CDS/DDLS view; source = DDL text), `tabl` (DDIC transparent table; source = `define table` DDL) / `stru` (DDIC structure; source = `define structure` DDL) — both lock-free, see the note below, `package` (create/delete only — packages have no source).
 
 ```bash
 # AI-style editing (recommended): unique find-and-replace + activate
@@ -260,7 +260,7 @@ curl -X POST http://127.0.0.1:3000/api/objects/prog/ZMY_REPORT/syntax \
 - `syntax` body: `source`. Returns `issues[]` with `severity` (E/W/…), `line`, `offset`, `text`.
 - Response `activated.success` is the **logical** result: an activation failure is HTTP 200 with `activated.messages[]` / `problems[]` ("Line N: text") — read them, fix the source, retry. Transport errors (network, session) are 4xx/5xx as usual.
 - Lock conflict (someone else editing) → 409 `OBJECT_LOCKED` with SAP's own message.
-- **`tabl` writes are lock-free (etag optimistic concurrency)**: source-based DDIC objects (transparent tables) don't use ADT edit locks at all — the gateway writes them as GET etag → PUT (`If-Match`) → activate, so there is no stateful session and no 423 `InvalidLockHandle` family on this path. A concurrent modification between your read and write surfaces as 412 `ETAG_CONFLICT` — re-read the source and retry. The table source is the `define table` DDL form (same as the ADT source editor returns); `syntax` checks work on it too. The DDL needs its annotations (`@EndUserText.label`, `@AbapCatalog.enhancement.category`, `@AbapCatalog.tableCategory`, `@AbapCatalog.deliveryClass`, `@AbapCatalog.dataMaintenance`) — a missing one is rejected with "Can't save due to errors in source; execute check for details" (run `POST .../syntax` to see which).
+- **`tabl`/`stru` writes are lock-free (etag optimistic concurrency)**: source-based DDIC objects (transparent tables and structures) don't use ADT edit locks at all — the gateway writes them as GET etag → PUT (`If-Match`) → activate, so there is no stateful session and no 423 `InvalidLockHandle` family on this path. A concurrent modification between your read and write surfaces as 412 `ETAG_CONFLICT` — re-read the source and retry. Sources are DDL text (`define table ...` for tables, `define structure ...` for structures — the structure only needs `@EndUserText.label` + `@AbapCatalog.enhancement.category`; the table additionally needs `@AbapCatalog.tableCategory`, `@AbapCatalog.deliveryClass`, `@AbapCatalog.dataMaintenance`). A missing annotation is rejected with "Can't save due to errors in source; execute check for details" (run `POST .../syntax` to see which). ⚠️ Other DDIC types (domains, data elements, table types) are **structure-editor objects with no text source** on current releases — they are not supported by these endpoints; create them with the raw-proxy recipes in the subsection below instead.
 - **Function module signatures are writable via source (SEDI form)**: write the parameters **inline in the FUNCTION statement** — `FUNCTION zfm IMPORTING VALUE(iv) TYPE i EXPORTING VALUE(ev) TYPE i.` … `ENDFUNCTION.` — the signature registers in the FM interface (verified end-to-end). The gateway also accepts the classic `*" IMPORTING ...` comment block (as returned by `/api/functions/{n}/source`) and converts it automatically. ⚠️ Exception: modules that are (or ever were) **rfc_enabled** have a frozen interface — source writes succeed but parameter changes are ignored; delete + recreate to change the signature (cheap with `create` + `rfc_enabled`).
 - **`rfc_enabled: true`** (create/`PUT source`/`replace`, func only): after the source write, the gateway PUTs the module metadata (`fmodule:processingType="rfc"`, description carried over — the PUT replaces the whole document) under the same lock. The new FM is immediately callable through `POST /api/rfc`.
 - **Creation is ADT-first**: `POST /api/objects/{type}/{name}/create` (body: `description` required, optional `devclass` default `$TMP`, `transport`, `software_component` (package only; default ladder ZLOCAL→LOCAL→HOME), and `source` for a first write+activate in one call). The gateway posts the standard ADT objectcreation XML (the Eclipse/vscode_abap_remote_fs/vibing-steampunk contract); `prog`/`func` fall back to the RFC RPY insert path when ADT fails. `func` auto-creates its `fugr` when the group is missing (ADT path — this also works on ABAP Cloud trials, where the RFC group-insert registers nothing in TADIR). Even smoother: `PUT .../source` and `POST .../replace` accept `"create": true` + `"description"` — when the object is missing, the gateway creates the shell and retries automatically. Deleting a just-created shell is one `DELETE` away.
@@ -268,6 +268,87 @@ curl -X POST http://127.0.0.1:3000/api/objects/prog/ZMY_REPORT/syntax \
 - **Match tolerance in `replace`** (in order): exact → CRLF/LF normalization → trailing-`\n` trim (last-line anchors) → **case-insensitive unique match**. SAP stores the source in its original case while some read paths used to return an uppercased view — the fallback absorbs that drift. Multiple case-insensitive hits still fail with a count.
 - **Reads return the original case**: `/api/programs/{name}/source` now requests `WITH_LOWERCASE` — what you read is what is stored, so anchors taken from a previous read always match. `GET /api/objects/{type}/{name}/source` (ADT channel) is the canonical read for the new types and for function modules (SEDI form, matching what writes expect).
 - **Read-only deployments**: the deployer may run the gateway with `SAP_READ_ONLY=1` — write endpoints (`PUT .../source`, `POST .../replace`, `POST .../create`, `DELETE`, non-read `/api/adt` methods) then return 403 `READ_ONLY`. This is intentional: don't retry writes, stick to reads and `POST .../syntax` (still allowed, nothing is stored). `POST /api/rfc` is unaffected by the switch.
+
+### Structured DDIC types (doma / dtel / ttyp) via the raw proxy
+
+Domains, data elements and table types are **structure-editor objects** (no text source), so the `/api/objects` pipeline above does not cover them. They are creatable through the raw ADT proxy with the same philosophy as everything else — **the creation document IS the object document**: POST it to the collection, activate, and (lock-free) DELETE. All templates below verified end-to-end on ABAP Platform 816 (create → activate → `version="active"` → usable in ABAP → delete).
+
+```bash
+# 1) Create — POST the object document to the collection
+curl -X POST http://127.0.0.1:3000/api/adt/ddic/domains \
+  -H "Content-Type: application/*" -H "Accept: */*" -d @domain.xml
+
+# 2) Activate — same activation service as everything else
+curl -X POST "http://127.0.0.1:3000/api/adt/activation?method=activate&preauditRequested=true" \
+  -H "Content-Type: application/xml" -H "Accept: */*" \
+  -d '<?xml version="1.0" encoding="UTF-8"?><adtcore:objectReferences xmlns:adtcore="http://www.sap.com/adt/core"><adtcore:objectReference adtcore:uri="/sap/bc/adt/ddic/domains/zmy_dom" adtcore:name="ZMY_DOM"/></adtcore:objectReferences>'
+
+# 3) Delete (lock-free, like tabl/stru)
+curl -X DELETE http://127.0.0.1:3000/api/adt/ddic/domains/zmy_dom
+```
+
+**Domain** (`ddic/domains`; CHAR(10)) — root `doma:domain`, content carries the type:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<doma:domain xmlns:doma="http://www.sap.com/dictionary/domain" xmlns:adtcore="http://www.sap.com/adt/core"
+  adtcore:description="my domain" adtcore:name="ZMY_DOM" adtcore:type="DOMA/DD">
+  <adtcore:packageRef adtcore:name="$TMP"/>
+  <doma:content>
+    <doma:typeInformation><doma:datatype>CHAR</doma:datatype><doma:length>000010</doma:length><doma:decimals>000000</doma:decimals></doma:typeInformation>
+    <doma:outputInformation><doma:length>000010</doma:length><doma:style>00</doma:style><doma:conversionExit/><doma:signExists>false</doma:signExists><doma:lowercase>false</doma:lowercase><doma:ampmFormat>false</doma:ampmFormat></doma:outputInformation>
+    <doma:valueInformation><doma:valueTableRef/><doma:appendExists>false</doma:appendExists><doma:fixValues/></doma:valueInformation>
+  </doma:content>
+</doma:domain>
+```
+
+**Data element** (`ddic/dataelements`; references a domain) — root is `blue:wbobj` (namespace differs from domains!), child `dtel:dataElement`; all four label groups (short/medium/long/heading, each Label + Length + MaxLength) are required:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<blue:wbobj xmlns:blue="http://www.sap.com/wbobj/dictionary/dtel" xmlns:adtcore="http://www.sap.com/adt/core"
+  xmlns:dtel="http://www.sap.com/adt/dictionary/dataelements"
+  adtcore:description="my element" adtcore:name="ZMY_ELEM" adtcore:type="DTEL/DE">
+  <adtcore:packageRef adtcore:name="$TMP"/>
+  <dtel:dataElement>
+    <dtel:typeKind>domain</dtel:typeKind><dtel:typeName>ZMY_DOM</dtel:typeName>
+    <dtel:dataType>CHAR</dtel:dataType><dtel:dataTypeLength>000010</dtel:dataTypeLength><dtel:dataTypeDecimals>000000</dtel:dataTypeDecimals>
+    <dtel:shortFieldLabel>Id</dtel:shortFieldLabel><dtel:shortFieldLength>10</dtel:shortFieldLength><dtel:shortFieldMaxLength>10</dtel:shortFieldMaxLength>
+    <dtel:mediumFieldLabel>My Element</dtel:mediumFieldLabel><dtel:mediumFieldLength>15</dtel:mediumFieldLength><dtel:mediumFieldMaxLength>20</dtel:mediumFieldMaxLength>
+    <dtel:longFieldLabel>My Element</dtel:longFieldLabel><dtel:longFieldLength>20</dtel:longFieldLength><dtel:longFieldMaxLength>40</dtel:longFieldMaxLength>
+    <dtel:headingFieldLabel>My Element</dtel:headingFieldLabel><dtel:headingFieldLength>25</dtel:headingFieldLength><dtel:headingFieldMaxLength>55</dtel:headingFieldMaxLength>
+    <dtel:searchHelp/><dtel:searchHelpParameter/><dtel:setGetParameter/><dtel:defaultComponentName/>
+    <dtel:deactivateInputHistory>false</dtel:deactivateInputHistory><dtel:changeDocument>false</dtel:changeDocument>
+    <dtel:leftToRightDirection>false</dtel:leftToRightDirection><dtel:deactivateBIDIFiltering>false</dtel:deactivateBIDIFiltering>
+  </dtel:dataElement>
+</blue:wbobj>
+```
+
+**Table type** (`ddic/tabletypes`; standard table of a data element) — `rowType` and `primaryKey` children are fully required (`builtInType`, `kind`, …):
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<ttyp:tableType xmlns:ttyp="http://www.sap.com/dictionary/tabletype" xmlns:adtcore="http://www.sap.com/adt/core"
+  adtcore:description="my table type" adtcore:name="ZMY_TT" adtcore:type="TTYP/DA">
+  <adtcore:packageRef adtcore:name="$TMP"/>
+  <ttyp:rowType>
+    <ttyp:typeKind>dataElement</ttyp:typeKind><ttyp:typeName>ZMY_ELEM</ttyp:typeName>
+    <ttyp:builtInType><ttyp:dataType>CHAR</ttyp:dataType><ttyp:length>000010</ttyp:length><ttyp:decimals>000000</ttyp:decimals></ttyp:builtInType>
+    <ttyp:rangeType/>
+  </ttyp:rowType>
+  <ttyp:initialRowCount>00000</ttyp:initialRowCount>
+  <ttyp:accessType>standard</ttyp:accessType>
+  <ttyp:primaryKey ttyp:isVisible="true" ttyp:isEditable="true"><ttyp:definition>standard</ttyp:definition><ttyp:kind>nonUnique</ttyp:kind><ttyp:components ttyp:isVisible="false"/><ttyp:alias/></ttyp:primaryKey>
+  <ttyp:secondaryKeys ttyp:isVisible="true" ttyp:isEditable="true"><ttyp:allowed>notSpecified</ttyp:allowed></ttyp:secondaryKeys>
+</ttyp:tableType>
+```
+
+Tips:
+
+- A rejected document names exactly what's missing ("System expected the element '…'") — add it and retry; two or three iterations converge.
+- To modify an existing object: `GET` the document, edit the XML, `PUT` it back (same etag conventions as tabl/stru).
+- To learn the full shape of anything: `GET /api/adt/ddic/<collection>/<existing-name>` and copy from a live object (e.g. `domains/char10`, `dataelements/mtext_d`, `tabletypes/string_table`).
+- **Classic SE11 views have no usable path here**: `RPY_VIEW_INSERT` pops a dialog (`DYNPRO_SEND_IN_BACKGROUND`, background-unsafe) and ADT `ddic/views` is for **external HANA views** only. Use a CDS view entity (`POST /api/objects/cds/{name}/create`) instead — that is the modern replacement and fully supported.
 
 ## Key constraints (pitfalls to avoid)
 

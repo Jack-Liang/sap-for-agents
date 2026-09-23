@@ -91,6 +91,8 @@ pub enum ObjectType {
     CdsView,
     /// DDIC 透明表（源码化 DDIC「blue 对象」）：无编辑锁，etag 乐观并发
     Table,
+    /// DDIC 结构（同为 blue 对象，`define structure` 方言）：与表同一套契约
+    Structure,
     Package,
 }
 
@@ -107,9 +109,17 @@ impl ObjectType {
             "fugr" | "fgroup" | "group" => Some(Self::FunctionGroup),
             "cds" | "ddls" => Some(Self::CdsView),
             "tabl" | "table" | "dtab" => Some(Self::Table),
+            "stru" | "structure" => Some(Self::Structure),
             "package" | "pkg" | "devclass" => Some(Self::Package),
             _ => None,
         }
+    }
+
+    /// 是否源码化 DDIC「blue 对象」（表/结构）：走无锁 etag 写入通道。
+    /// 其余 DDIC 类型（域/数据元素/表类型/视图）是结构编辑器对象，
+    /// 无文本源码，不在此列（A4H 816 真机实证）。
+    pub fn is_blue_ddic(self) -> bool {
+        matches!(self, Self::Table | Self::Structure)
     }
 
     /// API 使用的规范类型名（响应 `type` 字段 / MCP 枚举）。
@@ -123,6 +133,7 @@ impl ObjectType {
             Self::FunctionGroup => "fugr",
             Self::CdsView => "cds",
             Self::Table => "tabl",
+            Self::Structure => "stru",
             Self::Package => "package",
         }
     }
@@ -138,6 +149,7 @@ impl ObjectType {
             Self::FunctionGroup => "FUGR/F",
             Self::CdsView => "DDLS/DF",
             Self::Table => "TABL/DT",
+            Self::Structure => "STRU/DT",
             Self::Package => "DEVC/K",
         }
     }
@@ -179,6 +191,7 @@ impl ObjectType {
             Self::FunctionGroup => format!("functions/groups/{}", self.url_name(name)),
             Self::CdsView => format!("ddic/ddl/sources/{}", self.url_name(name)),
             Self::Table => format!("ddic/tables/{}", self.url_name(name)),
+            Self::Structure => format!("ddic/structures/{}", self.url_name(name)),
             Self::Package => format!("packages/{}", self.url_name(name)),
         }
     }
@@ -230,11 +243,16 @@ impl ObjectType {
                 "ddl:ddlSource",
                 "http://www.sap.com/adt/ddic/ddlsources",
             ),
-            // 表是「源码化 DDIC」（blue 对象）：创建文档的根**就是** blueSource
-            // 本身（adtcore 属性 + packageRef 子元素）——发 tbl:table 根会被
-            // 要求内嵌 blueSource 而内嵌源码又不被接受（A4H 816 真机实证）
-            Self::Table => (
-                "ddic/tables".into(),
+            // 表/结构是「源码化 DDIC」（blue 对象）：创建文档的根**就是**
+            // blueSource 本身（adtcore 属性 + packageRef 子元素）——发 tbl:table
+            // 根会被要求内嵌 blueSource 而内嵌源码又不被接受（A4H 816 真机实证）。
+            // 结构的 DDL 方言是 define structure，表是 define table，其余契约一致。
+            Self::Table | Self::Structure => (
+                if matches!(self, Self::Table) {
+                    "ddic/tables".into()
+                } else {
+                    "ddic/structures".into()
+                },
                 "blue:blueSource",
                 "http://www.sap.com/wbobj/blue",
             ),
@@ -1067,7 +1085,7 @@ async fn create_object_adt(
 
     let (rel, _, _) = obj_type.creation(group);
     // blueSource 创建契约不含 responsible（服务端自动记创建用户），不带更稳
-    let responsible = if obj_type == ObjectType::Table {
+    let responsible = if obj_type.is_blue_ddic() {
         None
     } else {
         responsible
@@ -1524,9 +1542,9 @@ pub async fn write_object_source(
             key: "NO_SOURCE_RESOURCE".into(),
         });
     }
-    // 表（blue 对象）不走锁编排：etag 乐观并发，单独通道
-    if obj_type == ObjectType::Table {
-        return write_table_source(name, source, transport, activate).await;
+    // 表/结构（blue 对象）不走锁编排：etag 乐观并发，单独通道
+    if obj_type.is_blue_ddic() {
+        return write_ddic_source(obj_type, name, source, transport, activate).await;
     }
     let type_name = obj_type.api_name();
     let base = obj_type.base_rel(name, group);
@@ -1667,9 +1685,9 @@ pub async fn write_object_source(
     })
 }
 
-/// 表（blue 对象）写入编排：GET etag → PUT 源码 → 激活。**全程无锁**。
+/// 表/结构（blue 对象）写入编排：GET etag → PUT 源码 → 激活。**全程无锁**。
 ///
-/// DDIC 表是「源码化 DDIC」，ADT 对它不用编辑锁而用 etag 乐观并发——
+/// DDIC 表和结构是「源码化 DDIC」，ADT 对它们不用编辑锁而用 etag 乐观并发——
 /// 没有 stateful 会话、没有 lockHandle，也就没有 423 InvalidLockHandle 一族
 /// 的问题（与 prog/class 的锁编排是两套并发模型）。etag 有两个真机实证的
 /// 怪癖，都已在实现里吸收：
@@ -1680,15 +1698,16 @@ pub async fn write_object_source(
 ///
 /// 对象不存在时 GET 的错误经 [`adt_exception_error`] 归一为
 /// 409/ADT_ExceptionResourceNotFound，与锁编排路径同形态——
-/// `create:true` 的建壳重试因此对表同样生效。
-async fn write_table_source(
+/// `create:true` 的建壳重试因此对表/结构同样生效。
+async fn write_ddic_source(
+    obj_type: ObjectType,
     name: &str,
     source: &str,
     transport: Option<&str>,
     activate: bool,
 ) -> Result<WriteOutcome, RfcError> {
-    let base = ObjectType::Table.base_rel(name, "");
-    let source_rel = ObjectType::Table.source_rel(name, "");
+    let base = obj_type.base_rel(name, "");
+    let source_rel = obj_type.source_rel(name, "");
 
     // ① GET 现源拿 etag（裸 text/plain，与 PUT 的 Content-Type 同串）
     let get_resp = adt_request_raw(
@@ -1706,15 +1725,15 @@ async fn write_table_source(
     if !(200..300).contains(&get_resp.status) {
         let body = String::from_utf8_lossy(&get_resp.body).to_string();
         if body.contains("exc:exception") {
-            // 表缺失的 ADT 说法是 "Error while importing object X from the
+            // 对象缺失的 ADT 说法是 "Error while importing object X from the
             // database"——归一后 is_object_not_exist 可识别
-            return Err(adt_exception_error(&body, "读取表源码失败"));
+            return Err(adt_exception_error(&body, "读取 DDIC 源码失败"));
         }
         return Err(RfcError {
             code: -1,
             status: 502,
             message: format!(
-                "读取表源码失败（ADT 返回 {}）: {}",
+                "读取 DDIC 源码失败（ADT 返回 {}）: {}",
                 get_resp.status,
                 truncate(&body, 300)
             ),
@@ -1724,7 +1743,7 @@ async fn write_table_source(
     let etag = get_resp.etag.ok_or_else(|| RfcError {
         code: -1,
         status: 502,
-        message: "表源码读取成功但未返回 ETag（无法做乐观并发写入）".into(),
+        message: "DDIC 源码读取成功但未返回 ETag（无法做乐观并发写入）".into(),
         key: "ETAG_MISSING".into(),
     })?;
 
@@ -1761,7 +1780,7 @@ async fn write_table_source(
             code: -1,
             status,
             message: format!(
-                "写入表源码失败（ADT 返回 {}）: {}",
+                "写入 DDIC 源码失败（ADT 返回 {}）: {}",
                 put_resp.status,
                 truncate(&body, 300)
             ),
@@ -1778,7 +1797,7 @@ async fn write_table_source(
     };
 
     Ok(WriteOutcome {
-        obj_type: "tabl".to_string(),
+        obj_type: obj_type.api_name().to_string(),
         name: name_upper,
         group: None,
         source_url: source_rel,
@@ -1937,8 +1956,8 @@ pub async fn delete_object(
 ) -> Result<DeleteOutcome, RfcError> {
     let base = obj_type.base_rel(name, group);
     let mut warnings = Vec::new();
-    // 表（blue 对象）删除不需要编辑锁：无状态 DELETE 即可（真机实证 200）
-    if obj_type == ObjectType::Table {
+    // 表/结构（blue 对象）删除不需要编辑锁：无状态 DELETE 即可（真机实证 200）
+    if obj_type.is_blue_ddic() {
         let transport_used = transport
             .map(str::to_string)
             .filter(|t| !t.trim().is_empty());
@@ -2422,6 +2441,8 @@ mod tests {
         assert_eq!(ObjectType::parse("tabl"), Some(ObjectType::Table));
         assert_eq!(ObjectType::parse("TABLE"), Some(ObjectType::Table));
         assert_eq!(ObjectType::parse("dtab"), Some(ObjectType::Table));
+        assert_eq!(ObjectType::parse("stru"), Some(ObjectType::Structure));
+        assert_eq!(ObjectType::parse("STRUCTURE"), Some(ObjectType::Structure));
         assert_eq!(ObjectType::parse("package"), Some(ObjectType::Package));
         assert_eq!(ObjectType::parse("pkg"), Some(ObjectType::Package));
         assert_eq!(ObjectType::parse("foobar"), None);
@@ -2462,9 +2483,26 @@ mod tests {
         );
         assert!(ObjectType::Table.has_source());
         assert!(!ObjectType::Table.needs_group());
+        // 结构：ddic/structures 下，与表同为 blue 对象
+        assert_eq!(
+            ObjectType::Structure.base_rel("zagw_st1", ""),
+            "ddic/structures/ZAGW_ST1"
+        );
+        assert_eq!(
+            ObjectType::Structure.source_rel("zagw_st1", ""),
+            "ddic/structures/ZAGW_ST1/source/main"
+        );
+        assert!(ObjectType::Structure.has_source());
+        assert!(ObjectType::Table.is_blue_ddic());
+        assert!(ObjectType::Structure.is_blue_ddic());
+        assert!(!ObjectType::CdsView.is_blue_ddic());
         // 创建契约：根元素是 blue:blueSource（blue 对象，非 tbl:table）
         let (rel, root, ns) = ObjectType::Table.creation("");
         assert_eq!(rel, "ddic/tables");
+        assert_eq!(root, "blue:blueSource");
+        assert_eq!(ns, "http://www.sap.com/wbobj/blue");
+        let (rel, root, ns) = ObjectType::Structure.creation("");
+        assert_eq!(rel, "ddic/structures");
         assert_eq!(root, "blue:blueSource");
         assert_eq!(ns, "http://www.sap.com/wbobj/blue");
         assert_eq!(ObjectType::Package.base_rel("zpkg", ""), "packages/ZPKG");
@@ -2509,6 +2547,12 @@ mod tests {
         assert!(tbody.contains("adtcore:name=\"ZAGW_T1\""));
         assert!(tbody.contains("<adtcore:packageRef adtcore:name=\"ZPKG\"/>"));
         assert!(!tbody.contains("<tbl:table"));
+
+        // 结构：同一 blueSource 契约，仅类型 ID 与集合不同
+        let sbody = create_body_simple(ObjectType::Structure, "ZAGW_ST1", "", &spec, None);
+        assert!(sbody.contains("<blue:blueSource "));
+        assert!(sbody.contains("adtcore:type=\"STRU/DT\""));
+        assert!(sbody.contains("<adtcore:packageRef adtcore:name=\"ZPKG\"/>"));
     }
 
     #[test]

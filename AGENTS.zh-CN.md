@@ -43,7 +43,7 @@ curl -H "Authorization: Bearer <SAP_API_KEY>" http://127.0.0.1:3000/api/function
 | 想知道**什么在反复失败**（按错误类型 + 终止程序聚合） | `GET /api/dumps/grouped` |
 | 想看某个转储的调用栈/出错行/组件（免拉 45KB–1MB 的 ST22 正文） | `GET /api/dumps/{key}/detail` |
 | 想要原始的完整 ST22 正文（发生了什么/错误分析） | `GET /api/adt/runtime/dump/{key}/formatted` |
-| 想**创建** ABAP 对象（prog / incl / class / intf / func / fugr / cds / tabl / package），可顺带首版源码 | `POST /api/objects/{type}/{name}/create` |
+| 想**创建** ABAP 对象（prog / incl / class / intf / func / fugr / cds / tabl / stru / package），可顺带首版源码 | `POST /api/objects/{type}/{name}/create` |
 | 想**修改** ABAP 代码（上列所有带源码的类型） | `PUT /api/objects/{type}/{name}/source` |
 | AI 式编辑（唯一匹配查找替换 + 自动激活） | `POST /api/objects/{type}/{name}/replace` |
 | 语法检查（**不写库**，源码内嵌提交） | `POST /api/objects/{type}/{name}/syntax` |
@@ -220,7 +220,7 @@ curl http://127.0.0.1:3000/api/dumps/20260824012009%20a4h/detail
 
 修改函数 / 类 / 程序 / 接口 / include / 函数组 / CDS 视图。网关在一次 HTTP 请求内跑完 ADT 写序列：**建立 stateful 会话 → LOCK → PUT 源码 → UNLOCK → 激活**；lockHandle 绝不跨请求（ADT 锁绑定 ABAP 会话，跨请求的柄必然失效）。
 
-`{type}` 取 `prog`（程序/报表）、`incl`（include）、`class`、`intf`（接口）、`func`（函数模块，组名自动经 RFC 搜索反解，也可显式传 `"group"`）、`fugr`（函数组）、`cds`（CDS/DDLS 视图，source 即 DDL 文本）、`tabl`（DDIC 透明表，source 为 `define table` DDL——见下方无锁写入说明）、`package`（仅创建/删除——包没有源码）。
+`{type}` 取 `prog`（程序/报表）、`incl`（include）、`class`、`intf`（接口）、`func`（函数模块，组名自动经 RFC 搜索反解，也可显式传 `"group"`）、`fugr`（函数组）、`cds`（CDS/DDLS 视图，source 即 DDL 文本）、`tabl`（DDIC 透明表，source 为 `define table` DDL）/ `stru`（DDIC 结构，source 为 `define structure` DDL）——两者均无锁，见下方说明、`package`（仅创建/删除——包没有源码）。
 
 ```bash
 # AI 式编辑（推荐）：唯一匹配查找替换 + 激活
@@ -260,7 +260,7 @@ curl -X POST http://127.0.0.1:3000/api/objects/prog/ZMY_REPORT/syntax \
 - `syntax` 请求体：`source`。返回 `issues[]`：`severity`（E/W/…）、`line`、`offset`、`text`。
 - 响应里的 `activated.success` 是**逻辑结果**：激活失败时 HTTP 仍为 200，带 `activated.messages[]` / `problems[]`（"Line N: 文本"）——读它、改源码、重试。传输层错误（网络/会话）才走 4xx/5xx。
 - 锁冲突（他人正在编辑）→ 409 `OBJECT_LOCKED`，消息来自 SAP 原文。
-- **`tabl` 写入无锁（etag 乐观并发）**：源码化 DDIC 对象（透明表）完全不用 ADT 编辑锁——网关按 GET etag → PUT（`If-Match`）→ 激活 写入，没有 stateful 会话，也就没有 423 `InvalidLockHandle` 一族的问题。读与写之间被并发修改会以 412 `ETAG_CONFLICT` 暴露——重读源码再试即可。表源码是 `define table` DDL 形态（与 ADT 源码编辑器返回的一致），`syntax` 检查同样适用。DDL 需带注解（`@EndUserText.label`、`@AbapCatalog.enhancement.category`、`@AbapCatalog.tableCategory`、`@AbapCatalog.deliveryClass`、`@AbapCatalog.dataMaintenance`）——缺失会被以 "Can't save due to errors in source; execute check for details" 拒绝（跑一下 `POST .../syntax` 即可看到缺哪个）。
+- **`tabl`/`stru` 写入无锁（etag 乐观并发）**：源码化 DDIC 对象（透明表与结构）完全不用 ADT 编辑锁——网关按 GET etag → PUT（`If-Match`）→ 激活 写入，没有 stateful 会话，也就没有 423 `InvalidLockHandle` 一族的问题。读与写之间被并发修改会以 412 `ETAG_CONFLICT` 暴露——重读源码再试即可。源码是 DDL 文本（表 `define table ...`，结构 `define structure ...`——结构只需 `@EndUserText.label` + `@AbapCatalog.enhancement.category`，表还需 `@AbapCatalog.tableCategory`、`@AbapCatalog.deliveryClass`、`@AbapCatalog.dataMaintenance`），`syntax` 检查同样适用。缺注解会被以 "Can't save due to errors in source; execute check for details" 拒绝（跑一下 `POST .../syntax` 即可看到缺哪个）。⚠️ 其余 DDIC 类型（域、数据元素、表类型）在现行版本上是**结构编辑器对象、无文本源码**——本组端点不支持；请改用下方小节的裸代理配方创建。
 - **函数模块签名可经源码写入（SEDI 形态）**：参数签名**内联写在 FUNCTION 语句里**——`FUNCTION zfm IMPORTING VALUE(iv) TYPE i EXPORTING VALUE(ev) TYPE i.` … `ENDFUNCTION.`——签名会注册进 FM 接口（已端到端实证）。网关也接受经典 `*" IMPORTING ...` 注释块形态（`/api/functions/{n}/source` 的返回形态）并自动转换。⚠️ 例外：**曾/现 rfc_enabled** 的模块接口被冻结——源码写得进、激活也成功，但参数变化被 SAP 忽略；改签名请删除重建（配合 `create` + `rfc_enabled` 成本很低）。
 - **`rfc_enabled: true`**（create / `PUT source` / `replace`，仅 func）：源码写完后，网关在同一把锁下 PUT 模块元数据（`fmodule:processingType="rfc"`，描述先读回再带上——该 PUT 是整文档替换）。新 FM 立即可经 `POST /api/rfc` 调用。
 - **创建走 ADT-first**：`POST /api/objects/{type}/{name}/create`（body：`description` 必填；可选 `devclass`（默认 `$TMP`）、`transport`、`software_component`（仅 package；缺省按 ZLOCAL→LOCAL→HOME 逐个试）、`source` 首版源码一步写入+激活）。网关按标准 ADT objectcreation XML 创建（Eclipse / vscode_abap_remote_fs / vibing-steampunk 同一契约）；`prog`/`func` 在 ADT 失败时回退 RFC RPY 插入路径。`func` 在组缺失时自动建 `fugr`（ADT 路径——ABAP Cloud Trial 上同样有效，绕开了 RFC 建组不写 TADIR 的限制）。更丝滑的形态：`PUT .../source` 与 `POST .../replace` 支持 `"create": true` + `"description"`——对象不存在时网关自动建壳并重试；建错的壳一个 `DELETE` 即可清掉。
@@ -268,6 +268,87 @@ curl -X POST http://127.0.0.1:3000/api/objects/prog/ZMY_REPORT/syntax \
 - **replace 匹配容忍阶梯**（依次）：精确 → CRLF/LF 归一 → 末尾 `\n` 修剪（末行锚点）→ **大小写不敏感唯一匹配**。SAP 存储源码原文，而部分读取路径曾返回大写化视图——兜底吸收这个漂移；大小写不敏感多命中仍按命中数报错。
 - **读回保留原文大小写**：`/api/programs/{name}/source` 现以 `WITH_LOWERCASE` 请求——读到即存到，从读回内容取的锚点必然匹配。`GET /api/objects/{type}/{name}/source`（ADT 通道）是新类型与函数模块的规范读入口（SEDI 形态，与写入口径一致）。
 - **只读部署**：部署者可能以 `SAP_READ_ONLY=1` 运行网关——写端点（`PUT .../source`、`POST .../replace`、`POST .../create`、`DELETE`、`/api/adt` 非读方法）此时返回 403 `READ_ONLY`。这是刻意为之：不要重试写操作，改为只读操作与 `POST .../syntax`（仍可用，不落库）。`POST /api/rfc` 不受该开关影响。
+
+### 结构化 DDIC 类型（doma / dtel / ttyp）——经裸代理创建
+
+域、数据元素、表类型是**结构编辑器对象**（无文本源码），上面的 `/api/objects` 管线不覆盖它们。但可以经裸 ADT 代理创建，哲学与一切相同——**创建文档就是对象文档本身**：POST 到集合 → 激活 → （无锁）DELETE。以下模板全部在 ABAP Platform 816 上端到端实证（创建 → 激活 → `version="active"` → ABAP 可用 → 删除）。
+
+```bash
+# 1) 创建——把对象文档 POST 到集合
+curl -X POST http://127.0.0.1:3000/api/adt/ddic/domains \
+  -H "Content-Type: application/*" -H "Accept: */*" -d @domain.xml
+
+# 2) 激活——与所有对象同一个激活服务
+curl -X POST "http://127.0.0.1:3000/api/adt/activation?method=activate&preauditRequested=true" \
+  -H "Content-Type: application/xml" -H "Accept: */*" \
+  -d '<?xml version="1.0" encoding="UTF-8"?><adtcore:objectReferences xmlns:adtcore="http://www.sap.com/adt/core"><adtcore:objectReference adtcore:uri="/sap/bc/adt/ddic/domains/zmy_dom" adtcore:name="ZMY_DOM"/></adtcore:objectReferences>'
+
+# 3) 删除（无锁，同 tabl/stru）
+curl -X DELETE http://127.0.0.1:3000/api/adt/ddic/domains/zmy_dom
+```
+
+**域**（`ddic/domains`；CHAR(10)）——根元素 `doma:domain`，content 承载类型定义：
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<doma:domain xmlns:doma="http://www.sap.com/dictionary/domain" xmlns:adtcore="http://www.sap.com/adt/core"
+  adtcore:description="my domain" adtcore:name="ZMY_DOM" adtcore:type="DOMA/DD">
+  <adtcore:packageRef adtcore:name="$TMP"/>
+  <doma:content>
+    <doma:typeInformation><doma:datatype>CHAR</doma:datatype><doma:length>000010</doma:length><doma:decimals>000000</doma:decimals></doma:typeInformation>
+    <doma:outputInformation><doma:length>000010</doma:length><doma:style>00</doma:style><doma:conversionExit/><doma:signExists>false</doma:signExists><doma:lowercase>false</doma:lowercase><doma:ampmFormat>false</doma:ampmFormat></doma:outputInformation>
+    <doma:valueInformation><doma:valueTableRef/><doma:appendExists>false</doma:appendExists><doma:fixValues/></doma:valueInformation>
+  </doma:content>
+</doma:domain>
+```
+
+**数据元素**（`ddic/dataelements`；引用域）——根是 `blue:wbobj`（命名空间与域不同！），子元素 `dtel:dataElement`；四组字段标签（short/medium/long/heading，各需 Label + Length + MaxLength）**全部必填**：
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<blue:wbobj xmlns:blue="http://www.sap.com/wbobj/dictionary/dtel" xmlns:adtcore="http://www.sap.com/adt/core"
+  xmlns:dtel="http://www.sap.com/adt/dictionary/dataelements"
+  adtcore:description="my element" adtcore:name="ZMY_ELEM" adtcore:type="DTEL/DE">
+  <adtcore:packageRef adtcore:name="$TMP"/>
+  <dtel:dataElement>
+    <dtel:typeKind>domain</dtel:typeKind><dtel:typeName>ZMY_DOM</dtel:typeName>
+    <dtel:dataType>CHAR</dtel:dataType><dtel:dataTypeLength>000010</dtel:dataTypeLength><dtel:dataTypeDecimals>000000</dtel:dataTypeDecimals>
+    <dtel:shortFieldLabel>Id</dtel:shortFieldLabel><dtel:shortFieldLength>10</dtel:shortFieldLength><dtel:shortFieldMaxLength>10</dtel:shortFieldMaxLength>
+    <dtel:mediumFieldLabel>My Element</dtel:mediumFieldLabel><dtel:mediumFieldLength>15</dtel:mediumFieldLength><dtel:mediumFieldMaxLength>20</dtel:mediumFieldMaxLength>
+    <dtel:longFieldLabel>My Element</dtel:longFieldLabel><dtel:longFieldLength>20</dtel:longFieldLength><dtel:longFieldMaxLength>40</dtel:longFieldMaxLength>
+    <dtel:headingFieldLabel>My Element</dtel:headingFieldLabel><dtel:headingFieldLength>25</dtel:headingFieldLength><dtel:headingFieldMaxLength>55</dtel:headingFieldMaxLength>
+    <dtel:searchHelp/><dtel:searchHelpParameter/><dtel:setGetParameter/><dtel:defaultComponentName/>
+    <dtel:deactivateInputHistory>false</dtel:deactivateInputHistory><dtel:changeDocument>false</dtel:changeDocument>
+    <dtel:leftToRightDirection>false</dtel:leftToRightDirection><dtel:deactivateBIDIFiltering>false</dtel:deactivateBIDIFiltering>
+  </dtel:dataElement>
+</blue:wbobj>
+```
+
+**表类型**（`ddic/tabletypes`；数据元素的标准表）——`rowType` 与 `primaryKey` 的子元素是全量必填（`builtInType`、`kind`……）：
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<ttyp:tableType xmlns:ttyp="http://www.sap.com/dictionary/tabletype" xmlns:adtcore="http://www.sap.com/adt/core"
+  adtcore:description="my table type" adtcore:name="ZMY_TT" adtcore:type="TTYP/DA">
+  <adtcore:packageRef adtcore:name="$TMP"/>
+  <ttyp:rowType>
+    <ttyp:typeKind>dataElement</ttyp:typeKind><ttyp:typeName>ZMY_ELEM</ttyp:typeName>
+    <ttyp:builtInType><ttyp:dataType>CHAR</ttyp:dataType><ttyp:length>000010</ttyp:length><ttyp:decimals>000000</ttyp:decimals></ttyp:builtInType>
+    <ttyp:rangeType/>
+  </ttyp:rowType>
+  <ttyp:initialRowCount>00000</ttyp:initialRowCount>
+  <ttyp:accessType>standard</ttyp:accessType>
+  <ttyp:primaryKey ttyp:isVisible="true" ttyp:isEditable="true"><ttyp:definition>standard</ttyp:definition><ttyp:kind>nonUnique</ttyp:kind><ttyp:components ttyp:isVisible="false"/><ttyp:alias/></ttyp:primaryKey>
+  <ttyp:secondaryKeys ttyp:isVisible="true" ttyp:isEditable="true"><ttyp:allowed>notSpecified</ttyp:allowed></ttyp:secondaryKeys>
+</ttyp:tableType>
+```
+
+要点：
+
+- 被拒的文档会**点名缺失项**（"System expected the element '…'"）——补上重试，两三轮即收敛。
+- 修改已有对象：`GET` 文档 → 改 XML → `PUT` 回去（etag 约定与 tabl/stru 相同）。
+- 想学任何对象的完整形态：`GET /api/adt/ddic/<集合>/<已有名>`，照抄活对象（如 `domains/char10`、`dataelements/mtext_d`、`tabletypes/string_table`）。
+- **经典 SE11 视图在此无路可走**：`RPY_VIEW_INSERT` 弹窗（`DYNPRO_SEND_IN_BACKGROUND`，后台不可用），ADT 的 `ddic/views` 只管**外部 HANA 视图**。用 CDS 视图实体（`POST /api/objects/cds/{name}/create`）替代——那是现代正解且已完整支持。
 
 ## 关键约束（避坑）
 
