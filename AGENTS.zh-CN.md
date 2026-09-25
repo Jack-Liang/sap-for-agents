@@ -36,7 +36,7 @@ curl -H "Authorization: Bearer <SAP_API_KEY>" http://127.0.0.1:3000/api/function
 | 想查最近的调用历史排障（别名、函数、耗时、IP） | `GET /api/invokes/audit` |
 | 新会话先**自描述**：网关版本/commit、能力开关（鉴权/只读/ADT/注册表/限流）、SAP sysid 与 release | `GET /api/version`（公开） |
 | 不知道有哪些函数 → 按名字模糊搜索 | `POST /api/functions/search` |
-| 知道函数名，想知道参数怎么填 | `GET /api/functions/{name}` |
+| 知道函数名，想知道参数怎么填（永远新鲜——服务器端实时读） | `GET /api/functions/{name}` |
 | 想读函数的完整文档（用途、示例） | `GET /api/functions/{name}/doc` |
 | 想查某张表/结构有哪些字段 | `GET /api/ddic/type/{name}` |
 | 想理解某个字段的含义、合法取值 | `GET /api/ddic/field/{table}/{field}` |
@@ -113,7 +113,7 @@ curl -X DELETE 'http://127.0.0.1:3000/api/registry/z_calc?purge=true' # 物理�
 
 #### 交付端口：`POST /api/invokes/{alias}`（扁平 JSON 进 / 扁平 JSON 出）
 
-published（或 draft）条目可被**外部系统零 SAP 方言**调用——不用大写参数约定、不用声明怎么读输出。契约每次调用从函数的**接口元数据**派生（网关之外发生的漂移自然跟随；经本网关改参数签名则需重启网关才可见新参数——SDK 元数据缓存，见写入章节）：
+published（或 draft）条目可被**外部系统零 SAP 方言**调用——不用大写参数约定、不用声明怎么读输出。契约每次调用**实时读 SAP 服务器接口**（`FUNCTION_IMPORT_INTERFACE`）派生——无论漂移来自哪里（SE37 手改、经本网关删库重建）都立即跟随。执行侧仍按 SDK 描述符缓存编组：当契约触碰 SDK 尚不认识的参数（网关启动后签名变过）时，调用返回 `409 SIGNATURE_STALE` 提示重启网关，而不是按旧签名静默错读错写（见写入章节）：
 
 ```bash
 # 前端/其他语言的消费方调用注册接口——这就是全部的 API：
@@ -152,12 +152,14 @@ curl http://127.0.0.1:3000/api/functions/BAPI_USER_GETLIST
 
 返回该函数的**全部参数**，每个参数含：
 - `name`：参数名（**传入时必须用这个原样大写名**）
-- `type`：`CHAR` / `INT` / `STRUCTURE` / `TABLE` / `BCD` / `DATE` ...
+- `type`：`CHAR` / `INT` / `STRUCTURE` / `TABLE` / `BCD` / `DATE` ... 或 `ELEMENT`（见下）
 - `direction`：`IMPORT`（你要填）/ `EXPORT`（返回值）/ `TABLES`（可进可出）
 - `length`：字符长度（CHAR/NUM/DATE 等）
 - `optional`：是否可省略
 - `description`：参数说明
 - `fields`：若为 STRUCTURE/TABLE，列出嵌套字段
+
+接口元数据**实时读 SAP 服务器**（`FUNCTION_IMPORT_INTERFACE`，响应字段 `interface_via: "fii"`）——无论签名是经本网关改的还是别人在 SE37 手改的，都**立即**反映。SDK 描述符已认识的参数带精确类型/长度/字段；**新增**参数（SDK 缓存慢一步）做尽力映射：ABAP 内建字面量（`I`→`INT`、`STRING`、`D`→`DATE`…）精确对应，结构体/表经 DDIC 解析出字段清单，其余显示 `type: "ELEMENT"`、引用对象写进 `description`（如 `TYPE BAPIEXTUIDGET`）。网关重启后 SDK 视图跟上，精确类型自然出现。
 
 > 支持带命名空间的函数名（含 `/`，如 `/SDF/EWA_GET_ABAP_DUMPS`）。
 > URL 路径中原始形式（`/api/functions//SDF/EWA_GET_ABAP_DUMPS`）与
@@ -314,14 +316,14 @@ curl -X POST http://127.0.0.1:3000/api/objects/prog/ZMY_REPORT/syntax \
 ```
 
 - **`doc` 字段（仅 func，v0.14）**：`create`/`PUT source`/`replace` 接受 `doc` —— 面向消费方的 Markdown 文档，存入注册表条目并渲染进 OpenAPI 目录。文档随代码走：带新 `doc` 重写即更新条目；不带则保留已有。（当前 release 的 SE37 长文本没有远程写通道——注册表条目就是文档的存放地。）
-- **写后一致性（v0.14）**：函数写入/删除成功后，网关清元数据缓存并排干空闲 RFC 连接——下一次接口自省/调用立刻看到新签名。剩余注意点：SAP SDK 的进程级描述符缓存无法在进程内失效——**参数签名变更**（含删除后重建）在网关重启前对 `/api/rfc` 与 `/api/invokes` 不可见。正文/逻辑修改不受影响（值走活连接）；被缓存的只有参数清单。ADT 通道读取如 `GET /api/objects/func/{n}/source` 永远新鲜。
+- **写后一致性（v0.14 + v0.15）**：函数写入/删除成功后，网关清元数据缓存并排干空闲 RFC 连接。v0.15 起**契约面永远新鲜**：`GET /api/functions/{n}`、`POST /api/invokes/{alias}` 的契约派生、OpenAPI 目录、MCP `get_function_interface` 全部实时读 SAP 服务器接口（`FUNCTION_IMPORT_INTERFACE`）——签名变更（含删除后重建、SE37 手改）立即可见。剩余硬限制在**执行侧**：SAP SDK 的进程级描述符缓存无法在进程内失效，网关启动后改过**参数签名**的函数仍按旧编组视图调用。网关会检测这一点（契约 vs SDK 视图）并拒绝瞎猜：`POST /api/invokes/{alias}` → `409 SIGNATURE_STALE`，`/api/rfc` 的参数错误附带重启提示。正文/逻辑修改不受影响（值走活连接）；被缓存的只有参数清单。tabl/stru 写入/删除也会清网关的 DDIC 字段缓存（`GET /api/ddic/type/{n}`）。
 - `replace` 请求体：`old_string` / `new_string`（可选 `transport`、`activate`（默认 true）、`group`、`rfc_enabled`、`doc`）。`old_string` 必须精确匹配**唯一一处**（0 处 → 先读当前源码；多处 → 带更多上下文行；`\r\n`/`\n` 差异自动归一化）。空 `old_string` 仅对空对象有效。
 - `PUT /source` 请求体：`source`（全量源码）+ 同上可选字段。
 - `syntax` 请求体：`source`。返回 `issues[]`：`severity`（E/W/…）、`line`、`offset`、`text`。
 - 响应里的 `activated.success` 是**逻辑结果**：激活失败时 HTTP 仍为 200，带 `activated.messages[]` / `problems[]`（"Line N: 文本"）——读它、改源码、重试。传输层错误（网络/会话）才走 4xx/5xx。
 - 锁冲突（他人正在编辑）→ 409 `OBJECT_LOCKED`，消息来自 SAP 原文。
 - **`tabl`/`stru` 写入无锁（etag 乐观并发）**：源码化 DDIC 对象（透明表与结构）完全不用 ADT 编辑锁——网关按 GET etag → PUT（`If-Match`）→ 激活 写入，没有 stateful 会话，也就没有 423 `InvalidLockHandle` 一族的问题。读与写之间被并发修改会以 412 `ETAG_CONFLICT` 暴露——重读源码再试即可。源码是 DDL 文本（表 `define table ...`，结构 `define structure ...`——结构只需 `@EndUserText.label` + `@AbapCatalog.enhancement.category`，表还需 `@AbapCatalog.tableCategory`、`@AbapCatalog.deliveryClass`、`@AbapCatalog.dataMaintenance`），`syntax` 检查同样适用。缺注解会被以 "Can't save due to errors in source; execute check for details" 拒绝（跑一下 `POST .../syntax` 即可看到缺哪个）。⚠️ 其余 DDIC 类型（域、数据元素、表类型）在现行版本上是**结构编辑器对象、无文本源码**——本组端点不支持；请改用下方小节的裸代理配方创建。
-- **函数模块签名可经源码写入（SEDI 形态）**：参数签名**内联写在 FUNCTION 语句里**——`FUNCTION zfm IMPORTING VALUE(iv) TYPE i EXPORTING VALUE(ev) TYPE i.` … `ENDFUNCTION.`——签名会注册进 FM 接口（已端到端实证）。网关也接受经典 `*" IMPORTING ...` 注释块形态（`/api/functions/{n}/source` 的返回形态）并自动转换。⚠️ 例外：**曾/现 rfc_enabled** 的模块接口被冻结——源码写得进、激活也成功，但参数变化被 SAP 忽略；改签名请删除重建（配合 `create` + `rfc_enabled` 成本很低）。
+- **函数模块签名可经源码写入（SEDI 形态）**：参数签名**内联写在 FUNCTION 语句里**——`FUNCTION zfm IMPORTING VALUE(iv) TYPE i EXPORTING VALUE(ev) TYPE i.` … `ENDFUNCTION.`——签名会注册进 FM 接口（已端到端实证）。网关也接受经典 `*" IMPORTING ...` 注释块形态（`/api/functions/{n}/source` 的返回形态）并自动转换。⚠️ 例外：**曾/现 rfc_enabled** 的模块接口被冻结——源码写得进、激活也成功，但参数变化被 SAP 忽略；改签名请删除重建（配合 `create` + `rfc_enabled` 成本很低）。删除重建改签名后，接口读取立即新鲜，但调用需重启网关（见下方写后一致性）。
 - **`rfc_enabled: true`**（create / `PUT source` / `replace`，仅 func）：源码写完后，网关在同一把锁下 PUT 模块元数据（`fmodule:processingType="rfc"`，描述先读回再带上——该 PUT 是整文档替换）。新 FM 立即可经 `POST /api/rfc` 调用。
 - **创建走 ADT-first**：`POST /api/objects/{type}/{name}/create`（body：`description` 必填；可选 `devclass`（默认 `$TMP`）、`transport`、`software_component`（仅 package；缺省按 ZLOCAL→LOCAL→HOME 逐个试）、`source` 首版源码一步写入+激活）。网关按标准 ADT objectcreation XML 创建（Eclipse / vscode_abap_remote_fs / vibing-steampunk 同一契约）；`prog`/`func` 在 ADT 失败时回退 RFC RPY 插入路径。`func` 在组缺失时自动建 `fugr`（ADT 路径——ABAP Cloud Trial 上同样有效，绕开了 RFC 建组不写 TADIR 的限制）。更丝滑的形态：`PUT .../source` 与 `POST .../replace` 支持 `"create": true` + `"description"`——对象不存在时网关自动建壳并重试；建错的壳一个 `DELETE` 即可清掉。
 - 写入需 ADT 已启用；写入失败也会尽力 UNLOCK，不留孤儿锁。
@@ -424,7 +426,7 @@ curl -X DELETE http://127.0.0.1:3000/api/adt/ddic/domains/zmy_dom
 10. **限流**：设了 `SAP_RATE_LIMIT_RPS` 时，`/api` 按调用方 IP 限速；超限返回 `429`（`key=RATE_LIMITED`）。默认不限流。
 11. **源码端点自动降级 ADT**：`/api/functions/{name}/source` 与 `/api/programs/{name}/source` 先走 RFC（`RPY_FUNCTIONMODULE_READ` / `RPY_PROGRAM_READ`），失败（NOT_FOUND 除外）自动改走 ADT 重读，响应的 `source_via` 字段标明来源（`rfc` / `adt`）。背景：源码行宽超 72 字符（现代 ABAP 常见）在部分系统上会让 RPY 路径直接报错。
 12. **激活失败不是 HTTP 错误**：写入端点在 SAP 拒绝激活时返回 200 + `activated.success=false` + `problems[]`——必须检查响应体里的 `activated` 字段。
-13. **函数模块签名写在源码里（SEDI 形态）**：新版 ADT 系统把 FM 参数签名**内联存在 FUNCTION 语句里**——`FUNCTION zfm IMPORTING VALUE(iv) TYPE i EXPORTING VALUE(ev) TYPE i.`——并**拒绝**经典 `*" IMPORTING ...` 注释块（400 "Parameter comment blocks are not allowed"）。网关写入时自动转换经典块；RFC 读端点（`/api/functions/{n}/source`）返回的仍是经典形态——做读改写时优先用 `GET /api/objects/func/{n}/source`（ADT 形态）。签名变更**会**注册进 FM 接口——**例外**：曾/现 `rfc_enabled` 的模块接口冻结（SAP 忽略源码级签名变更），改签名请删除重建。
+13. **函数模块签名写在源码里（SEDI 形态）**：新版 ADT 系统把 FM 参数签名**内联存在 FUNCTION 语句里**——`FUNCTION zfm IMPORTING VALUE(iv) TYPE i EXPORTING VALUE(ev) TYPE i.`——并**拒绝**经典 `*" IMPORTING ...` 注释块（400 "Parameter comment blocks are not allowed"）。网关写入时自动转换经典块；RFC 读端点（`/api/functions/{n}/source`）返回的仍是经典形态——做读改写时优先用 `GET /api/objects/func/{n}/source`（ADT 形态）。签名变更**会**注册进 FM 接口——**例外**：曾/现 `rfc_enabled` 的模块接口冻结（SAP 忽略源码级签名变更），改签名请删除重建。改过签名之后，接口读取立即新鲜，但**调用**该函数在网关重启前会得到 `409 SIGNATURE_STALE`（交付端口）或带重启提示的参数错误（`/api/rfc`）——签名类写入完成后请重启网关。
 
 ## 典型任务示例
 

@@ -351,11 +351,11 @@ async fn call_tool(pool: SharedPool, name: &str, args: Value) -> Result<Value, R
             let fname = req_str(&args, "name")?.to_uppercase();
             crate::api::validate_func_name(&fname)?;
             let resp_name = fname.clone();
-            let params = crate::server::run_blocking(pool, move |conn| {
+            let view = crate::server::run_blocking(pool, move |conn| {
                 crate::server::collect_function_params(conn, &fname)
             })
             .await?;
-            Ok(json!({ "name": resp_name, "params": params }))
+            Ok(json!({ "name": resp_name, "params": view.params }))
         }
         "get_function_doc" => {
             let fname = req_str(&args, "name")?.to_uppercase();
@@ -666,10 +666,7 @@ async fn call_tool(pool: SharedPool, name: &str, args: Value) -> Result<Value, R
             Ok(serde_json::to_value(outcome).unwrap_or_default())
         }
         "list_registry_apis" => {
-            let q = args
-                .get("q")
-                .and_then(|v| v.as_str())
-                .map(String::from);
+            let q = args.get("q").and_then(|v| v.as_str()).map(String::from);
             let include_deleted = args
                 .get("include_deleted")
                 .and_then(|v| v.as_bool())

@@ -319,7 +319,10 @@ pub fn app(pool: SharedPool) -> Router {
                 .delete(object_delete_handler),
         )
         // ADT REST 通用代理（dump 正文、类/程序源码等，任何方法透传）
-        .route("/api/adt/{*path}", axum::routing::any(crate::adt::adt_proxy))
+        .route(
+            "/api/adt/{*path}",
+            axum::routing::any(crate::adt::adt_proxy),
+        )
         .layer(axum::middleware::from_fn(read_only_guard))
         .layer(axum::middleware::from_fn(runtime_mode_guard))
         .layer(axum::middleware::from_fn(crate::auth::require_api_key))
@@ -330,10 +333,7 @@ pub fn app(pool: SharedPool) -> Router {
         .route("/ready", axum::routing::get(ready_handler))
         // /api/version 同样公开：Agent 拿不到 token 前也需要知道"要不要 token"
         // （capabilities.auth）。挂在公开侧使其不受 require_api_key 拦截。
-        .route(
-            "/api/version",
-            axum::routing::get(version_handler),
-        )
+        .route("/api/version", axum::routing::get(version_handler))
         .route("/metrics", axum::routing::get(metrics_handler))
         .merge(api)
         .fallback(fallback_handler)
@@ -825,7 +825,17 @@ pub(crate) async fn run_invoke_and_log(
             );
             Ok(Json(resp))
         }
-        Err(e) => {
+        Err(mut e) => {
+            // 「字段不存在」类错误附加签名漂移提示：SDK 描述符缓存进程级不可失效，
+            // 函数签名在网关启动后变过时，设/读新参数都会报这个错——给出路标
+            // 而不是让调用方对着裸 SDK 错误猜。
+            if e.key == "RFC_INVALID_PARAMETER" && e.message.contains("not found") {
+                e.message.push_str(&format!(
+                    "（若 {} 的签名近期变更过：网关 SDK 描述符缓存仍持旧接口，\
+                     重启网关后重试；实时接口见 GET /api/functions/{}）",
+                    func_name, func_name
+                ));
+            }
             record_audit(AuditRecord {
                 at: crate::registry::now_iso8601_public(),
                 via: audit_via,
@@ -946,7 +956,7 @@ async fn openapi_dynamic_handler(
             .map(|n| {
                 let r = collect_function_params(conn, n);
                 let op = match r {
-                    Ok(params) => crate::openapi::function_operation(n, &params),
+                    Ok(view) => crate::openapi::function_operation(n, &view.params),
                     Err(e) => crate::openapi::function_operation_failed(n, &e.message),
                 };
                 (n.clone(), op)
@@ -1080,32 +1090,204 @@ async fn function_interface_handler(
     let result = run_blocking(pool, move |conn| collect_function_params(conn, &name)).await?;
     Ok(Json(FunctionInterface {
         name: req_name,
-        params: result,
+        params: result.params,
+        interface_via: Some(result.via),
     }))
 }
 
-/// 拉取函数参数元数据并展开嵌套字段（接口端点与动态 OpenAPI 生成共用）。
+/// 接口视图：参数列表 + 服务通道。
+///
+/// - `via = "fii"`：`FUNCTION_IMPORT_INTERFACE` 服务器端实时读（v0.15 起），
+///   签名变更（含 SE37 手改、删库重建）即时可见；
+/// - `via = "sdk"`：SDK 描述符（进程级缓存）——FII 不可用时的降级通道。
+#[derive(Debug)]
+pub(crate) struct InterfaceView {
+    pub params: Vec<FunctionParam>,
+    pub via: &'static str,
+}
+
+/// 拉取函数参数元数据（契约面：接口端点 / 平坦调用 / OpenAPI / MCP 共用）。
+///
+/// 优先 FII 实时读，再与 SDK 描述符视图**合并**：SDK 认识（同名同方向）的
+/// 参数保留其精确类型/长度/嵌套字段，SDK 不认识的（签名刚变更、描述符缓存
+/// 未跟上）做尽力映射。FII 失败（除「函数不存在」外）降级为纯 SDK 通道，
+/// 即 v0.14 及之前的行为。
 pub(crate) fn collect_function_params(
+    conn: &crate::connection::RfcConnection,
+    name: &str,
+) -> Result<InterfaceView, RfcError> {
+    match crate::discovery::read_function_interface_rfc(conn, name) {
+        Ok((raw, docu)) => {
+            // SDK 视图拿不到（如非远程函数的描述符、通讯故障）就全走尽力映射
+            let sdk = conn.get_param_infos(name).ok();
+            let params = merge_interface(sdk.as_deref(), &raw, &docu, &|t| {
+                crate::metadata::get_type_fields(conn, t).ok()
+            });
+            Ok(InterfaceView { params, via: "fii" })
+        }
+        Err(e) if e.key == "FU_NOT_FOUND" => Err(e),
+        Err(e) => {
+            tracing::warn!(
+                func = %name,
+                key = %e.key,
+                error = %e.message,
+                "FII 接口读取失败，降级 SDK 描述符通道"
+            );
+            Ok(InterfaceView {
+                params: collect_function_params_sdk(conn, name)?,
+                via: "sdk",
+            })
+        }
+    }
+}
+
+/// 纯 SDK 描述符通道（v0.14 行为，FII 不可用时的降级路径）。
+fn collect_function_params_sdk(
     conn: &crate::connection::RfcConnection,
     name: &str,
 ) -> Result<Vec<FunctionParam>, RfcError> {
     let param_infos = conn.get_param_infos(name)?;
-    param_infos
+    Ok(param_infos
         .iter()
-        .map(|p| {
-            Ok(FunctionParam {
-                name: p.name.clone(),
-                type_name: rfctype_name(p.type_),
-                direction: direction_name(p.direction),
-                length: p.char_length,
-                decimals: p.decimals,
-                optional: p.optional,
-                default: p.default_value.clone(),
-                description: p.parameter_text.clone(),
-                fields: param_info_to_field_def(p)?.fields,
-            }) as Result<FunctionParam, RfcError>
+        .map(param_info_to_function_param)
+        .collect())
+}
+
+/// SDK ParamInfo → FunctionParam（类型/长度/嵌套字段精确，一层展开）。
+fn param_info_to_function_param(p: &crate::connection::ParamInfo) -> FunctionParam {
+    FunctionParam {
+        name: p.name.clone(),
+        type_name: rfctype_name(p.type_),
+        direction: direction_name(p.direction),
+        length: p.char_length,
+        decimals: p.decimals,
+        optional: p.optional,
+        default: p.default_value.clone(),
+        description: p.parameter_text.clone(),
+        fields: param_info_to_field_def(p).ok().and_then(|f| f.fields),
+    }
+}
+
+/// FII 实时视图与 SDK 描述符视图的合并（纯函数，单测锁定）。
+///
+/// - 同名**同方向**的参数：用 SDK 块——marshaling 走 SDK，它的类型信息精确；
+/// - FII 独有的参数（SDK 缓存未跟上）：`fresh_param` 尽力映射。
+///
+/// `ddic`：DDIC 类型名 → 字段列表解析器（结构/表返回非空，数据元素返回空，
+/// 未知类型 None）——传入闭包以便单测注入，生产路径走 metadata::get_type_fields。
+fn merge_interface(
+    sdk: Option<&[crate::connection::ParamInfo]>,
+    raw: &[crate::discovery::RawInterfaceParam],
+    docu: &std::collections::HashMap<String, String>,
+    ddic: &dyn Fn(&str) -> Option<Vec<crate::metadata::TypeFieldMeta>>,
+) -> Vec<FunctionParam> {
+    raw.iter()
+        .map(|r| {
+            let precise = sdk.and_then(|infos| {
+                infos
+                    .iter()
+                    .find(|p| p.name == r.name && direction_name(p.direction) == r.direction)
+            });
+            match precise {
+                Some(p) => param_info_to_function_param(p),
+                None => fresh_param(r, docu, ddic),
+            }
         })
         .collect()
+}
+
+/// 描述追加类型引用备注（"TYPE X" / "LIKE T-F"），非空时以 " · " 连接。
+fn append_note(description: &mut String, note: &str) {
+    if description.is_empty() {
+        *description = note.to_string();
+    } else {
+        description.push_str(" · ");
+        description.push_str(note);
+    }
+}
+
+/// ABAP 内建类型字面量（FII 的 TYP/DBFIELD 列）→ 展示用的 (类型名, 字符长度)。
+/// 仅覆盖 RFC 接口里能出现的具体内建类型；数据元素名（FLAG、BAPI*...）不在此列。
+fn abap_builtin_type(lit: &str) -> Option<(&'static str, usize)> {
+    let lit = lit.trim().to_ascii_uppercase();
+    Some(match lit.as_str() {
+        "I" | "INT4" | "B" | "S" | "INT1" | "INT2" => ("INT", 0),
+        "INT8" => ("INT8", 0),
+        "F" => ("FLOAT", 0),
+        "P" => ("BCD", 0),
+        "D" => ("DATE", 8),
+        "T" => ("TIME", 6),
+        "N" => ("NUMC", 0),
+        "X" | "XSTRING" => ("BYTE", 0),
+        "C" => ("CHAR", 0),
+        "STRING" => ("STRING", 0),
+        _ => return None,
+    })
+}
+
+/// FII 独有参数的尽力映射。类型推断优先级：
+/// 1. LIKE 表-字段（`BAPIBNAME-BAPIBNAME`）：拆开查表字段，类型/长度精确；
+/// 2. ABAP 内建字面量（I/STRING/D/...）；
+/// 3. DDIC 对象解析：≥1 字段 → STRUCTURE/TABLE（附字段清单），
+///    0 字段或解析失败 → 数据元素标量，type 显示 `ELEMENT`、引用名进描述
+///    （精确类型待 SDK 视图跟上（网关重启）后自然出现）。
+fn fresh_param(
+    r: &crate::discovery::RawInterfaceParam,
+    docu: &std::collections::HashMap<String, String>,
+    ddic: &dyn Fn(&str) -> Option<Vec<crate::metadata::TypeFieldMeta>>,
+) -> FunctionParam {
+    let mut param = FunctionParam {
+        name: r.name.clone(),
+        type_name: "ELEMENT",
+        direction: r.direction,
+        length: 0,
+        decimals: 0,
+        optional: r.optional,
+        default: r.default.clone(),
+        description: docu.get(&r.name).cloned().unwrap_or_default(),
+        fields: None,
+    };
+    // 引用名：LIKE/结构引用（DBFIELD/DBSTRUCT）优先，其次 TYPE 引用（TYP）
+    let like = r.dbfield.trim();
+    let typ = r.typ.trim();
+    let ref_name = if like.is_empty() { typ } else { like };
+    if ref_name.is_empty() {
+        return param;
+    }
+    // LIKE 表-字段
+    if let Some((tab, fld)) = ref_name.split_once('-') {
+        if let Some(fs) = ddic(tab) {
+            if let Some(f) = fs.iter().find(|f| f.name.eq_ignore_ascii_case(fld)) {
+                param.type_name = rfctype_name(f.type_);
+                param.length = f.char_length;
+                param.decimals = f.decimals;
+                append_note(&mut param.description, &format!("LIKE {ref_name}"));
+                return param;
+            }
+        }
+    }
+    // 内建字面量
+    if let Some((tn, len)) = abap_builtin_type(ref_name) {
+        param.type_name = tn;
+        param.length = len;
+        return param;
+    }
+    // DDIC 对象：结构/表类型（≥1 字段）或数据元素（0 字段）
+    let is_table = r.direction == "TABLES";
+    match ddic(ref_name) {
+        Some(fs) if !fs.is_empty() => {
+            param.type_name = if is_table { "TABLE" } else { "STRUCTURE" };
+            param.fields = Some(fs.iter().map(FieldDef::from_type_field).collect());
+            append_note(
+                &mut param.description,
+                &format!("{} {ref_name}", if is_table { "TABLE OF" } else { "TYPE" }),
+            );
+        }
+        _ => {
+            append_note(&mut param.description, &format!("TYPE {ref_name}"));
+        }
+    }
+    param
 }
 
 /// ② POST /api/functions/search —— 搜索函数模块
@@ -2066,10 +2248,192 @@ mod tests {
         assert!(!runtime_mode_allows(&post, "/api/functions/search"));
         assert!(!runtime_mode_allows(&post, "/api/table/read"));
         assert!(!runtime_mode_allows(&get, "/api/dumps"));
-        assert!(!runtime_mode_allows(&put_method(), "/api/objects/prog/Z/source"));
+        assert!(!runtime_mode_allows(
+            &put_method(),
+            "/api/objects/prog/Z/source"
+        ));
         assert!(!runtime_mode_allows(&get, "/api/adt/runtime/dumps"));
         assert!(!runtime_mode_allows(&post, "/mcp"));
         // 非业务路径（公开页）不经此守卫（挂载在 api 路由层内）
+    }
+
+    // ====================================================================
+    // v0.15：FII + SDK 接口合并（merge_interface / fresh_param / 内建映射）
+    // ====================================================================
+
+    use crate::connection::ParamInfo;
+    use crate::discovery::RawInterfaceParam;
+    use crate::metadata::TypeFieldMeta;
+
+    fn sdk_param(name: &str, type_: i32, direction: i32) -> ParamInfo {
+        ParamInfo {
+            name: name.into(),
+            type_,
+            char_length: 0,
+            direction,
+            decimals: 0,
+            optional: true,
+            parameter_text: format!("sdk text {name}"),
+            default_value: String::new(),
+            type_desc_handle: None,
+        }
+    }
+
+    fn raw(name: &str, direction: &'static str, dbfield: &str, typ: &str) -> RawInterfaceParam {
+        RawInterfaceParam {
+            name: name.into(),
+            direction,
+            dbfield: dbfield.into(),
+            typ: typ.into(),
+            optional: true,
+            default: String::new(),
+        }
+    }
+
+    /// DDIC 解析桩：预置类型名 → 字段列表（None = 未知类型，空 vec = 数据元素）。
+    fn stub_ddic<'a>(
+        map: &'a [(&'a str, Vec<&'a str>)],
+    ) -> impl Fn(&str) -> Option<Vec<TypeFieldMeta>> + 'a {
+        move |t| {
+            map.iter()
+                .find(|(n, _)| n.eq_ignore_ascii_case(t))
+                .map(|(_, fs)| {
+                    fs.iter()
+                        .map(|f| TypeFieldMeta {
+                            name: f.to_string(),
+                            type_: crate::ffi::rfctype::CHAR,
+                            char_length: 10,
+                            decimals: 0,
+                            description: String::new(),
+                            sub_fields: None,
+                        })
+                        .collect()
+                })
+        }
+    }
+
+    #[test]
+    fn merge_prefers_sdk_block_for_known_params() {
+        let sdk = vec![
+            sdk_param(
+                "IV_A",
+                crate::ffi::rfctype::INT,
+                crate::ffi::RFC_DIRECTION_IMPORT,
+            ),
+            sdk_param(
+                "EV_SUM",
+                crate::ffi::rfctype::INT,
+                crate::ffi::RFC_DIRECTION_EXPORT,
+            ),
+        ];
+        let rawv = vec![
+            raw("IV_A", "IMPORT", "", "I"),
+            raw("EV_SUM", "EXPORT", "", "I"),
+            raw("IV_NEW", "IMPORT", "", "STRING"),
+        ];
+        let merged = merge_interface(Some(&sdk), &rawv, &Default::default(), &|_| None);
+        assert_eq!(merged.len(), 3);
+        // SDK 认识的：精确块（类型 + 描述文本来自 SDK）
+        let iv_a = merged.iter().find(|p| p.name == "IV_A").unwrap();
+        assert_eq!(iv_a.type_name, "INT");
+        assert_eq!(iv_a.description, "sdk text IV_A");
+        // SDK 不认识的：尽力映射（内建字面量 STRING）
+        let iv_new = merged.iter().find(|p| p.name == "IV_NEW").unwrap();
+        assert_eq!(iv_new.type_name, "STRING");
+    }
+
+    #[test]
+    fn merge_falls_back_to_fresh_when_direction_differs() {
+        // 同名但方向变了（IMPORT→EXPORT）：说明签名变过，不能信 SDK 块
+        let sdk = vec![sdk_param(
+            "CH_X",
+            crate::ffi::rfctype::INT,
+            crate::ffi::RFC_DIRECTION_IMPORT,
+        )];
+        let rawv = vec![raw("CH_X", "EXPORT", "", "I")];
+        let merged = merge_interface(Some(&sdk), &rawv, &Default::default(), &|_| None);
+        assert_eq!(merged[0].type_name, "INT");
+        assert_eq!(merged[0].direction, "EXPORT");
+        assert_eq!(merged[0].description, "", "SDK 文本不应跟过来");
+    }
+
+    #[test]
+    fn merge_without_sdk_maps_everything_fresh() {
+        let rawv = vec![raw("IV_A", "IMPORT", "", "I")];
+        let merged = merge_interface(None, &rawv, &Default::default(), &|_| None);
+        assert_eq!(merged[0].type_name, "INT");
+    }
+
+    #[test]
+    fn fresh_param_like_table_field_resolves_precisely() {
+        let r = raw("USERNAME", "IMPORT", "BAPIBNAME-BAPIBNAME", "");
+        let p = fresh_param(
+            &r,
+            &Default::default(),
+            &stub_ddic(&[("BAPIBNAME", vec!["BAPIBNAME"])]),
+        );
+        assert_eq!(p.type_name, "CHAR");
+        assert_eq!(p.length, 10);
+        assert!(p.description.contains("LIKE BAPIBNAME-BAPIBNAME"));
+    }
+
+    #[test]
+    fn fresh_param_table_param_gets_row_fields() {
+        let r = raw("T_ROWS", "TABLES", "ZAGW_ROW_T", "");
+        let p = fresh_param(
+            &r,
+            &Default::default(),
+            &stub_ddic(&[("ZAGW_ROW_T", vec!["F1", "F2"])]),
+        );
+        assert_eq!(p.type_name, "TABLE");
+        let fields = p.fields.as_ref().unwrap();
+        assert_eq!(
+            fields.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(),
+            ["F1", "F2"]
+        );
+        assert!(p.description.contains("TABLE OF ZAGW_ROW_T"));
+    }
+
+    #[test]
+    fn fresh_param_struct_and_element_fallback() {
+        // 结构（TYPE 引用走 TYP 列，DBFIELD 为空）
+        let s = raw("ES_HDR", "EXPORT", "", "ZAGW_HDR");
+        let p = fresh_param(
+            &s,
+            &Default::default(),
+            &stub_ddic(&[("ZAGW_HDR", vec!["A", "B"])]),
+        );
+        assert_eq!(p.type_name, "STRUCTURE");
+        assert_eq!(p.fields.as_ref().unwrap().len(), 2);
+
+        // 数据元素（0 字段）→ ELEMENT 标量，引用名进描述
+        let e = raw("IV_FLAG2", "IMPORT", "", "ZAGW_FLAG");
+        let p = fresh_param(
+            &e,
+            &Default::default(),
+            &stub_ddic(&[("ZAGW_FLAG", vec![])]),
+        );
+        assert_eq!(p.type_name, "ELEMENT");
+        assert!(p.fields.is_none());
+        assert!(p.description.contains("TYPE ZAGW_FLAG"));
+
+        // P_DOCU 短文本与类型备注拼接
+        let mut docu = std::collections::HashMap::new();
+        docu.insert("IV_FLAG2".to_string(), "双精度标志".to_string());
+        let p = fresh_param(&e, &docu, &stub_ddic(&[("ZAGW_FLAG", vec![])]));
+        assert_eq!(p.description, "双精度标志 · TYPE ZAGW_FLAG");
+    }
+
+    #[test]
+    fn abap_builtin_literals_map() {
+        assert_eq!(abap_builtin_type("I"), Some(("INT", 0)));
+        assert_eq!(abap_builtin_type("int8"), Some(("INT8", 0)));
+        assert_eq!(abap_builtin_type("D"), Some(("DATE", 8)));
+        assert_eq!(abap_builtin_type("T"), Some(("TIME", 6)));
+        assert_eq!(abap_builtin_type("string"), Some(("STRING", 0)));
+        assert_eq!(abap_builtin_type("xstring"), Some(("BYTE", 0)));
+        assert_eq!(abap_builtin_type("FLAG"), None, "数据元素不算内建");
+        assert_eq!(abap_builtin_type("BAPIRET2"), None);
     }
 
     fn put_method() -> axum::http::Method {

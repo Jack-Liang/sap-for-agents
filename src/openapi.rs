@@ -2294,6 +2294,11 @@ const SPEC_JSON: &str = r##"{
             "items": {
               "$ref": "#/components/schemas/FunctionParam"
             }
+          },
+          "interface_via": {
+            "type": "string",
+            "enum": ["fii", "sdk"],
+            "description": "Which channel served the interface: fii = live server-side read (always fresh, default), sdk = SDK descriptor cache (fallback when FII is unavailable)"
           }
         }
       },
@@ -3475,7 +3480,7 @@ async fn rebuild_registry_ops(pool: &crate::server::SharedPool) -> Vec<(String, 
         })
         .await;
         let op = match r {
-            Ok(params) => flat_invoke_operation(&entry, &params),
+            Ok(view) => flat_invoke_operation(&entry, &view.params),
             Err(e) => {
                 let path = format!("/api/invokes/{}", entry.alias);
                 let placeholder = json!({
@@ -3813,8 +3818,14 @@ mod tests {
         assert_eq!(op["post"]["operationId"], "invoke_z_calc");
         assert_eq!(op["post"]["summary"], "calculator for frontend");
         let desc = op["post"]["description"].as_str().unwrap();
-        assert!(desc.contains("integers only") && desc.contains("500"), "{desc}");
-        assert!(desc.contains("## Usage"), "doc 正文应流入 description: {desc}");
+        assert!(
+            desc.contains("integers only") && desc.contains("500"),
+            "{desc}"
+        );
+        assert!(
+            desc.contains("## Usage"),
+            "doc 正文应流入 description: {desc}"
+        );
         // 请求体：IV_A 必填且为 integer
         let body = &op["post"]["requestBody"]["content"]["application/json"]["schema"];
         assert_eq!(body["properties"]["IV_A"]["type"], "integer");

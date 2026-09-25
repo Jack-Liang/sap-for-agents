@@ -245,7 +245,10 @@ fn stfc_connection_echo_roundtrip() {
         echo
     );
     // RESPTEXT 应非空（通常是 SAP 系统信息）
-    assert!(!body["scalars"]["RESPTEXT"].as_str().unwrap_or("").is_empty());
+    assert!(!body["scalars"]["RESPTEXT"]
+        .as_str()
+        .unwrap_or("")
+        .is_empty());
 }
 
 // ========================================================================
@@ -270,7 +273,11 @@ fn function_interface_returns_params() {
         .iter()
         .map(|p| p["name"].as_str().unwrap_or(""))
         .collect();
-    assert!(names.contains(&"REQUTEXT"), "参数应含 REQUTEXT, 实际 {:?}", names);
+    assert!(
+        names.contains(&"REQUTEXT"),
+        "参数应含 REQUTEXT, 实际 {:?}",
+        names
+    );
 }
 
 #[test]
@@ -317,7 +324,11 @@ fn ddic_type_bapiret2_has_fields() {
         .iter()
         .map(|f| f["name"].as_str().unwrap_or(""))
         .collect();
-    assert!(names.contains(&"TYPE"), "BAPIRET2 应含 TYPE 字段, 实际 {:?}", names);
+    assert!(
+        names.contains(&"TYPE"),
+        "BAPIRET2 应含 TYPE 字段, 实际 {:?}",
+        names
+    );
     assert!(
         names.contains(&"MESSAGE"),
         "BAPIRET2 应含 MESSAGE 字段, 实际 {:?}",
@@ -340,11 +351,7 @@ fn ddic_field_semantics_has_fixed_values() {
     let has_semantics = !body["data_element"].as_str().unwrap_or("").is_empty()
         || !body["domain"].as_str().unwrap_or("").is_empty()
         || !body["description"].as_str().unwrap_or("").is_empty();
-    assert!(
-        has_semantics,
-        "TYPE 字段应返回语义元数据, 实际: {}",
-        body
-    );
+    assert!(has_semantics, "TYPE 字段应返回语义元数据, 实际: {}", body);
     // fixed_values 可能为空（固定值在域级别，非所有系统都暴露），不强制断言
 }
 
@@ -455,7 +462,10 @@ fn bapi_user_getlist_with_return() {
     assert_eq!(resp.status(), 200, "BAPI_USER_GETLIST 应成功");
     let body: serde_json::Value = resp.json().unwrap();
     // 应返回 USERLIST 表（可能为空数组，但键应存在）
-    assert!(body["tables"].get("USERLIST").is_some(), "应返回 USERLIST 表");
+    assert!(
+        body["tables"].get("USERLIST").is_some(),
+        "应返回 USERLIST 表"
+    );
     // read_return=true，return_table 应存在（即使为 null 也合理——无消息）
 }
 
@@ -529,7 +539,11 @@ fn concurrent_calls_dont_deadlock() {
         .collect();
 
     let total_ok: u32 = threads.into_iter().map(|t| t.join().unwrap()).sum();
-    assert_eq!(total_ok, 24, "8 线程 × 3 请求应全部成功，实际 {} / 24", total_ok);
+    assert_eq!(
+        total_ok, 24,
+        "8 线程 × 3 请求应全部成功，实际 {} / 24",
+        total_ok
+    );
 }
 
 // ========================================================================
@@ -545,7 +559,12 @@ fn adt_proxy_forwards_dump_list() {
         .header("Accept", "*/*")
         .send()
         .unwrap();
-    assert_eq!(resp.status(), 200, "ADT 代理应透传 200，实际 {}", resp.status());
+    assert_eq!(
+        resp.status(),
+        200,
+        "ADT 代理应透传 200，实际 {}",
+        resp.status()
+    );
     let body = resp.text().unwrap();
     assert!(
         body.contains("atom:feed") || body.contains("atom:entry"),
@@ -669,7 +688,10 @@ fn dumps_detail_uses_key_from_list() {
 fn function_source_returns_lines_and_via() {
     let _s = start_server();
     let resp = http_client()
-        .get(format!("{}/api/functions/STFC_CONNECTION/source", _s.base_url))
+        .get(format!(
+            "{}/api/functions/STFC_CONNECTION/source",
+            _s.base_url
+        ))
         .send()
         .unwrap();
     assert_eq!(resp.status(), 200);
@@ -784,7 +806,10 @@ fn objects_syntax_reports_error_lines() {
     let _s = start_server();
     // 锚在不存在的 Z 名上：ADT 按虚拟对象检查，干扰告警最少（不落库）
     let resp = http_client()
-        .post(format!("{}/api/objects/prog/ZSYNTAX_PROBE/syntax", _s.base_url))
+        .post(format!(
+            "{}/api/objects/prog/ZSYNTAX_PROBE/syntax",
+            _s.base_url
+        ))
         .json(&serde_json::json!({"source": "REPORT zsyntax_probe.\nWRIT 1."}))
         .send()
         .unwrap();
@@ -804,7 +829,10 @@ fn objects_syntax_clean_source_has_no_errors() {
     // 注意锚点选可执行程序语义：F 类型主程序（如 SAPLSTFC）顶层 WRITE 会报
     // 「Statement is not accessible」E，与源码本身无关；Z 名 = type 1 语义
     let resp = http_client()
-        .post(format!("{}/api/objects/prog/ZSYNTAX_PROBE/syntax", _s.base_url))
+        .post(format!(
+            "{}/api/objects/prog/ZSYNTAX_PROBE/syntax",
+            _s.base_url
+        ))
         .json(&serde_json::json!({"source": "REPORT zsyntax_probe.\nWRITE 1."}))
         .send()
         .unwrap();
@@ -856,7 +884,10 @@ fn read_only_blocks_adt_writes_but_passes_reads() {
     let _s = start_server_with_env(&[("SAP_READ_ONLY", "1")]);
     // ADT 写方法 → 403 READ_ONLY（网关侧拦截，不转发到 ICF）
     let resp = http_client()
-        .post(format!("{}/api/adt/oo/classes/zcl_ro_test/source/main", _s.base_url))
+        .post(format!(
+            "{}/api/adt/oo/classes/zcl_ro_test/source/main",
+            _s.base_url
+        ))
         .header("Content-Type", "text/plain")
         .body("class")
         .send()
@@ -913,7 +944,11 @@ fn idle_connection_validated_on_checkout() {
         }))
         .send()
         .unwrap();
-    assert_eq!(r2.status(), 200, "空闲超阈值后借出（先 ping 校验）应照常成功");
+    assert_eq!(
+        r2.status(),
+        200,
+        "空闲超阈值后借出（先 ping 校验）应照常成功"
+    );
 }
 
 // ========================================================================
@@ -954,13 +989,14 @@ fn openapi_dynamic_generates_typed_operations() {
     // STFC_CONNECTION 的类型化 operation 存在，REQUTEXT 已展开
     let op = &spec["paths"]["/api/functions/STFC_CONNECTION/invoke"]["post"];
     assert!(op.is_object(), "应生成类型化 operation");
-    let inputs = &op["requestBody"]["content"]["application/json"]["schema"]["properties"]["inputs"];
+    let inputs =
+        &op["requestBody"]["content"]["application/json"]["schema"]["properties"]["inputs"];
     assert_eq!(inputs["properties"]["REQUTEXT"]["type"], "string");
     // BAPI 的输出表进 table_outputs 提示
     let bapi = &spec["paths"]["/api/functions/BAPI_USER_GETLIST/invoke"]["post"];
     assert!(
-        bapi["requestBody"]["content"]["application/json"]["schema"]["properties"]
-            ["table_outputs"]["example"]["USERLIST"]
+        bapi["requestBody"]["content"]["application/json"]["schema"]["properties"]["table_outputs"]
+            ["example"]["USERLIST"]
             .is_array(),
         "USERLIST 输出表应有示例"
     );
@@ -991,7 +1027,10 @@ fn function_invoke_endpoint_roundtrip() {
     let _s = start_server();
     // 函数名来自路径，body 免填 func_name
     let resp = http_client()
-        .post(format!("{}/api/functions/STFC_CONNECTION/invoke", _s.base_url))
+        .post(format!(
+            "{}/api/functions/STFC_CONNECTION/invoke",
+            _s.base_url
+        ))
         .json(&serde_json::json!({
             "inputs": {"REQUTEXT": "typed invoke"},
             "string_outputs": {"ECHOTEXT": 135}
@@ -1057,7 +1096,12 @@ fn mcp_tools_list_returns_manifest() {
     let body: serde_json::Value = resp.json().unwrap();
     let tools = body["result"]["tools"].as_array().expect("tools 数组");
     let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
-    for must in ["search_functions", "get_function_interface", "invoke_rfc", "syntax_check"] {
+    for must in [
+        "search_functions",
+        "get_function_interface",
+        "invoke_rfc",
+        "syntax_check",
+    ] {
         assert!(names.contains(&must), "缺工具 {must}");
     }
 }
@@ -1146,7 +1190,10 @@ fn mcp_tools_call_metadata_and_errors() {
 fn where_used_returns_structure_even_without_index() {
     let _s = start_server();
     let resp = http_client()
-        .get(format!("{}/api/functions/BAPI_TRANSACTION_COMMIT/where-used", _s.base_url))
+        .get(format!(
+            "{}/api/functions/BAPI_TRANSACTION_COMMIT/where-used",
+            _s.base_url
+        ))
         .send()
         .unwrap();
     // 有索引的系统返回真实使用者；无索引的 trial 返回空 + note——都是 200
@@ -1217,8 +1264,13 @@ fn smooth_write_lifecycle_on_program() {
         .unwrap()
         .json()
         .unwrap();
-    let text = src["lines"].as_array().unwrap().iter()
-        .map(|l| l.as_str().unwrap()).collect::<Vec<_>>().join("\n");
+    let text = src["lines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|l| l.as_str().unwrap())
+        .collect::<Vec<_>>()
+        .join("\n");
     assert!(text.contains("lv_n"), "读回应保留小写原文: {text}");
 
     // ③ 大写锚点改小写原文（大小写漂移兜底）
@@ -1268,7 +1320,10 @@ fn mcp_edit_code_and_write_source_tools() {
         .send()
         .unwrap();
     let body: serde_json::Value = resp.json().unwrap();
-    assert_eq!(body["result"]["isError"], false, "MCP write_source 创建应成功");
+    assert_eq!(
+        body["result"]["isError"], false,
+        "MCP write_source 创建应成功"
+    );
 
     // MCP edit_code 用大写漂移锚点丝滑修改
     let resp = http_client()
@@ -1284,7 +1339,10 @@ fn mcp_edit_code_and_write_source_tools() {
         .send()
         .unwrap();
     let body: serde_json::Value = resp.json().unwrap();
-    assert_eq!(body["result"]["isError"], false, "MCP edit_code 大写锚点应兜底命中");
+    assert_eq!(
+        body["result"]["isError"], false,
+        "MCP edit_code 大写锚点应兜底命中"
+    );
     let text = body["result"]["content"][0]["text"].as_str().unwrap();
     let payload: serde_json::Value = serde_json::from_str(text).unwrap();
     assert_eq!(payload["activated"]["success"], true);
@@ -1468,10 +1526,11 @@ fn registry_corrupt_file_recovers() {
     let has_backup = std::fs::read_dir(dir)
         .unwrap()
         .filter_map(|e| e.ok())
-        .any(|e| e
-            .file_name()
-            .to_string_lossy()
-            .starts_with("registry.json.corrupt-"));
+        .any(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with("registry.json.corrupt-")
+        });
     assert!(has_backup, "坏文件应被备份而非覆盖丢失");
 }
 
@@ -1508,7 +1567,10 @@ fn flat_invoke_and_registry_catalog() {
     let body: serde_json::Value = resp.json().unwrap();
     assert_eq!(body["ECHOTEXT"], "hello flat", "扁平响应: {body}");
     assert!(
-        body["RESPTEXT"].as_str().map(|s| !s.is_empty()).unwrap_or(false),
+        body["RESPTEXT"]
+            .as_str()
+            .map(|s| !s.is_empty())
+            .unwrap_or(false),
         "RESPTEXT 应非空: {body}"
     );
     // 响应就是扁平对象：没有 /api/rfc 的 scalars/tables 包装
@@ -1524,7 +1586,10 @@ fn flat_invoke_and_registry_catalog() {
     let body: serde_json::Value = resp.json().unwrap();
     assert_eq!(body["error"]["key"], "INVOKE_PARAM_UNKNOWN");
     assert!(
-        body["error"]["message"].as_str().unwrap().contains("REQUTEXT"),
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("REQUTEXT"),
         "错误应列出合法参数: {body}"
     );
 
@@ -1581,12 +1646,15 @@ fn flat_invoke_and_registry_catalog() {
                 body["paths"]["/api/invokes/stfc-echo"]["post"]["summary"],
                 "connectivity check echo"
             );
-            let schema = &body["paths"]["/api/invokes/stfc-echo"]["post"]["requestBody"]
-                ["content"]["application/json"]["schema"];
+            let schema = &body["paths"]["/api/invokes/stfc-echo"]["post"]["requestBody"]["content"]
+                ["application/json"]["schema"];
             assert_eq!(schema["properties"]["REQUTEXT"]["type"], "string");
             break;
         }
-        assert!(Instant::now() < deadline, "openapi 目录未在 15s 内出现: {body}");
+        assert!(
+            Instant::now() < deadline,
+            "openapi 目录未在 15s 内出现: {body}"
+        );
         std::thread::sleep(Duration::from_millis(500));
     }
 
@@ -1680,19 +1748,23 @@ fn runtime_mode_locks_down_to_delivery_port() {
     // 拦截：开发面全部 403 RUNTIME_MODE
     for (method, url) in [
         ("POST", format!("{}/api/rfc", _s.base_url)),
-        ("GET", format!("{}/api/functions/STFC_CONNECTION", _s.base_url)),
+        (
+            "GET",
+            format!("{}/api/functions/STFC_CONNECTION", _s.base_url),
+        ),
         ("POST", format!("{}/api/functions/search", _s.base_url)),
         ("POST", format!("{}/api/table/read", _s.base_url)),
         ("GET", format!("{}/api/dumps", _s.base_url)),
-        (
-            "PUT",
-            format!("{}/api/registry/whatever", _s.base_url),
-        ),
+        ("PUT", format!("{}/api/registry/whatever", _s.base_url)),
         ("GET", format!("{}/api/invokes/audit", _s.base_url)),
         ("POST", format!("{}/mcp", _s.base_url)),
     ] {
         let resp = match method {
-            "POST" => http_client().post(url).json(&serde_json::json!({})).send().unwrap(),
+            "POST" => http_client()
+                .post(url)
+                .json(&serde_json::json!({}))
+                .send()
+                .unwrap(),
             "PUT" => http_client()
                 .put(url)
                 .json(&serde_json::json!({"func_name": "Z_X"}))
@@ -1771,4 +1843,203 @@ fn doc_field_flows_into_catalog_and_audits_invoke() {
     assert_eq!(first["func"], "STFC_CONNECTION");
     assert_eq!(first["ok"], true);
     assert!(first["ms"].is_u64());
+}
+
+// ========================================================================
+// v0.15：FII 实时契约 + 签名漂移守卫
+// ========================================================================
+
+/// 接口端点走 FII 实时通道：宽源码 BAPI（RPY 路径会 FL 180）也能读接口，
+/// 且响应标明 interface_via=fii；SDK 认识的参数保留精确类型。
+#[test]
+#[ignore]
+fn function_interface_fresh_via_fii() {
+    let _s = start_server();
+    let body: serde_json::Value = http_client()
+        .get(format!(
+            "{}/api/functions/BAPI_USER_GET_DETAIL",
+            _s.base_url
+        ))
+        .send()
+        .unwrap()
+        .json()
+        .unwrap();
+    assert_eq!(body["interface_via"], "fii", "应走 FII 实时通道: {body}");
+    let params = body["params"].as_array().unwrap();
+    let find = |n: &str| {
+        params
+            .iter()
+            .find(|p| p["name"] == n)
+            .unwrap_or_else(|| panic!("缺参数 {n}: {body}"))
+    };
+    // 标量（LIKE 表-字段引用）/ 结构体 / 表参数各一
+    let username = find("USERNAME");
+    assert_eq!(username["direction"], "IMPORT");
+    assert_ne!(
+        username["type"].as_str().unwrap_or("ELEMENT"),
+        "ELEMENT",
+        "SDK 认识的参数应有精确类型"
+    );
+    let address = find("ADDRESS");
+    assert_eq!(address["type"], "STRUCTURE");
+    assert!(
+        address["fields"]
+            .as_array()
+            .map(|a| !a.is_empty())
+            .unwrap_or(false),
+        "结构体应带字段清单"
+    );
+    let ret = find("RETURN");
+    assert_eq!(ret["type"], "TABLE");
+    // 普通函数也走 FII
+    let body2: serde_json::Value = http_client()
+        .get(format!("{}/api/functions/STFC_CONNECTION", _s.base_url))
+        .send()
+        .unwrap()
+        .json()
+        .unwrap();
+    assert_eq!(body2["interface_via"], "fii");
+    assert!(body2["params"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|p| p["name"] == "REQUTEXT"));
+}
+
+/// 签名漂移的端到端闭环：创建 rfc FM → 调用（SDK 描述符定格 v1）→
+/// 删库重建改签名 → 接口端点**立即**显示新参数（FII 实时）→
+/// 平坦调用触碰新参数 → 409 SIGNATURE_STALE → /api/rfc 设新参数 →
+/// 错误带重启提示。这正是 v0.15 要消灭的「改完签名要瞎猜」体验。
+#[test]
+#[ignore]
+fn signature_change_contract_fresh_invoke_guarded() {
+    let _s = start_server();
+    let name = format!("ZAGWSTLE{}", std::process::id() % 10000);
+    let group = "ZAGW_STALE_GRP";
+    let alias = name.to_lowercase();
+
+    // ① 创建 rfc FM v1：IV_A → EV_SUM = IV_A * 2
+    let v1 = format!(
+        "FUNCTION {n} IMPORTING VALUE(iv_a) TYPE i EXPORTING VALUE(ev_sum) TYPE i.\n  ev_sum = iv_a * 2.\nENDFUNCTION.",
+        n = name.to_lowercase()
+    );
+    let resp = http_client()
+        .post(format!("{}/api/objects/func/{}/create", _s.base_url, name))
+        .json(&serde_json::json!({
+            "description": "stale sig test v1", "group": group,
+            "rfc_enabled": true, "source": v1
+        }))
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 200, "创建 v1 应成功");
+    let body: serde_json::Value = resp.json().unwrap();
+    assert_eq!(
+        body["write"]["activated"]["success"], true,
+        "v1 激活应成功: {body}"
+    );
+
+    // ② 调用一次（SDK 描述符从此定格 v1）
+    let resp = http_client()
+        .post(format!("{}/api/rfc", _s.base_url))
+        .json(&serde_json::json!({
+            "func_name": name, "inputs": {"IV_A": 20}, "auto_outputs": ["EV_SUM"]
+        }))
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().unwrap();
+    assert_eq!(body["scalars"]["EV_SUM"], 40, "v1 逻辑 iv_a*2: {body}");
+
+    // ③ 删库重建为 v2：+IV_B，EV_SUM = IV_A + IV_B
+    let resp = http_client()
+        .delete(format!(
+            "{}/api/objects/func/{}?group={}",
+            _s.base_url, name, group
+        ))
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 200, "删除 v1 应成功");
+    let v2 = format!(
+        "FUNCTION {n} IMPORTING VALUE(iv_a) TYPE i VALUE(iv_b) TYPE i EXPORTING VALUE(ev_sum) TYPE i.\n  ev_sum = iv_a + iv_b.\nENDFUNCTION.",
+        n = name.to_lowercase()
+    );
+    let resp = http_client()
+        .post(format!("{}/api/objects/func/{}/create", _s.base_url, name))
+        .json(&serde_json::json!({
+            "description": "stale sig test v2", "group": group,
+            "rfc_enabled": true, "source": v2
+        }))
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 200, "重建 v2 应成功");
+    let body: serde_json::Value = resp.json().unwrap();
+    assert_eq!(
+        body["write"]["activated"]["success"], true,
+        "v2 激活应成功: {body}"
+    );
+
+    // ④ 接口端点立即显示新参数 IV_B（FII 实时；SDK 描述符仍持 v1）
+    let body: serde_json::Value = http_client()
+        .get(format!("{}/api/functions/{}", _s.base_url, name))
+        .send()
+        .unwrap()
+        .json()
+        .unwrap();
+    assert_eq!(body["interface_via"], "fii");
+    let params = body["params"].as_array().unwrap();
+    assert!(
+        params.iter().any(|p| p["name"] == "IV_B"),
+        "FII 应立即看到 IV_B: {body}"
+    );
+    // 新参数尽力映射：TYP=I → INT
+    let iv_b = params.iter().find(|p| p["name"] == "IV_B").unwrap();
+    assert_eq!(iv_b["type"], "INT");
+    // 老参数走 SDK 精确块
+    let iv_a = params.iter().find(|p| p["name"] == "IV_A").unwrap();
+    assert_eq!(iv_a["type"], "INT");
+
+    // ⑤ 平坦调用触碰新参数 → 409 SIGNATURE_STALE（守卫拒绝按旧签名错读错写）
+    let resp = http_client()
+        .post(format!("{}/api/invokes/{}", _s.base_url, alias))
+        .json(&serde_json::json!({"iv_a": 1, "iv_b": 2}))
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 409, "触碰新参数应 409: {} {resp:?}", alias);
+    let body: serde_json::Value = resp.json().unwrap();
+    assert_eq!(body["error"]["key"], "SIGNATURE_STALE");
+    assert!(
+        body["error"]["message"].as_str().unwrap().contains("IV_B"),
+        "消息应点名新参数"
+    );
+
+    // ⑥ /api/rfc 直接设新参数 → SDK 报字段不存在，错误应带重启提示
+    let resp = http_client()
+        .post(format!("{}/api/rfc", _s.base_url))
+        .json(&serde_json::json!({"func_name": name, "inputs": {"IV_B": 1}}))
+        .send()
+        .unwrap();
+    let body: serde_json::Value = resp.json().unwrap();
+    assert_eq!(body["error"]["key"], "RFC_INVALID_PARAMETER");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("重启网关"),
+        "应带重启提示: {body}"
+    );
+
+    // ⑦ 清理：删 FM + 清注册表条目
+    let resp = http_client()
+        .delete(format!(
+            "{}/api/objects/func/{}?group={}",
+            _s.base_url, name, group
+        ))
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 200, "清理删除应成功");
+    let resp = http_client()
+        .delete(format!("{}/api/registry/{}?purge=true", _s.base_url, alias))
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 200, "清理注册表应成功");
 }

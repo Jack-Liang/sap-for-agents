@@ -9,7 +9,6 @@ use base64::{engine::general_purpose, Engine as _};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-
 /// 显式类型标记：用于 BCD/INT8/Bytes 这些无法靠 JSON 字面量区分的类型。
 /// JSON 形式：`{"type":"BCD","value":"123.45"}`
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -494,9 +493,9 @@ where
                         let v = if ftype == crate::ffi::rfctype::INT1
                             || ftype == crate::ffi::rfctype::INT2
                         {
-                            row.get_int(fname.as_str()).map(ScalarValue::Int).unwrap_or_else(|_| {
-                                ScalarValue::Chars(String::new())
-                            })
+                            row.get_int(fname.as_str())
+                                .map(ScalarValue::Int)
+                                .unwrap_or_else(|_| ScalarValue::Chars(String::new()))
                         } else {
                             row.get_chars(fname.as_str(), flen)
                                 .map(ScalarValue::Chars)
@@ -552,9 +551,17 @@ where
             for field_spec in fields {
                 let v = if field_spec.auto {
                     let (type_, char_len) = field_metas
-                        .and_then(|fm| fm.get(&field_spec.name.to_uppercase()).map(|(l, t)| (*t, *l)))
+                        .and_then(|fm| {
+                            fm.get(&field_spec.name.to_uppercase())
+                                .map(|(l, t)| (*t, *l))
+                        })
                         .unwrap_or((crate::ffi::RFCTYPE_CHAR, DEFAULT_CHAR_LEN));
-                    match read_scalar_by_type(&mut row, &field_spec.name.to_uppercase(), type_, char_len) {
+                    match read_scalar_by_type(
+                        &mut row,
+                        &field_spec.name.to_uppercase(),
+                        type_,
+                        char_len,
+                    ) {
                         Ok(v) => v,
                         Err(e) => {
                             tracing::warn!(table = %table_name, field = %field_spec.name, error = %e.message, "表字段按类型读取失败，用空串替代");
@@ -565,8 +572,9 @@ where
                     let len = field_spec
                         .clamped_len()
                         .or_else(|| {
-                            field_metas
-                                .and_then(|fm| fm.get(&field_spec.name.to_uppercase()).map(|(l, _)| *l))
+                            field_metas.and_then(|fm| {
+                                fm.get(&field_spec.name.to_uppercase()).map(|(l, _)| *l)
+                            })
                         })
                         .unwrap_or(DEFAULT_CHAR_LEN);
                     match row.get_chars(&field_spec.name.to_uppercase(), len) {
@@ -595,10 +603,18 @@ where
         let mut m = HashMap::new();
         for field_spec in fields {
             let v = if field_spec.auto {
-                    let (type_, char_len) = struct_metas
-                        .and_then(|fm| fm.get(&field_spec.name.to_uppercase()).map(|(l, t)| (*t, *l)))
-                        .unwrap_or((crate::ffi::RFCTYPE_CHAR, DEFAULT_CHAR_LEN));
-                    match read_scalar_by_type(&mut row, &field_spec.name.to_uppercase(), type_, char_len) {
+                let (type_, char_len) = struct_metas
+                    .and_then(|fm| {
+                        fm.get(&field_spec.name.to_uppercase())
+                            .map(|(l, t)| (*t, *l))
+                    })
+                    .unwrap_or((crate::ffi::RFCTYPE_CHAR, DEFAULT_CHAR_LEN));
+                match read_scalar_by_type(
+                    &mut row,
+                    &field_spec.name.to_uppercase(),
+                    type_,
+                    char_len,
+                ) {
                     Ok(v) => v,
                     Err(e) => {
                         tracing::warn!(structure = %struct_name, field = %field_spec.name, error = %e.message, "结构体字段按类型读取失败，用空串替代");
@@ -780,9 +796,10 @@ impl FieldDef {
             length: f.char_length,
             decimals: f.decimals,
             description: f.description.clone(),
-            fields: f.sub_fields.as_ref().map(|subs| {
-                subs.iter().map(FieldDef::from_type_field).collect()
-            }),
+            fields: f
+                .sub_fields
+                .as_ref()
+                .map(|subs| subs.iter().map(FieldDef::from_type_field).collect()),
         }
     }
 }
@@ -812,6 +829,11 @@ pub struct FunctionParam {
 pub struct FunctionInterface {
     pub name: String,
     pub params: Vec<FunctionParam>,
+    /// 接口元数据的服务通道（v0.15）：
+    /// - `fii`：FUNCTION_IMPORT_INTERFACE 服务器端实时读（签名变更即时可见）；
+    /// - `sdk`：SDK 描述符（进程级缓存，FII 不可用时降级）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub interface_via: Option<&'static str>,
 }
 
 // --- 端点② POST /api/functions/search ---
@@ -946,7 +968,8 @@ mod tests {
         let f: FieldSpec = serde_json::from_str(r#"{"name":"X","max_len":10}"#).unwrap();
         assert!(!f.auto);
         // 显式传 true
-        let f: FieldSpec = serde_json::from_str(r#"{"name":"X","max_len":10,"auto":true}"#).unwrap();
+        let f: FieldSpec =
+            serde_json::from_str(r#"{"name":"X","max_len":10,"auto":true}"#).unwrap();
         assert!(f.auto);
     }
 
@@ -1337,7 +1360,11 @@ mod tests {
         for bad in ["FOO BAR", "FOO-BAR", "FOO;DROP", "函数", "FOO$"] {
             let err = validate_func_name(bad).unwrap_err();
             assert_eq!(err.status, 400, "{} 应被拒绝", bad);
-            assert!(err.message.contains("非法字符"), "{} 的错误信息应含非法字符", bad);
+            assert!(
+                err.message.contains("非法字符"),
+                "{} 的错误信息应含非法字符",
+                bad
+            );
         }
     }
 
@@ -1345,12 +1372,12 @@ mod tests {
     fn validate_func_name_rejects_malformed_slashes() {
         // 斜杠只允许作为 /NS/ 前缀出现，且两段非空
         for bad in [
-            "FOO/BAR",     // 无命名空间前缀的斜杠
-            "/SDF",        // 只有前斜杠
-            "/SDF/",       // 名字段为空
-            "//X",         // 命名空间段为空
-            "/SDF/X/Y",    // 多余斜杠
-            "/SDF/X/",     // 尾斜杠
+            "FOO/BAR",  // 无命名空间前缀的斜杠
+            "/SDF",     // 只有前斜杠
+            "/SDF/",    // 名字段为空
+            "//X",      // 命名空间段为空
+            "/SDF/X/Y", // 多余斜杠
+            "/SDF/X/",  // 尾斜杠
         ] {
             let err = validate_func_name(bad).unwrap_err();
             assert_eq!(err.status, 400, "{} 应被拒绝", bad);

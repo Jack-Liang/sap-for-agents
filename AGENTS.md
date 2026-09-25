@@ -36,7 +36,7 @@ curl -H "Authorization: Bearer <SAP_API_KEY>" http://127.0.0.1:3000/api/function
 | Want recent invoke history for troubleshooting (alias, function, duration, IP) | `GET /api/invokes/audit` |
 | New session → **self-description first**: gateway version/commit, capability switches (auth / read_only / adt / registry / rate limit), SAP sysid & release | `GET /api/version` (public) |
 | Don't know which functions exist → fuzzy search by name | `POST /api/functions/search` |
-| Know the function name, want to know how to fill parameters | `GET /api/functions/{name}` |
+| Know the function name, want to know how to fill parameters (always fresh — server-side read) | `GET /api/functions/{name}` |
 | Want full function documentation (purpose, examples) | `GET /api/functions/{name}/doc` |
 | Want the fields of a table/structure | `GET /api/ddic/type/{name}` |
 | Want to understand a field's meaning and valid values | `GET /api/ddic/field/{table}/{field}` |
@@ -113,7 +113,7 @@ curl -X DELETE 'http://127.0.0.1:3000/api/registry/z_calc?purge=true' # physical
 
 #### Delivery port: `POST /api/invokes/{alias}` (flat JSON in / flat JSON out)
 
-Published (or draft) entries are callable by **external systems without any SAP dialect** — no uppercase-parameter conventions, no output-read declarations. The contract is derived from the function's interface metadata on every call (drift happening outside this gateway is picked up automatically; signature edits made THROUGH this gateway need a gateway restart before new parameters show — SDK metadata cache, see the write section):
+Published (or draft) entries are callable by **external systems without any SAP dialect** — no uppercase-parameter conventions, no output-read declarations. The contract is derived on every call from the function's **live server-side interface** (`FUNCTION_IMPORT_INTERFACE`) — drift from any source (SE37 edits, delete+recreate through this gateway) is picked up immediately. The execution side still marshals via the SDK descriptor cache: if the contract touches a parameter the SDK doesn't know yet (signature changed since gateway start), the invoke returns `409 SIGNATURE_STALE` telling you to restart the gateway, instead of silently marshaling the old signature (see the write section):
 
 ```bash
 # Frontend/other-language consumer calls a registered API — this is the whole API:
@@ -152,12 +152,14 @@ curl http://127.0.0.1:3000/api/functions/BAPI_USER_GETLIST
 
 Returns **all parameters** of the function; each parameter has:
 - `name`: parameter name (**always use this exact uppercase name when passing it**)
-- `type`: `CHAR` / `INT` / `STRUCTURE` / `TABLE` / `BCD` / `DATE` ...
+- `type`: `CHAR` / `INT` / `STRUCTURE` / `TABLE` / `BCD` / `DATE` ... or `ELEMENT` (see below)
 - `direction`: `IMPORT` (you fill) / `EXPORT` (return value) / `TABLES` (in or out)
 - `length`: character length (for CHAR/NUM/DATE etc.)
 - `optional`: whether it can be omitted
 - `description`: parameter description
 - `fields`: for STRUCTURE/TABLE, lists the nested fields
+
+The interface is read **live from the SAP server** (`FUNCTION_IMPORT_INTERFACE`, response field `interface_via: "fii"`), so signature changes — yours through this gateway, or someone else's in SE37 — show up **immediately**. Parameters the SDK descriptor already knows carry precise type/length/fields; a **newly added** parameter (SDK cache one step behind) is best-effort typed: built-in ABAP literals (`I`→`INT`, `STRING`, `D`→`DATE`...) map exactly, structures/tables get their field lists resolved from the DDIC, and everything else shows `type: "ELEMENT"` with the referenced object in `description` (e.g. `TYPE BAPIEXTUIDGET`). After a gateway restart the SDK view catches up and the precise type appears.
 
 > Namespaced function names (containing `/`, e.g. `/SDF/EWA_GET_ABAP_DUMPS`) are supported.
 > In URL paths, use either the raw form (`/api/functions//SDF/EWA_GET_ABAP_DUMPS`) or the
@@ -314,7 +316,7 @@ curl -X POST http://127.0.0.1:3000/api/objects/prog/ZMY_REPORT/syntax \
 ```
 
 - **`doc` field (func only, v0.14)**: `create`/`PUT source`/`replace` accept `doc` — consumer-facing Markdown documentation stored on the registry entry and rendered in the OpenAPI catalog. Docs travel with the code: re-writing with a new `doc` updates the entry; omitting it keeps the existing one. (SE37 long text has no remote-write channel on current releases — the registry entry IS the documentation store.)
-- **Post-write consistency (v0.14)**: successful func writes/deletes clear the gateway's metadata cache and drain idle RFC connections, so the next interface introspection / invoke sees the new signature immediately. Remaining caveat: the SAP SDK's process-global descriptor cache cannot be invalidated in-process — *parameter-signature changes* (including delete+recreate) stay invisible to `/api/rfc` and `/api/invokes` until gateway restart. Body/logic edits are NOT affected (values pass through live connections); only the parameter list is cached. ADT-channel reads like `GET /api/objects/func/{n}/source` are always fresh.
+- **Post-write consistency (v0.14 + v0.15)**: successful func writes/deletes clear the gateway's metadata cache and drain idle RFC connections. Since v0.15 the **contract side is always fresh**: `GET /api/functions/{n}`, `POST /api/invokes/{alias}` contract derivation, the OpenAPI catalog and MCP `get_function_interface` all read the interface live from the SAP server (`FUNCTION_IMPORT_INTERFACE`) — signature changes (including delete+recreate, or edits made directly in SE37) show up immediately. The remaining hard limit is the **execution** side: the SAP SDK's process-global descriptor cache cannot be invalidated in-process, so a function whose *parameter signature* changed after gateway start is invoked with the old marshaling view. The gateway detects this (contract vs SDK view) and refuses instead of guessing: `POST /api/invokes/{alias}` → `409 SIGNATURE_STALE`, and `/api/rfc` parameter errors carry a restart hint. Body/logic edits are NOT affected (values pass through live connections); only the parameter list is cached. tabl/stru writes/deletes also clear the gateway's DDIC field cache (`GET /api/ddic/type/{n}`).
 - `replace` body: `old_string` / `new_string` (+ optional `transport`, `activate` (default true), `group`, `rfc_enabled`, `doc`). `old_string` must match **exactly one** place (0 → read the current source first; >1 → include more context lines; `\r\n`/`\n` differences are normalized automatically). Empty `old_string` only works on an empty object.
 - `PUT /source` body: `source` (full text), plus the same optional fields.
 - `syntax` body: `source`. Returns `issues[]` with `severity` (E/W/…), `line`, `offset`, `text`.
@@ -424,7 +426,7 @@ Tips:
 10. **Rate limiting**: when `SAP_RATE_LIMIT_RPS` is set, `/api` is rate-limited per caller IP; exceeding the limit returns `429` (`key=RATE_LIMITED`). No rate limit by default.
 11. **Source endpoints fall back to ADT automatically**: `/api/functions/{name}/source` and `/api/programs/{name}/source` try the RFC path (`RPY_FUNCTIONMODULE_READ` / `RPY_PROGRAM_READ`) first; on failure (except NOT_FOUND) they re-read via ADT. The response's `source_via` field says which channel served it (`rfc` / `adt`). This matters because sources with lines wider than 72 chars (common in modern ABAP) fail the RPY path on some systems.
 12. **Activation failure is not an HTTP error**: write endpoints return 200 with `activated.success=false` + `problems[]` when SAP refuses to activate — always check `activated` in the response body.
-13. **FM signature lives in the source (SEDI form)**: modern ADT systems store a function module's parameter signature **inline in the FUNCTION statement** — `FUNCTION zfm IMPORTING VALUE(iv) TYPE i EXPORTING VALUE(ev) TYPE i.` — and **reject** the classic `*" IMPORTING ...` comment block (400 "Parameter comment blocks are not allowed"). The gateway converts classic blocks automatically on write, and the RFC read endpoint (`/api/functions/{n}/source`) still shows the classic form — prefer `GET /api/objects/func/{n}/source` (ADT form) when doing read-modify-write. Signature changes **do** register in the FM interface — **except** for modules that are (or ever were) `rfc_enabled`: those keep a frozen interface (SAP ignores source-level signature changes); delete + recreate to change them.
+13. **FM signature lives in the source (SEDI form)**: modern ADT systems store a function module's parameter signature **inline in the FUNCTION statement** — `FUNCTION zfm IMPORTING VALUE(iv) TYPE i EXPORTING VALUE(ev) TYPE i.` — and **reject** the classic `*" IMPORTING ...` comment block (400 "Parameter comment blocks are not allowed"). The gateway converts classic blocks automatically on write, and the RFC read endpoint (`/api/functions/{n}/source`) still shows the classic form — prefer `GET /api/objects/func/{n}/source` (ADT form) when doing read-modify-write. Signature changes **do** register in the FM interface — **except** for modules that are (or ever were) `rfc_enabled`: those keep a frozen interface (SAP ignores source-level signature changes); delete + recreate to change them. After such a signature change, interface reads are immediately fresh (constraint 12 territory aside), but **invoking** the changed function returns `409 SIGNATURE_STALE` (flat port) or a parameter error with restart hint (`/api/rfc`) until the gateway restarts — restart the gateway after signature-changing writes.
 
 ## Typical task example
 

@@ -513,7 +513,11 @@ async fn lock_object(base: &str, sess: &mut WriteSession) -> Result<LockInfo, Rf
         return Err(RfcError {
             code: -1,
             status: 502,
-            message: format!("锁定对象失败（ADT 返回 {}）: {}", resp.status, truncate(&body, 200)),
+            message: format!(
+                "锁定对象失败（ADT 返回 {}）: {}",
+                resp.status,
+                truncate(&body, 200)
+            ),
             key: "ADT_LOCK_FAILED".into(),
         });
     }
@@ -1428,7 +1432,14 @@ pub async fn write_object_maybe_create(
         doc,
     } = *opts;
     match write_object_source(
-        obj_type, name, group, source, transport, activate, rfc_enabled, doc,
+        obj_type,
+        name,
+        group,
+        source,
+        transport,
+        activate,
+        rfc_enabled,
+        doc,
     )
     .await
     {
@@ -1445,7 +1456,14 @@ pub async fn write_object_maybe_create(
             };
             create_object(pool, obj_type, name, group, &spec).await?;
             let out = write_object_source(
-                obj_type, name, group, source, transport, activate, rfc_enabled, doc,
+                obj_type,
+                name,
+                group,
+                source,
+                transport,
+                activate,
+                rfc_enabled,
+                doc,
             )
             .await?;
             drain_pool_after_write(pool, obj_type);
@@ -1502,7 +1520,14 @@ pub async fn replace_object_maybe_create(
         });
     }
     let outcome = write_object_source(
-        obj_type, name, group, &updated, transport, activate, rfc_enabled, doc,
+        obj_type,
+        name,
+        group,
+        &updated,
+        transport,
+        activate,
+        rfc_enabled,
+        doc,
     )
     .await?;
     drain_pool_after_write(pool, obj_type);
@@ -1561,9 +1586,18 @@ pub async fn write_object_source(
             key: "NO_SOURCE_RESOURCE".into(),
         });
     }
-    // 表/结构（blue 对象）不走锁编排：etag 乐观并发，单独通道
+    // 表/结构（blue 对象）不走锁编排：etag 乐观并发，单独通道。
+    // 成功后清 TYPE_CACHE——结构定义变更要立即反映到字段展开
+    //（/api/ddic/type 与结构/表参数的字段清单）。
     if obj_type.is_blue_ddic() {
-        return write_ddic_source(obj_type, name, source, transport, activate).await;
+        let outcome = write_ddic_source(obj_type, name, source, transport, activate).await;
+        if outcome.is_ok() {
+            let cleared = crate::metadata::invalidate_type(name.trim());
+            if cleared {
+                tracing::debug!(r#type = %name.trim(), "写后清除 TYPE_CACHE 条目");
+            }
+        }
+        return outcome;
     }
     let type_name = obj_type.api_name();
     let base = obj_type.base_rel(name, group);
@@ -1708,7 +1742,11 @@ pub async fn write_object_source(
     let mut registered_alias = None;
     if obj_type == ObjectType::Function && rfc_result == Some(true) {
         let doc = doc.filter(|d| !d.trim().is_empty());
-        match crate::registry::auto_register_func(&name_upper, (!group.trim().is_empty()).then(|| group.trim()), doc) {
+        match crate::registry::auto_register_func(
+            &name_upper,
+            (!group.trim().is_empty()).then(|| group.trim()),
+            doc,
+        ) {
             Ok(alias) => registered_alias = Some(alias),
             Err(e) => warnings.push(format!("注册表自动登记失败（不影响写入）: {}", e.message)),
         }
@@ -2043,6 +2081,11 @@ pub async fn delete_object(
                 ),
                 key: "ADT_DELETE_FAILED".into(),
             });
+        }
+        // 删除成功后清 TYPE_CACHE（结构定义没了，字段缓存不能留幽灵条目）
+        let cleared = crate::metadata::invalidate_type(name.trim());
+        if cleared {
+            tracing::debug!(r#type = %name.trim(), "删除后清除 TYPE_CACHE 条目");
         }
         return Ok(DeleteOutcome {
             obj_type: obj_type.api_name().to_string(),

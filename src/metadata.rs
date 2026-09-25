@@ -75,6 +75,16 @@ pub fn invalidate_function(func_name: &str) -> bool {
     }
 }
 
+/// 写钩子调用：DDIC 表/结构（tabl/stru）写入或删除成功后清除其字段缓存，
+/// 让下一次 `/api/ddic/type/{name}` 及结构/表参数的字段展开拿到新定义。
+/// 返回是否确有条目被清除（供日志判断）。
+pub fn invalidate_type(type_name: &str) -> bool {
+    match type_cache().write() {
+        Ok(mut map) => map.remove(&type_name.to_uppercase()).is_some(),
+        Err(_) => false,
+    }
+}
+
 /// 把 type_desc_handle 递归解析成 TypeFieldMeta 列表。
 /// SAFETY: type_handle 必须是有效的 DDIC 类型描述符句柄。
 unsafe fn resolve_fields_recursive(

@@ -9,9 +9,12 @@
 //! ```
 //!
 //! 契约**按需派生**而非注册时快照：每次调用从接口元数据现推输入/输出分类，
-//! 注册表里只存覆盖项（如 `max_rows`）。注意：经本网关改参数签名后，SDK 的
-//! 进程级描述符缓存仍持有旧接口（网关重启前新参数不可见——正文逻辑修改
-//! 不受影响）；外部发生的签名漂移在下次派生时自然跟随。三类输出全部
+//! 注册表里只存覆盖项（如 `max_rows`）。v0.15 起接口元数据走 FII
+//! （`FUNCTION_IMPORT_INTERFACE`）服务器端实时读——经本网关改签名（删库重建）
+//! 或 SE37 手改，契约**立即**跟随，SDK 描述符缓存的过期只影响执行侧。
+//! 执行侧有漂移守卫：契约触碰的参数不在 SDK 视图（说明签名在网关启动后变过）
+//! 时返回 409 `SIGNATURE_STALE`（网关重启恢复），而不是按旧签名错读错写。
+//! 三类输出全部
 //! 按真实类型序列化（复用 auto 机制：INT→整数、FLOAT→浮点、BYTE→Base64），
 //! 输出表封顶 `?limit=` > 条目 `max_rows` > 默认 100 行（截断时响应带
 //! `_truncated` 列表）。
@@ -115,6 +118,36 @@ pub fn derive_contract(params: &[FunctionParam]) -> FlatContract {
 }
 
 // ========================================================================
+// 漂移守卫（纯函数，单测锁定）
+// ========================================================================
+
+/// 契约触碰的参数（请求输入 + 全部契约输出——平坦调用的输出是全量自动读回，
+/// 缺一个就不完整）中不在 SDK 描述符视图里的名字，排序去重后返回。
+/// 非空 ⇒ 该函数的签名在网关启动后变更过（SDK 缓存未跟上）。
+pub fn stale_params(
+    contract: &FlatContract,
+    req: &InvokeRequest,
+    sdk: &std::collections::HashSet<String>,
+) -> Vec<String> {
+    let mut touched: Vec<&str> = req
+        .inputs
+        .keys()
+        .chain(req.struct_inputs.keys())
+        .chain(req.table_inputs.keys())
+        .map(|s| s.as_str())
+        .collect();
+    touched.extend(contract.outputs.iter().map(|p| p.name.as_str()));
+    let mut missing: Vec<String> = touched
+        .into_iter()
+        .filter(|n| !sdk.contains(*n))
+        .map(String::from)
+        .collect();
+    missing.sort();
+    missing.dedup();
+    missing
+}
+
+// ========================================================================
 // 请求体分类（扁平 JSON → InvokeRequest 的输入侧）
 // ========================================================================
 
@@ -130,7 +163,10 @@ fn to_scalar(key: &str, v: &Value) -> Result<ScalarValue, RfcError> {
 }
 
 /// 结构体/表行字段的键也做大小写归一（值必须是标量）。
-fn uppercase_row_keys(key: &str, obj: &Map<String, Value>) -> Result<HashMap<String, ScalarValue>, RfcError> {
+fn uppercase_row_keys(
+    key: &str,
+    obj: &Map<String, Value>,
+) -> Result<HashMap<String, ScalarValue>, RfcError> {
     let mut out = HashMap::new();
     for (k, v) in obj {
         out.insert(k.to_uppercase(), to_scalar(&format!("{key}.{k}"), v)?);
@@ -347,13 +383,21 @@ async fn flat_invoke_handler(
         key: "JSON_INVALID".into(),
     })?;
 
-    // 接口元数据（连接池 + 元数据缓存）→ 契约
+    // 接口元数据（FII 实时通道）→ 契约；同时取 SDK 描述符视图的参数集
+    //（漂移守卫用——SDK 缓存进程级，签名变更后它落在后面）
     let func = entry.func_name.clone();
-    let params = crate::server::run_blocking(Arc::clone(&pool), move |conn| {
-        crate::server::collect_function_params(conn, &func)
+    let (view, sdk_param_set) = crate::server::run_blocking(Arc::clone(&pool), move |conn| {
+        let view = crate::server::collect_function_params(conn, &func)?;
+        let sdk = crate::metadata::get_metadata(conn, &func).ok().map(|m| {
+            m.scalars
+                .keys()
+                .cloned()
+                .collect::<std::collections::HashSet<String>>()
+        });
+        Ok((view, sdk))
     })
     .await?;
-    let contract = derive_contract(&params);
+    let contract = derive_contract(&view.params);
     if contract.inputs.is_empty() && contract.outputs.is_empty() {
         return Err(RfcError {
             code: -1,
@@ -365,6 +409,26 @@ async fn flat_invoke_handler(
 
     let mut req = classify_body(&contract, &entry.func_name, &body, q.timeout_secs)?;
     apply_output_specs(&contract, &mut req);
+
+    // 漂移守卫（v0.15）：契约（FII 实时）触碰的参数不在 SDK 描述符视图里
+    // ⇒ 该函数的签名在网关启动后变更过。SDK 缓存无法在进程内失效，实际调用
+    // 会按旧签名错读错写——与其出错得莫名其妙，不如明确 409 给出路。
+    if let Some(sdk) = &sdk_param_set {
+        let missing = stale_params(&contract, &req, sdk);
+        if !missing.is_empty() {
+            return Err(RfcError {
+                code: -1,
+                status: 409,
+                message: format!(
+                    "函数 {} 的签名在网关启动后变更过（SDK 描述符缓存未跟上：{:?}）。\
+                     接口读取已实时反映新签名，但调用需在网关重启后进行；\
+                     网关内改签名请用「删除 + 重建」，改完重启网关",
+                    entry.func_name, missing
+                ),
+                key: "SIGNATURE_STALE".into(),
+            });
+        }
+    }
 
     // 复用 /api/rfc 的执行+指标+审计（函数名标签用真实 SAP 名）
     let resp = crate::server::run_invoke_and_log(
@@ -385,7 +449,9 @@ async fn flat_invoke_handler(
 async fn audit_handler() -> Result<Json<serde_json::Value>, RfcError> {
     let records = crate::server::audit_snapshot();
     let count = records.len();
-    Ok(Json(serde_json::json!({ "count": count, "records": records })))
+    Ok(Json(
+        serde_json::json!({ "count": count, "records": records }),
+    ))
 }
 
 /// 交付端口子路由（挂 /api 鉴权层内）。handler 需要连接池 → 状态类型固定。
@@ -407,7 +473,12 @@ pub fn router() -> Router<SharedPool> {
 mod tests {
     use super::*;
 
-    fn param(name: &str, type_name: &'static str, direction: &'static str, optional: bool) -> FunctionParam {
+    fn param(
+        name: &str,
+        type_name: &'static str,
+        direction: &'static str,
+        optional: bool,
+    ) -> FunctionParam {
         let kind = type_name;
         let fields = if kind == "STRUCTURE" || kind == "TABLE" {
             Some(vec![
@@ -515,14 +586,21 @@ mod tests {
         assert_eq!(err.status, 400);
         assert_eq!(err.key, "INVOKE_PARAM_UNKNOWN");
         assert!(err.message.contains("typo_key"));
-        assert!(err.message.contains("IV_A"), "应列出合法参数: {}", err.message);
+        assert!(
+            err.message.contains("IV_A"),
+            "应列出合法参数: {}",
+            err.message
+        );
     }
 
     #[test]
     fn classify_rejects_wrong_shapes() {
         let c = sample_contract();
         // 非对象体
-        assert_eq!(classify_body(&c, "Z_X", &json!([1]), None).unwrap_err().key, "INVOKE_BODY_INVALID");
+        assert_eq!(
+            classify_body(&c, "Z_X", &json!([1]), None).unwrap_err().key,
+            "INVOKE_BODY_INVALID"
+        );
         // 表传了对象
         let e = classify_body(&c, "Z_X", &json!({"SEL_RANGE": {}}), None).unwrap_err();
         assert_eq!(e.key, "INVOKE_VALUE_INVALID");
@@ -598,6 +676,79 @@ mod tests {
         assert_eq!(effective_cap(None, Some(500)), 500);
         assert_eq!(effective_cap(Some(7), Some(500)), 7);
         assert_eq!(effective_cap(Some(0), None), 1, "下限 1");
-        assert_eq!(effective_cap(Some(999_999), None), 10_000, "上限对齐 MAX_OUTPUT_ROWS");
+        assert_eq!(
+            effective_cap(Some(999_999), None),
+            10_000,
+            "上限对齐 MAX_OUTPUT_ROWS"
+        );
+    }
+
+    // --- 漂移守卫（v0.15） ---
+
+    fn sdk_set(names: &[&str]) -> std::collections::HashSet<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn stale_params_clean_when_sdk_knows_everything() {
+        let c = sample_contract();
+        let req = classify_body(
+            &c,
+            "Z_X",
+            &json!({"IV_A": 1, "sel_range": [{"SUB1": "x"}]}),
+            None,
+        )
+        .unwrap();
+        let sdk = sdk_set(&[
+            "IV_A",
+            "IV_ADDR",
+            "SEL_RANGE",
+            "T_ROWS",
+            "EV_SUM",
+            "ES_HDR",
+            "CH_COUNT",
+        ]);
+        // 契约输出全部在 SDK 视图 + 请求输入也都在 → 无漂移
+        assert!(stale_params(&c, &req, &sdk).is_empty());
+    }
+
+    #[test]
+    fn stale_params_detects_new_output_and_new_input() {
+        let c = sample_contract();
+        // SDK 视图缺 EV_SUM（签名变更后新增的输出）——平坦调用全量读回，必须报漂移
+        let sdk = sdk_set(&[
+            "IV_A",
+            "IV_ADDR",
+            "SEL_RANGE",
+            "T_ROWS",
+            "ES_HDR",
+            "CH_COUNT",
+        ]);
+        let req = classify_body(&c, "Z_X", &json!({}), None).unwrap();
+        assert_eq!(stale_params(&c, &req, &sdk), vec!["EV_SUM"]);
+
+        // SDK 视图缺请求输入 IV_A → 报漂移（输出侧这个视图是全的）
+        let sdk2 = sdk_set(&[
+            "IV_ADDR",
+            "SEL_RANGE",
+            "T_ROWS",
+            "EV_SUM",
+            "ES_HDR",
+            "CH_COUNT",
+        ]);
+        let req2 = classify_body(&c, "Z_X", &json!({"IV_A": 1}), None).unwrap();
+        assert_eq!(stale_params(&c, &req2, &sdk2), vec!["IV_A"]);
+    }
+
+    #[test]
+    fn stale_params_ignores_untouched_params() {
+        // SDK 视图缺 ES_HDR，但请求没碰它且……输出侧全量读回，仍会报——
+        // 这是有意的：平坦响应缺一个输出就是不完整。验证输入侧的「没碰就不报」：
+        let mut c = sample_contract();
+        c.outputs
+            .retain(|p| p.name != "ES_HDR" && p.name != "EV_SUM");
+        let sdk = sdk_set(&["IV_A", "IV_ADDR", "SEL_RANGE", "T_ROWS", "CH_COUNT"]);
+        let req = classify_body(&c, "Z_X", &json!({"IV_A": 1}), None).unwrap();
+        assert!(stale_params(&c, &req, &sdk).is_empty());
     }
 }

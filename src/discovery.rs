@@ -10,9 +10,9 @@
 
 use crate::api::{FieldSpec, InvokeRequest, ScalarValue};
 use crate::connection::RfcConnection;
-use serde::Serialize;
 use crate::error::RfcError;
 use crate::executor::execute_collect;
+use serde::Serialize;
 use std::collections::HashMap;
 
 /// 搜索结果条目：一个可远程调用的函数模块
@@ -69,9 +69,18 @@ pub fn search_functions(
     let mut out = Vec::new();
     for row in table.into_iter().take(max_results) {
         out.push(FunctionEntry {
-            name: row.get("FUNCNAME").map(|v| v.clone().into_chars()).unwrap_or_default(),
-            group: row.get("GROUPNAME").map(|v| v.clone().into_chars()).unwrap_or_default(),
-            description: row.get("STEXT").map(|v| v.clone().into_chars()).unwrap_or_default(),
+            name: row
+                .get("FUNCNAME")
+                .map(|v| v.clone().into_chars())
+                .unwrap_or_default(),
+            group: row
+                .get("GROUPNAME")
+                .map(|v| v.clone().into_chars())
+                .unwrap_or_default(),
+            description: row
+                .get("STEXT")
+                .map(|v| v.clone().into_chars())
+                .unwrap_or_default(),
         });
     }
     Ok(out)
@@ -139,18 +148,21 @@ pub fn read_ddic_field_info(
     let req = InvokeRequest {
         func_name: "DDIF_FIELDINFO_GET".to_string(),
         inputs: HashMap::from([
-            ("TABNAME".to_string(), ScalarValue::Chars(table.to_uppercase())),
+            (
+                "TABNAME".to_string(),
+                ScalarValue::Chars(table.to_uppercase()),
+            ),
             // 注意：查结构单字段必须用 LFIELDNAME 而非 FIELDNAME（后者对结构无效）
-            ("LFIELDNAME".to_string(), ScalarValue::Chars(field.to_uppercase())),
+            (
+                "LFIELDNAME".to_string(),
+                ScalarValue::Chars(field.to_uppercase()),
+            ),
             ("LANGU".to_string(), ScalarValue::Chars(lang.to_string())),
             ("ALL_TYPES".to_string(), ScalarValue::Chars("X".to_string())),
         ]),
         // DFIES_WA 是 EXPORT 结构体（单字段语义），FIXED_VALUES 是 TABLES（固定值列表）
         struct_outputs: HashMap::from([("DFIES_WA".to_string(), dfies_field_spec())]),
-        table_outputs: HashMap::from([(
-            "FIXED_VALUES".to_string(),
-            fixed_values_spec(),
-        )]),
+        table_outputs: HashMap::from([("FIXED_VALUES".to_string(), fixed_values_spec())]),
         ..Default::default()
     };
 
@@ -164,18 +176,39 @@ pub fn read_ddic_field_info(
         .unwrap_or_default()
         .into_iter()
         .map(|row| FixedValue {
-            value: row.get("LOW").map(|v| v.clone().into_chars()).unwrap_or_default(),
-            text: row.get("DDTEXT").map(|v| v.clone().into_chars()).unwrap_or_default(),
+            value: row
+                .get("LOW")
+                .map(|v| v.clone().into_chars())
+                .unwrap_or_default(),
+            text: row
+                .get("DDTEXT")
+                .map(|v| v.clone().into_chars())
+                .unwrap_or_default(),
         })
         .collect();
 
     Ok(FieldSemantics {
         field: field.to_uppercase(),
-        data_element: dfies.get("ROLLNAME").map(|v| v.clone().into_chars()).unwrap_or_default(),
-        domain: dfies.get("DOMNAME").map(|v| v.clone().into_chars()).unwrap_or_default(),
-        check_table: dfies.get("CHECKTABLE").map(|v| v.clone().into_chars()).unwrap_or_default(),
-        description: dfies.get("FIELDTEXT").map(|v| v.clone().into_chars()).unwrap_or_default(),
-        medium_label: dfies.get("SCRTEXT_M").map(|v| v.clone().into_chars()).unwrap_or_default(),
+        data_element: dfies
+            .get("ROLLNAME")
+            .map(|v| v.clone().into_chars())
+            .unwrap_or_default(),
+        domain: dfies
+            .get("DOMNAME")
+            .map(|v| v.clone().into_chars())
+            .unwrap_or_default(),
+        check_table: dfies
+            .get("CHECKTABLE")
+            .map(|v| v.clone().into_chars())
+            .unwrap_or_default(),
+        description: dfies
+            .get("FIELDTEXT")
+            .map(|v| v.clone().into_chars())
+            .unwrap_or_default(),
+        medium_label: dfies
+            .get("SCRTEXT_M")
+            .map(|v| v.clone().into_chars())
+            .unwrap_or_default(),
         fixed_values,
     })
 }
@@ -184,13 +217,13 @@ pub fn read_ddic_field_info(
 /// 字段名取自 SAP DFIES 结构定义；对可能缺失的字段容错。
 fn dfies_field_spec() -> Vec<FieldSpec> {
     [
-        "ROLLNAME",  // 数据元素
-        "DOMNAME",   // 域
+        "ROLLNAME",   // 数据元素
+        "DOMNAME",    // 域
         "CHECKTABLE", // 检查表
-        "FIELDTEXT", // 字段描述
-        "SCRTEXT_M", // 中等标签
-        "SCRTEXT_L", // 长标签
-        "SCRTEXT_S", // 短标签
+        "FIELDTEXT",  // 字段描述
+        "SCRTEXT_M",  // 中等标签
+        "SCRTEXT_L",  // 长标签
+        "SCRTEXT_S",  // 短标签
     ]
     .into_iter()
     .map(|name| FieldSpec {
@@ -247,7 +280,10 @@ pub fn read_function_doc(
     let req = InvokeRequest {
         func_name: "DOCU_GET".to_string(),
         inputs: HashMap::from([
-            ("OBJECT".to_string(), ScalarValue::Chars(func_name.to_uppercase())),
+            (
+                "OBJECT".to_string(),
+                ScalarValue::Chars(func_name.to_uppercase()),
+            ),
             ("ID".to_string(), ScalarValue::Chars("FU".to_string())),
             ("LANGU".to_string(), ScalarValue::Chars(lang.to_string())),
         ]),
@@ -262,7 +298,9 @@ pub fn read_function_doc(
             let long_text = lines
                 .iter()
                 .map(|row| {
-                    row.get("TDLINE").map(|v| v.clone().into_chars()).unwrap_or_default()
+                    row.get("TDLINE")
+                        .map(|v| v.clone().into_chars())
+                        .unwrap_or_default()
                 })
                 .collect::<Vec<_>>()
                 .join("\n");
@@ -279,7 +317,10 @@ pub fn read_function_doc(
                 name: func_name.to_string(),
                 short_text: short_text.to_string(),
                 long_text: String::new(),
-                warning: Some(format!("读取长文档失败（可能无文档或 DOCU_GET 不可用）: {}", e.message)),
+                warning: Some(format!(
+                    "读取长文档失败（可能无文档或 DOCU_GET 不可用）: {}",
+                    e.message
+                )),
             })
         }
     }
@@ -337,12 +378,187 @@ pub fn read_function_source(
         .collect())
 }
 
+// ========================================================================
+// 函数接口实时读取（v0.15 契约新鲜通道）
+// ========================================================================
+
+/// FII（`FUNCTION_IMPORT_INTERFACE`）参数表的一行，Rust 化。
+///
+/// `direction` 由行所在表决定（IMPORT/EXPORT/CHANGING/TABLES）。
+/// 与 SDK 描述符（`RfcGetFunctionDesc`，进程级缓存）不同，FII 在 SAP 端
+/// 实时读函数接口——签名变更后立即反映，是契约面（接口端点 / 平坦调用 /
+/// OpenAPI / MCP）的新鲜度来源。
+#[derive(Debug, Clone)]
+pub struct RawInterfaceParam {
+    pub name: String,
+    pub direction: &'static str,
+    /// LIKE/结构引用：IMPORT/EXPORT/CHANGING 行是 `DBFIELD` 列，TABLES 行是
+    /// `DBSTRUCT` 列（行类型不同，列名也不同——实测如此）。
+    pub dbfield: String,
+    /// `TYP` 列：TYPE 引用名（数据元素/结构/表类型）或 ABAP 内建字面量
+    /// （I/F/D/T/STRING/...）。
+    pub typ: String,
+    pub optional: bool,
+    pub default: String,
+}
+
+/// 参数短文本（FII `P_DOCU` 表：参数名 → STEXT，多为空——SE37 里没维护就空）。
+pub type ParamDocs = HashMap<String, String>;
+
+/// FII 输出表行字段规格。各表行类型不同，读不存在的字段每行会打 WARN 并得
+/// 空串，因此每个表的字段清单必须与真实行类型精确对齐（实测接口）：
+/// - IMPORT/CHANGING（含 ENHA_）：PARAMETER/DBFIELD/DEFAULT/OPTIONAL/TYP
+/// - EXPORT（含 ENHA_）：PARAMETER/DBFIELD/TYP（无 OPTIONAL 列）
+/// - TABLES（含 ENHA_）：PARAMETER/DBSTRUCT/OPTIONAL/TYP
+/// - P_DOCU：PARAMETER/KIND/STEXT
+fn fii_field_spec(shape: &'static str) -> Vec<FieldSpec> {
+    let f = |name: &str| FieldSpec {
+        name: name.to_string(),
+        max_len: None,
+        auto: false,
+    };
+    match shape {
+        "import" => vec![
+            f("PARAMETER"),
+            f("DBFIELD"),
+            f("DEFAULT"),
+            f("OPTIONAL"),
+            f("TYP"),
+        ],
+        "export" => vec![f("PARAMETER"), f("DBFIELD"), f("TYP")],
+        "tables" => vec![f("PARAMETER"), f("DBSTRUCT"), f("OPTIONAL"), f("TYP")],
+        _ => vec![f("PARAMETER"), f("KIND"), f("STEXT")], // docu
+    }
+}
+
+/// 把 FII 响应里的一张表转成 RawInterfaceParam 列表（纯函数，单测锁定）。
+/// `field_col`：DBFIELD（I/E/C 行）或 DBSTRUCT（TABLES 行）。
+fn raw_rows(
+    resp: &crate::api::InvokeResponse,
+    table: &str,
+    field_col: &str,
+    direction: &'static str,
+) -> Vec<RawInterfaceParam> {
+    resp.tables
+        .get(table)
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|row| {
+            let s = |k: &str| {
+                row.get(k)
+                    .map(|v| v.clone().into_chars())
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string()
+            };
+            let name = s("PARAMETER");
+            if name.is_empty() {
+                return None;
+            }
+            Some(RawInterfaceParam {
+                name,
+                direction,
+                dbfield: s(field_col),
+                typ: s("TYP"),
+                optional: s("OPTIONAL") == "X",
+                default: s("DEFAULT"),
+            })
+        })
+        .collect()
+}
+
+/// P_DOCU 表 → 参数短文本映射（仅取 KIND='P' 的参数行）。
+fn raw_param_docs(resp: &crate::api::InvokeResponse) -> ParamDocs {
+    resp.tables
+        .get("P_DOCU")
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|row| {
+            let s = |k: &str| {
+                row.get(k)
+                    .map(|v| v.clone().into_chars())
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string()
+            };
+            (s("KIND") == "P" && !s("PARAMETER").is_empty()).then(|| (s("PARAMETER"), s("STEXT")))
+        })
+        .collect()
+}
+
+/// 读函数模块的**实时接口**（参数名/方向/类型引用/可选/默认值/参数短文本）。
+///
+/// 内部调 `FUNCTION_IMPORT_INTERFACE`（SE37 接口读取器同款，remote-enabled）。
+/// 选它而不是 `RPY_FUNCTIONMODULE_READ` 的原因：后者必读 SOURCE 表，源码行
+/// 宽超 72 时整个调用被 FL 180 拒绝（宽源码在现代 ABAP 很常见），FII 不碰
+/// 源码没有这个坑。增强参数（ENHA_*）一并读回，与 SDK 描述符视图对齐。
+///
+/// 函数不存在时返回 404 `FU_NOT_FOUND`（与 SDK 通道同语义）。
+pub fn read_function_interface_rfc(
+    conn: &RfcConnection,
+    func_name: &str,
+) -> Result<(Vec<RawInterfaceParam>, ParamDocs), RfcError> {
+    let req = InvokeRequest {
+        func_name: "FUNCTION_IMPORT_INTERFACE".to_string(),
+        inputs: HashMap::from([
+            (
+                "FUNCNAME".to_string(),
+                ScalarValue::Chars(func_name.to_uppercase()),
+            ),
+            // INACTIVE_VERSION 是非可选 CHAR1，传空格 = 读激活版本
+            (
+                "INACTIVE_VERSION".to_string(),
+                ScalarValue::Chars(" ".to_string()),
+            ),
+            // 把增强参数并入 ENHA_* 表（不传时增强参数可能缺席）
+            (
+                "WITH_ENHANCEMENTS".to_string(),
+                ScalarValue::Chars("X".to_string()),
+            ),
+        ]),
+        table_outputs: HashMap::from([
+            ("IMPORT_PARAMETER".to_string(), fii_field_spec("import")),
+            ("EXPORT_PARAMETER".to_string(), fii_field_spec("export")),
+            ("CHANGING_PARAMETER".to_string(), fii_field_spec("import")),
+            ("TABLES_PARAMETER".to_string(), fii_field_spec("tables")),
+            ("ENHA_IMP_PARAMETER".to_string(), fii_field_spec("import")),
+            ("ENHA_EXP_PARAMETER".to_string(), fii_field_spec("export")),
+            ("ENHA_CHA_PARAMETER".to_string(), fii_field_spec("import")),
+            ("ENHA_TBL_PARAMETER".to_string(), fii_field_spec("tables")),
+            ("P_DOCU".to_string(), fii_field_spec("docu")),
+        ]),
+        ..Default::default()
+    };
+    let resp = match execute_collect(conn, &req) {
+        Ok(r) => r,
+        // FL 046 在 FII 的错误键是 FUNCTION_NOT_FOUND——归一成 SDK 通道的
+        // FU_NOT_FOUND，让上游（降级逻辑/HTTP 层）只认一种「函数不存在」。
+        Err(e) if e.key == "FUNCTION_NOT_FOUND" => {
+            return Err(RfcError {
+                key: "FU_NOT_FOUND".into(),
+                status: 404,
+                ..e
+            });
+        }
+        Err(e) => return Err(e),
+    };
+    let mut out = Vec::new();
+    out.extend(raw_rows(&resp, "IMPORT_PARAMETER", "DBFIELD", "IMPORT"));
+    out.extend(raw_rows(&resp, "ENHA_IMP_PARAMETER", "DBFIELD", "IMPORT"));
+    out.extend(raw_rows(&resp, "EXPORT_PARAMETER", "DBFIELD", "EXPORT"));
+    out.extend(raw_rows(&resp, "ENHA_EXP_PARAMETER", "DBFIELD", "EXPORT"));
+    out.extend(raw_rows(&resp, "CHANGING_PARAMETER", "DBFIELD", "CHANGING"));
+    out.extend(raw_rows(&resp, "ENHA_CHA_PARAMETER", "DBFIELD", "CHANGING"));
+    out.extend(raw_rows(&resp, "TABLES_PARAMETER", "DBSTRUCT", "TABLES"));
+    out.extend(raw_rows(&resp, "ENHA_TBL_PARAMETER", "DBSTRUCT", "TABLES"));
+    Ok((out, raw_param_docs(&resp)))
+}
+
 /// 读 ABAP 程序源代码（内部调 `RPY_PROGRAM_READ`，源码在 `SOURCE_EXTENDED` 表）。
 /// 程序不存在时 SAP 返回错误（透传 → 404）；存在但无源码 → 空 Vec。
-pub fn read_program_source(
-    conn: &RfcConnection,
-    prog_name: &str,
-) -> Result<Vec<String>, RfcError> {
+pub fn read_program_source(conn: &RfcConnection, prog_name: &str) -> Result<Vec<String>, RfcError> {
     let req = InvokeRequest {
         func_name: "RPY_PROGRAM_READ".to_string(),
         inputs: HashMap::from([
@@ -531,12 +747,23 @@ pub fn read_where_used(
     func_name: &str,
     max_results: usize,
 ) -> Result<Vec<WhereUsedEntry>, RfcError> {
-    fn query(conn: &RfcConnection, name: &str, obj_type: &str, max: usize) -> Result<Vec<WhereUsedEntry>, RfcError> {
+    fn query(
+        conn: &RfcConnection,
+        name: &str,
+        obj_type: &str,
+        max: usize,
+    ) -> Result<Vec<WhereUsedEntry>, RfcError> {
         let req = InvokeRequest {
             func_name: "REPOSITORY_ENVIRONMENT_SET_RFC".to_string(),
             inputs: HashMap::from([
-                ("OBJECT_NAME".to_string(), ScalarValue::Chars(name.to_uppercase())),
-                ("OBJ_TYPE".to_string(), ScalarValue::Chars(obj_type.to_string())),
+                (
+                    "OBJECT_NAME".to_string(),
+                    ScalarValue::Chars(name.to_uppercase()),
+                ),
+                (
+                    "OBJ_TYPE".to_string(),
+                    ScalarValue::Chars(obj_type.to_string()),
+                ),
             ]),
             // 只关心「谁在用」：程序与函数组（类在环境引擎里也归 PROG）
             struct_inputs: HashMap::from([(
@@ -549,11 +776,31 @@ pub fn read_where_used(
             table_outputs: HashMap::from([(
                 "ENVIRONMENT".to_string(),
                 vec![
-                    crate::api::FieldSpec { name: "TYPE".to_string(), max_len: Some(15), auto: false },
-                    crate::api::FieldSpec { name: "OBJECT".to_string(), max_len: Some(180), auto: false },
-                    crate::api::FieldSpec { name: "ENCL_OBJ".to_string(), max_len: Some(40), auto: false },
-                    crate::api::FieldSpec { name: "DEVCLASS".to_string(), max_len: Some(30), auto: false },
-                    crate::api::FieldSpec { name: "CALL_TYPE".to_string(), max_len: Some(15), auto: false },
+                    crate::api::FieldSpec {
+                        name: "TYPE".to_string(),
+                        max_len: Some(15),
+                        auto: false,
+                    },
+                    crate::api::FieldSpec {
+                        name: "OBJECT".to_string(),
+                        max_len: Some(180),
+                        auto: false,
+                    },
+                    crate::api::FieldSpec {
+                        name: "ENCL_OBJ".to_string(),
+                        max_len: Some(40),
+                        auto: false,
+                    },
+                    crate::api::FieldSpec {
+                        name: "DEVCLASS".to_string(),
+                        max_len: Some(30),
+                        auto: false,
+                    },
+                    crate::api::FieldSpec {
+                        name: "CALL_TYPE".to_string(),
+                        max_len: Some(15),
+                        auto: false,
+                    },
                 ],
             )]),
             ..Default::default()
@@ -739,7 +986,10 @@ pub fn build_function_prologue(conn: &RfcConnection, deps: &[String]) -> Prologu
             }
             Err(e) => {
                 failed += 1;
-                text.push_str(&format!("\" FUNCTION {} -- 接口读取失败: {}\n", d, e.message));
+                text.push_str(&format!(
+                    "\" FUNCTION {} -- 接口读取失败: {}\n",
+                    d, e.message
+                ));
             }
         }
     }
@@ -778,7 +1028,10 @@ pub fn resolve_function_group(conn: &RfcConnection, func_name: &str) -> Result<S
     Err(RfcError {
         code: -1,
         status: 404,
-        message: format!("无法反解函数 {} 的所属函数组（ADT 降级读需要组名）", func_name),
+        message: format!(
+            "无法反解函数 {} 的所属函数组（ADT 降级读需要组名）",
+            func_name
+        ),
         key: "FUNCTION_GROUP_NOT_FOUND".into(),
     })
 }
@@ -786,6 +1039,92 @@ pub fn resolve_function_group(conn: &RfcConnection, func_name: &str) -> Result<S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- FII 行解析（v0.15） ---
+
+    fn fii_resp() -> crate::api::InvokeResponse {
+        let row = |pairs: &[(&str, &str)]| {
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), ScalarValue::Chars(v.to_string())))
+                .collect::<HashMap<_, _>>()
+        };
+        crate::api::InvokeResponse {
+            func: "FUNCTION_IMPORT_INTERFACE".into(),
+            scalars: Default::default(),
+            structs: Default::default(),
+            return_table: None,
+            tables: HashMap::from([
+                (
+                    "IMPORT_PARAMETER".to_string(),
+                    vec![
+                        row(&[
+                            ("PARAMETER", "IV_A"),
+                            ("DBFIELD", ""),
+                            ("DEFAULT", "1"),
+                            ("OPTIONAL", "X"),
+                            ("TYP", "I"),
+                        ]),
+                        row(&[
+                            ("PARAMETER", "USERNAME"),
+                            ("DBFIELD", "BAPIBNAME-BAPIBNAME"),
+                            ("OPTIONAL", ""),
+                        ]),
+                        // 空名行防御性跳过
+                        row(&[("PARAMETER", " "), ("TYP", "I")]),
+                    ],
+                ),
+                (
+                    "TABLES_PARAMETER".to_string(),
+                    vec![row(&[
+                        ("PARAMETER", "T_ROWS"),
+                        ("DBSTRUCT", "ZAGW_ROW"),
+                        ("OPTIONAL", "X"),
+                    ])],
+                ),
+                (
+                    "P_DOCU".to_string(),
+                    vec![
+                        row(&[("PARAMETER", "IV_A"), ("KIND", "P"), ("STEXT", "左操作数")]),
+                        row(&[
+                            ("PARAMETER", "E_BOOM"),
+                            ("KIND", "E"),
+                            ("STEXT", "异常不算参数文本"),
+                        ]),
+                    ],
+                ),
+            ]),
+        }
+    }
+
+    #[test]
+    fn fii_rows_parse_directions_and_refs() {
+        let resp = fii_resp();
+        let rows = raw_rows(&resp, "IMPORT_PARAMETER", "DBFIELD", "IMPORT");
+        assert_eq!(rows.len(), 2, "空 PARAMETER 行应跳过");
+        assert_eq!(rows[0].name, "IV_A");
+        assert_eq!(rows[0].direction, "IMPORT");
+        assert!(rows[0].optional);
+        assert_eq!(rows[0].default, "1");
+        assert_eq!(rows[0].typ, "I");
+        // LIKE 表-字段引用走 DBFIELD 列
+        assert_eq!(rows[1].dbfield, "BAPIBNAME-BAPIBNAME");
+
+        let tables = raw_rows(&resp, "TABLES_PARAMETER", "DBSTRUCT", "TABLES");
+        assert_eq!(
+            tables[0].dbfield, "ZAGW_ROW",
+            "TABLES 行的类型引用在 DBSTRUCT 列"
+        );
+        assert_eq!(tables[0].direction, "TABLES");
+        assert!(tables[0].optional);
+    }
+
+    #[test]
+    fn fii_param_docs_only_kind_p() {
+        let docs = raw_param_docs(&fii_resp());
+        assert_eq!(docs.get("IV_A").map(String::as_str), Some("左操作数"));
+        assert!(!docs.contains_key("E_BOOM"));
+    }
 
     #[test]
     fn fallback_decision_preserves_not_found_semantics() {
@@ -835,7 +1174,11 @@ mod tests {
         ];
         assert_eq!(
             scan_called_functions(&lines, "", 30),
-            vec!["BAPI_TRANSACTION_COMMIT", "Z_FOO", "/SDF/EWA_GET_ABAP_DUMPS"]
+            vec![
+                "BAPI_TRANSACTION_COMMIT",
+                "Z_FOO",
+                "/SDF/EWA_GET_ABAP_DUMPS"
+            ]
         );
     }
 
@@ -850,7 +1193,10 @@ mod tests {
             "  CALL FUNCTION 'SELF'.".into(),
             "  CALL FUNCTION 'KEPT'.".into(),
         ];
-        assert_eq!(scan_called_functions(&lines, "SELF", 30), vec!["DUP", "KEPT"]);
+        assert_eq!(
+            scan_called_functions(&lines, "SELF", 30),
+            vec!["DUP", "KEPT"]
+        );
     }
 
     #[test]
@@ -887,9 +1233,17 @@ mod tests {
         let out = format_prologue_dep("BAPI_TRANSACTION_COMMIT", &params);
         assert_eq!(out[0], "FUNCTION BAPI_TRANSACTION_COMMIT.");
         assert!(out[1].starts_with("  IMPORT  WAIT"), "got: {}", out[1]);
-        assert!(out[1].ends_with("CHAR(1) 可选 -- 等待更新结束"), "got: {}", out[1]);
+        assert!(
+            out[1].ends_with("CHAR(1) 可选 -- 等待更新结束"),
+            "got: {}",
+            out[1]
+        );
         assert!(out[2].starts_with("  EXPORT  RETURN"), "got: {}", out[2]);
-        assert!(out[2].ends_with("STRUCT(TYPE,ID,NUMBER,MESSAGE)"), "got: {}", out[2]);
+        assert!(
+            out[2].ends_with("STRUCT(TYPE,ID,NUMBER,MESSAGE)"),
+            "got: {}",
+            out[2]
+        );
         // 列对齐：方向列 8 字符、名字列 31 字符，两行的类型表达从同一列开始
         let type_col = |l: &str| l.find("CHAR(1)").or_else(|| l.find("STRUCT("));
         assert_eq!(type_col(&out[1]), type_col(&out[2]));
