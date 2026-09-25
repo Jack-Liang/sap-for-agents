@@ -919,7 +919,9 @@ mod tests {
 
     // ---- HTTP 端点（全局单例 → 串行）----
 
-    static TEST_LOCK: Mutex<()> = Mutex::new(());
+    // tokio Mutex：测试体是 async fn，守卫要跨 await 持有（std Mutex 会触发
+    // clippy::await_holding_lock；这里序列化的是全局单例测试，无竞争语义差异）
+    static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     /// OnceLock 只能设一次：测试进程内首个调用者定路径；后续测试只重置
     /// 内部 store（文件路径不变，断言时从 REGISTRY 取真实路径）。
@@ -962,7 +964,7 @@ mod tests {
 
     #[tokio::test]
     async fn endpoint_crud_lifecycle() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().await;
         reset_global("crud");
         // 空表
         let (st, body) = call(
@@ -1025,7 +1027,7 @@ mod tests {
 
     #[tokio::test]
     async fn endpoint_validations() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().await;
         reset_global("validate");
         // 非法 alias（大写）
         let (st, body) = call(put_req("Z_BAD", &serde_json::json!({"func_name": "Z_X"}))).await;
@@ -1074,7 +1076,7 @@ mod tests {
 
     #[tokio::test]
     async fn corrupt_file_backed_up_and_starts_fresh() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().await;
         // 直接构造 state 验证逻辑（不动全局）：写坏文件 → init 分支逻辑在
         // Store::from_json 层面已被上面覆盖；这里验证备份命名与空表启动。
         let dir = std::env::temp_dir().join("sfa-registry-test-corrupt");
