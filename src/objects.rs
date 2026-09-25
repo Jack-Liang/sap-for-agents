@@ -1407,6 +1407,9 @@ pub struct WriteOpts<'a> {
     pub create_desc: Option<&'a str>,
     /// 函数模块写入后设为 remote-enabled（processingType=rfc，元数据 PUT）
     pub rfc_enabled: bool,
+    /// 随代码写入的接口文档（func 类）：存入注册表条目、流入 OpenAPI 目录正文。
+    /// None = 不动条目已有文档；Some("") 视为未提供。
+    pub doc: Option<&'a str>,
 }
 
 pub async fn write_object_maybe_create(
@@ -1422,19 +1425,17 @@ pub async fn write_object_maybe_create(
         activate,
         create_desc,
         rfc_enabled,
+        doc,
     } = *opts;
     match write_object_source(
-        obj_type,
-        name,
-        group,
-        source,
-        transport,
-        activate,
-        rfc_enabled,
+        obj_type, name, group, source, transport, activate, rfc_enabled, doc,
     )
     .await
     {
-        Ok(o) => Ok(o),
+        Ok(o) => {
+            drain_pool_after_write(pool, obj_type);
+            Ok(o)
+        }
         Err(e) if create_desc.is_some() && is_object_not_exist(&e) => {
             let spec = CreateSpec {
                 description: create_desc.unwrap_or_default().to_string(),
@@ -1443,16 +1444,12 @@ pub async fn write_object_maybe_create(
                 software_component: None,
             };
             create_object(pool, obj_type, name, group, &spec).await?;
-            write_object_source(
-                obj_type,
-                name,
-                group,
-                source,
-                transport,
-                activate,
-                rfc_enabled,
+            let out = write_object_source(
+                obj_type, name, group, source, transport, activate, rfc_enabled, doc,
             )
-            .await
+            .await?;
+            drain_pool_after_write(pool, obj_type);
+            Ok(out)
         }
         Err(e) => Err(e),
     }
@@ -1474,6 +1471,7 @@ pub async fn replace_object_maybe_create(
         activate,
         create_desc,
         rfc_enabled,
+        doc,
     } = *opts;
     let current = match read_current_source(obj_type, name, group).await {
         Ok(c) => c,
@@ -1504,15 +1502,10 @@ pub async fn replace_object_maybe_create(
         });
     }
     let outcome = write_object_source(
-        obj_type,
-        name,
-        group,
-        &updated,
-        transport,
-        activate,
-        rfc_enabled,
+        obj_type, name, group, &updated, transport, activate, rfc_enabled, doc,
     )
     .await?;
+    drain_pool_after_write(pool, obj_type);
     let mut v = serde_json::to_value(&outcome).unwrap_or_default();
     v["replaced"] = serde_json::json!(true);
     Ok(v)
@@ -1522,6 +1515,19 @@ pub async fn replace_object_maybe_create(
 pub fn is_object_not_exist(err: &RfcError) -> bool {
     (err.status == 409 && err.key == "ADT_ExceptionResourceNotFound")
         || err.message.contains("does not exist")
+}
+
+/// 写钩子的池侧失效：func/fugr 变更影响 SAP 按连接缓存的函数组加载——
+/// 排干空闲 RFC 连接，让下一次调用必然重建连接、重新加载组。
+/// （FUNC_CACHE 的清理在 write_object_source/delete_object 内部已做。）
+/// 对其他类型是无害空操作。
+pub fn drain_pool_after_write(
+    pool: &std::sync::Arc<crate::pool::RfcConnectionPool>,
+    obj_type: ObjectType,
+) {
+    if matches!(obj_type, ObjectType::Function | ObjectType::FunctionGroup) {
+        pool.drain_idle();
+    }
 }
 
 /// 编排写入：锁 → PUT 源码 →（可选）rfc 元数据 PUT → 解锁 → 激活。
@@ -1545,6 +1551,7 @@ pub async fn write_object_source(
     transport: Option<&str>,
     activate: bool,
     rfc_enabled: bool,
+    doc: Option<&str>,
 ) -> Result<WriteOutcome, RfcError> {
     if !obj_type.has_source() {
         return Err(RfcError {
@@ -1684,12 +1691,24 @@ pub async fn write_object_source(
         None
     };
 
-    // ⑤ 注册表自动登记：remote-enabled 函数写入成功即获得 draft 条目
-    //    （幂等；保留 Agent 已写的 intent/notes）。登记失败只降级为警告——
-    //    注册表是网关本地状态，绝不让它影响 SAP 写入结果。
+    // ⑤ 缓存失效：函数写入成功即清 FUNC_CACHE——下一次接口自省/auto_outputs
+    //    必然拿到新签名（否则读到的是写入前的快照）。注意 SAP 侧函数组加载
+    //    仍按连接缓存（池排干由调用方 drain_pool_after_write 处理）、SDK 描述符
+    //    缓存进程级不可失效（删库重建的 FM 新参数要重启网关才可见，见 AGENTS.md）。
+    if obj_type == ObjectType::Function {
+        let cleared = crate::metadata::invalidate_function(name.trim());
+        if cleared {
+            tracing::debug!(func = %name.trim(), "写后清除 FUNC_CACHE 条目");
+        }
+    }
+
+    // ⑥ 注册表自动登记：remote-enabled 函数写入成功即获得 draft 条目
+    //    （幂等；保留 Agent 已写的 intent/notes）。doc 随代码更新条目文档。
+    //    登记失败只降级为警告——注册表是网关本地状态，绝不让它影响 SAP 写入结果。
     let mut registered_alias = None;
     if obj_type == ObjectType::Function && rfc_result == Some(true) {
-        match crate::registry::auto_register_func(&name_upper, (!group.trim().is_empty()).then(|| group.trim())) {
+        let doc = doc.filter(|d| !d.trim().is_empty());
+        match crate::registry::auto_register_func(&name_upper, (!group.trim().is_empty()).then(|| group.trim()), doc) {
             Ok(alias) => registered_alias = Some(alias),
             Err(e) => warnings.push(format!("注册表自动登记失败（不影响写入）: {}", e.message)),
         }
@@ -2099,6 +2118,13 @@ pub async fn delete_object(
     }
     // 成功：DELETE 已消耗锁柄，直接结束会话
     drop_session(&base, &sess).await;
+    // 写后失效：函数删除即清 FUNC_CACHE（防幽灵元数据）
+    if obj_type == ObjectType::Function {
+        let cleared = crate::metadata::invalidate_function(name.trim());
+        if cleared {
+            tracing::debug!(func = %name.trim(), "删除后清除 FUNC_CACHE 条目");
+        }
+    }
     // 注册表钩子：函数删除成功 → 墓碑化（保留条目留档；失败只记警告）
     if obj_type == ObjectType::Function {
         if let Err(e) = crate::registry::tombstone_func(name.trim()) {

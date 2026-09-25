@@ -1612,3 +1612,163 @@ fn flat_invoke_and_registry_catalog() {
         .unwrap();
     assert_eq!(resp.status(), 404, "墓碑条目应 404");
 }
+
+// ========================================================================
+// v0.14：runtime 档位 / doc 文档流 / 调用审计
+// ========================================================================
+
+/// 预置一个 published 条目的注册表文件（schema v1，格式见 registry.rs）。
+fn registry_file_with_stfc(path: &str) {
+    std::fs::write(
+        path,
+        serde_json::to_string_pretty(&serde_json::json!({
+            "version": 1,
+            "entries": [{
+                "alias": "stfc-echo",
+                "func_name": "STFC_CONNECTION",
+                "intent": "echo check",
+                "status": "published",
+                "origin": "manual",
+                "created_at": "2026-09-25T00:00:00Z",
+                "updated_at": "2026-09-25T00:00:00Z"
+            }]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+}
+
+#[test]
+#[ignore]
+fn runtime_mode_locks_down_to_delivery_port() {
+    let reg_path = temp_registry_path("runtime");
+    registry_file_with_stfc(&reg_path);
+    let _s = start_server_with_env(&[
+        ("SAP_REGISTRY_FILE", reg_path.as_str()),
+        ("SAP_MODE", "runtime"),
+    ]);
+
+    // 自描述：mode = runtime
+    let body: serde_json::Value = http_client()
+        .get(format!("{}/api/version", _s.base_url))
+        .send()
+        .unwrap()
+        .json()
+        .unwrap();
+    assert_eq!(body["capabilities"]["mode"], "runtime");
+
+    // 放行：注册表读
+    let resp = http_client()
+        .get(format!("{}/api/registry", _s.base_url))
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    // 放行：平坦调用（真实走 SAP）
+    let resp = http_client()
+        .post(format!("{}/api/invokes/stfc-echo", _s.base_url))
+        .json(&serde_json::json!({"requtext": "hi"}))
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 200, "runtime 下平坦调用应照常工作");
+    // 公开页照常
+    let resp = http_client()
+        .get(format!("{}/openapi.json", _s.base_url))
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    // 拦截：开发面全部 403 RUNTIME_MODE
+    for (method, url) in [
+        ("POST", format!("{}/api/rfc", _s.base_url)),
+        ("GET", format!("{}/api/functions/STFC_CONNECTION", _s.base_url)),
+        ("POST", format!("{}/api/functions/search", _s.base_url)),
+        ("POST", format!("{}/api/table/read", _s.base_url)),
+        ("GET", format!("{}/api/dumps", _s.base_url)),
+        (
+            "PUT",
+            format!("{}/api/registry/whatever", _s.base_url),
+        ),
+        ("GET", format!("{}/api/invokes/audit", _s.base_url)),
+        ("POST", format!("{}/mcp", _s.base_url)),
+    ] {
+        let resp = match method {
+            "POST" => http_client().post(url).json(&serde_json::json!({})).send().unwrap(),
+            "PUT" => http_client()
+                .put(url)
+                .json(&serde_json::json!({"func_name": "Z_X"}))
+                .send()
+                .unwrap(),
+            _ => http_client().get(url).send().unwrap(),
+        };
+        assert_eq!(resp.status(), 403, "{method} 应被 runtime 档位拦截");
+        let body: serde_json::Value = resp.json().unwrap();
+        assert_eq!(body["error"]["key"], "RUNTIME_MODE");
+    }
+}
+
+#[test]
+#[ignore]
+fn doc_field_flows_into_catalog_and_audits_invoke() {
+    let reg_path = temp_registry_path("doc");
+    let _s = start_server_with_env(&[("SAP_REGISTRY_FILE", reg_path.as_str())]);
+    // 注册条目带 doc → OpenAPI 目录正文应含 Markdown 文档
+    let resp = http_client()
+        .put(format!("{}/api/registry/stfc-echo", _s.base_url))
+        .json(&serde_json::json!({
+            "func_name": "STFC_CONNECTION",
+            "intent": "echo check",
+            "doc": "## Usage\n\nPass `requtext`; the same text comes back as `ECHOTEXT`.",
+            "status": "published"
+        }))
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    // 等 watcher 预热
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let body: serde_json::Value = http_client()
+            .get(format!("{}/openapi.json", _s.base_url))
+            .send()
+            .unwrap()
+            .json()
+            .unwrap();
+        let desc = body["paths"]["/api/invokes/stfc-echo"]["post"]["description"]
+            .as_str()
+            .unwrap_or("");
+        if desc.contains("## Usage") {
+            assert!(desc.contains("ECHOTEXT"), "doc 正文完整流入: {desc}");
+            break;
+        }
+        assert!(Instant::now() < deadline, "doc 未在 15s 内进入目录");
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    // 条目读回含 doc
+    let body: serde_json::Value = http_client()
+        .get(format!("{}/api/registry/stfc-echo", _s.base_url))
+        .send()
+        .unwrap()
+        .json()
+        .unwrap();
+    assert!(body["doc"].as_str().unwrap_or("").contains("Usage"));
+
+    // 平坦调用一次 → 审计缓冲可见（含 alias 与 via）
+    let resp = http_client()
+        .post(format!("{}/api/invokes/stfc-echo", _s.base_url))
+        .json(&serde_json::json!({"requtext": "audit me"}))
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = http_client()
+        .get(format!("{}/api/invokes/audit", _s.base_url))
+        .send()
+        .unwrap()
+        .json()
+        .unwrap();
+    assert!(body["count"].as_u64().unwrap() >= 1, "审计应有记录: {body}");
+    let first = &body["records"][0];
+    assert_eq!(first["alias"], "stfc-echo");
+    assert_eq!(first["via"], "invokes-alias");
+    assert_eq!(first["func"], "STFC_CONNECTION");
+    assert_eq!(first["ok"], true);
+    assert!(first["ms"].is_u64());
+}

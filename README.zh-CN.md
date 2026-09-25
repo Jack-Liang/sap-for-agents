@@ -197,6 +197,7 @@ curl -X POST http://127.0.0.1:3000/api/rfc \
 | `SAP_POOL_IDLE_VALIDATE_SECS` | ❌ | `30` | 空闲连接借出前校验阈值（秒）：空闲超过该时长的连接，借出前先 `RFC_PING` 校验（僵尸连接丢弃重建），空闲后的首批请求不再撞 `RFC_INVALID_HANDLE`。`0` = 禁用校验。背景：连接死亡与 SAP 是否重启无关——网关空闲断连策略（`gw/conn_disconnect`，依系统配置而异）、笔记本休眠/唤醒、Docker/VM 暂停恢复、VPN 重连、防火墙/NAT 空闲超时都会**静默**产生半开连接，池端收不到任何通知 |
 | `SAP_READ_ONLY` | ❌ | _(关闭)_ | 只读模式（`1`/`true`/`yes`/`on`）：网关自身写端点——`/api/objects` 的 `PUT source` 与 `POST replace`、`/api/adt` 非读方法——返回 `403 READ_ONLY`。`POST syntax`（不落库）与 `POST /api/rfc` 不受影响（RFC 无法按函数名可靠区分读写，SAP 端授权才是真正的边界） |
 | `SAP_REQUEST_TIMEOUT_SECS` | ❌ | `60` | 单次 SAP 调用全局超时（秒），≥1；超时返回 504。`/api/rfc` 可用请求体 `timeout_secs` per-request 覆盖 |
+| `SAP_MODE` | ❌ | `full` | 运行档位（`runtime`）：网关收缩为纯消费方运行时——只保留 `GET /api/registry`、`POST /api/invokes/{alias}` 与公开页/探针；其余 `/api/*` 与 `/mcp` 返回 `403 RUNTIME_MODE`（见 `/api/version` → `capabilities.mode`）。默认 `full` = Agent 工作台 |
 | `SAP_REGISTRY_FILE` | ❌ | `./registry.json` | API 注册表文件（v0.12，Agent 跨会话记忆）：经网关成功写入的 remote-enabled 函数自动登记为 `draft` 条目（`GET /api/registry`）；删除函数对象时条目转墓碑。本地 JSON、跨重启存活、不依赖 SAP；文件损坏时自动备份为 `.corrupt-<时间戳>` 并以空表启动 |
 | `SAP_RATE_LIMIT_RPS` | ❌ | _(不限流)_ | `/api` 按调用方 IP 的每秒请求数，≥1 启用；超限返回 429 |
 | `SAP_UPDATE_CHECK` | ❌ | _(开启)_ | 新版本检查：启动时与每 24h 向 `api.github.com` 发一个匿名 GET 查询本仓库最新 Release（无遥测、不携带任何用户数据），结果展示在 `/api/version` 的 `latest` 块与首页页脚；设 `off`/`false`/`0`/`no` 可完全关闭（无外联） |

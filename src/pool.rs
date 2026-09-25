@@ -311,6 +311,33 @@ impl RfcConnectionPool {
         self.cv.notify_one();
     }
 
+    /// 排干全部空闲连接（写钩子调用）。返回关闭的连接数。
+    ///
+    /// 背景：SAP 侧的函数组加载是**按连接**缓存的——刚写入/删除的函数在
+    /// 旧连接上仍是旧版本。排干空闲连接让下一次调用必然重建连接、重新
+    /// 加载组，消除这层写后陈旧。ADT 写走 HTTP 不经 RFC 池，写入期间
+    /// RFC 连接全部空闲——因此"只排空闲"已覆盖实际场景；借出中的连接
+    /// （此刻必然在做无关调用）归还后在下一次排干时处理。
+    pub fn drain_idle(&self) -> usize {
+        let dropped = match self.inner.lock() {
+            Ok(mut guard) => {
+                let taken = std::mem::take(&mut guard.idle);
+                // 同步递减总数：否则池误认为已达上限，等待者会为一个
+                // 已不存在的连接空等（直到超时）
+                guard.total = guard.total.saturating_sub(taken.len());
+                taken
+            }
+            Err(_) => return 0,
+        };
+        let n = dropped.len();
+        // 显式 drop 触发连接关闭（RfcConnection Drop 释放 RFC 句柄）
+        drop(dropped);
+        if n > 0 {
+            tracing::debug!(conns = n, "写后排干空闲 RFC 连接（下次调用重建）");
+        }
+        n
+    }
+
     /// 用保存的参数新建一个连接（无锁操作，调用方负责计数管理）。
     fn create_connection(&self) -> Result<RfcConnection, RfcError> {
         let borrowed: Vec<(&str, &str)> =

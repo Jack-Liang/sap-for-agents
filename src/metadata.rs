@@ -65,6 +65,16 @@ fn type_cache() -> &'static RwLock<HashMap<String, Vec<TypeFieldMeta>>> {
     TYPE_CACHE.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
+/// 写钩子调用：函数对象写入/删除成功后清除其元数据缓存，
+/// 让下一次接口自省/auto_outputs 拿到新签名（否则读到的是写入前的快照）。
+/// 返回是否确有条目被清除（供日志判断）。
+pub fn invalidate_function(func_name: &str) -> bool {
+    match func_cache().write() {
+        Ok(mut map) => map.remove(&func_name.to_uppercase()).is_some(),
+        Err(_) => false,
+    }
+}
+
 /// 把 type_desc_handle 递归解析成 TypeFieldMeta 列表。
 /// SAFETY: type_handle 必须是有效的 DDIC 类型描述符句柄。
 unsafe fn resolve_fields_recursive(

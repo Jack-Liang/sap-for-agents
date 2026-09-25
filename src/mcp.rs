@@ -150,7 +150,8 @@ pub fn tools_manifest() -> Vec<Value> {
                 "create": { "type": "boolean", "description": "Create the object when missing (default false)" },
                 "description": { "type": "string", "description": "Title for auto-creation (required with create:true)" },
                 "devclass": { "type": "string", "description": "Package for auto-creation (default $TMP)" },
-                "rfc_enabled": { "type": "boolean", "description": "func only: mark the function module remote-enabled (processingType=rfc)" }
+                "rfc_enabled": { "type": "boolean", "description": "func only: mark the function module remote-enabled (processingType=rfc)" },
+                "doc": { "type": "string", "description": "func only: API documentation (Markdown) stored on the registry entry and shown in the OpenAPI catalog" }
             }, "required": ["type", "name", "source"] }
         }),
         json!({
@@ -165,7 +166,8 @@ pub fn tools_manifest() -> Vec<Value> {
                 "transport": { "type": "string", "description": "Transport request (optional)" },
                 "create": { "type": "boolean", "description": "Create the object when missing; new_string becomes the initial source (default false)" },
                 "description": { "type": "string", "description": "Title for auto-creation" },
-                "rfc_enabled": { "type": "boolean", "description": "func only: mark remote-enabled after the write" }
+                "rfc_enabled": { "type": "boolean", "description": "func only: mark remote-enabled after the write" },
+                "doc": { "type": "string", "description": "func only: API documentation (Markdown) stored on the registry entry and shown in the OpenAPI catalog" }
             }, "required": ["type", "name", "old_string", "new_string"] }
         }),
         json!({
@@ -180,7 +182,8 @@ pub fn tools_manifest() -> Vec<Value> {
                 "transport": { "type": "string", "description": "Transport request (optional)" },
                 "software_component": { "type": "string", "description": "package only: software component" },
                 "source": str_param("Optional first source (written + activated in one call)"),
-                "rfc_enabled": { "type": "boolean", "description": "func only: mark remote-enabled" }
+                "rfc_enabled": { "type": "boolean", "description": "func only: mark remote-enabled" },
+                "doc": { "type": "string", "description": "func only: API documentation (Markdown) stored on the registry entry and shown in the OpenAPI catalog" }
             }, "required": ["type", "name", "description"] }
         }),
         json!({
@@ -548,6 +551,7 @@ async fn call_tool(pool: SharedPool, name: &str, args: Value) -> Result<Value, R
                 .get("rfc_enabled")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
+            let doc = args.get("doc").and_then(|v| v.as_str()).map(String::from);
             let obj_type = ObjectType::parse(&otype).ok_or_else(|| RfcError {
                 code: -1,
                 status: 400,
@@ -587,8 +591,10 @@ async fn call_tool(pool: SharedPool, name: &str, args: Value) -> Result<Value, R
                             transport.as_deref(),
                             true,
                             rfc_enabled,
+                            doc.as_deref(),
                         )
                         .await?;
+                        crate::objects::drain_pool_after_write(&pool, obj_type);
                         out["write"] = serde_json::to_value(outcome).unwrap_or_default();
                     }
                 }
@@ -600,6 +606,7 @@ async fn call_tool(pool: SharedPool, name: &str, args: Value) -> Result<Value, R
                 activate: true,
                 create_desc: create.then_some(description.as_str()),
                 rfc_enabled,
+                doc: doc.as_deref(),
             };
             let outcome: serde_json::Value = if tool == "write_source" {
                 let source = req_str(&args, "source")?;
@@ -655,6 +662,7 @@ async fn call_tool(pool: SharedPool, name: &str, args: Value) -> Result<Value, R
             let outcome =
                 crate::objects::delete_object(obj_type, &name, &group, transport.as_deref())
                     .await?;
+            crate::objects::drain_pool_after_write(&pool, obj_type);
             Ok(serde_json::to_value(outcome).unwrap_or_default())
         }
         "list_registry_apis" => {

@@ -36,6 +36,10 @@ pub struct AppConfig {
     /// API 注册表文件路径（`SAP_REGISTRY_FILE`，默认 `./registry.json`）。
     /// 网关本地 JSON（不依赖 SAP）；目录须可写。
     pub registry_file: std::path::PathBuf,
+    /// 运行档位（`SAP_MODE=runtime`）：消费方运行模式——只保留
+    /// 平坦调用 + 注册表读 + 公开页/探针，关闭开发面（元数据探索、
+    /// 对象写、/api/rfc、MCP）。默认 full（开发工作台）。
+    pub runtime_mode: bool,
     /// 新版本检查（`SAP_UPDATE_CHECK`，默认开启；off/false/0/no 关闭）：
     /// 启动时与每 24h 查 GitHub 最新 Release（仅一个匿名 GET，无遥测），
     /// 结果进 `/api/version` 的 latest 块与首页页脚。
@@ -103,6 +107,10 @@ pub fn load() -> Result<AppConfig, String> {
     let registry_file = std::path::PathBuf::from(
         env::var("SAP_REGISTRY_FILE").unwrap_or_else(|_| "registry.json".to_string()),
     );
+    // 运行档位：SAP_MODE=runtime（大小写不敏感精确匹配）→ 消费方运行模式
+    let runtime_mode = env::var("SAP_MODE")
+        .map(|v| v.trim().eq_ignore_ascii_case("runtime"))
+        .unwrap_or(false);
     // 新版本检查：默认开启；识别 0/false/off/no（大小写不敏感）为关闭
     let update_check = env::var("SAP_UPDATE_CHECK")
         .map(|v| {
@@ -134,6 +142,7 @@ pub fn load() -> Result<AppConfig, String> {
         adt_passwd,
         read_only,
         registry_file,
+        runtime_mode,
         update_check,
     })
 }
@@ -169,6 +178,7 @@ mod tests {
             "SAP_READ_ONLY",
             "SAP_UPDATE_CHECK",
             "SAP_REGISTRY_FILE",
+            "SAP_MODE",
         ] {
             unsafe {
                 std::env::remove_var(k);

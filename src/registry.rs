@@ -74,6 +74,11 @@ pub struct Entry {
     /// 踩坑记录 / 使用注意事项（Agent 撰写）
     #[serde(default)]
     pub notes: String,
+    /// 接口文档正文（Markdown）：面向消费方的完整说明，随代码写入，
+    /// 流入 OpenAPI 目录的 operation description。区别于 intent（一句话
+    /// 干什么）与 notes（踩坑提醒）。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub doc: String,
     /// 调用示例（任意 JSON，通常是 /api/functions/{name}/invoke 的请求体）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub example: Option<serde_json::Value>,
@@ -176,6 +181,7 @@ impl Store {
                 .map(|g| g.to_uppercase()),
             intent: body.intent.trim().to_string(),
             notes: body.notes.trim().to_string(),
+            doc: body.doc.trim().to_string(),
             example: body.example.clone(),
             status: body.status,
             // 手工 PUT 保留 origin（auto 条目被 Agent 完善后仍是 auto 起源）
@@ -190,22 +196,36 @@ impl Store {
 
     /// 自动登记（写钩子调用）：按函数名幂等 upsert。
     /// - 已有该函数的条目 → 保留 intent/notes/example（绝不清空 Agent 写的心血），
-    ///   刷新 group 与 updated_at；墓碑则复活为 draft；
+    ///   刷新 group 与 updated_at；墓碑则复活为 draft；doc 非空时更新（文档随代码走）；
     /// - 没有 → 以小写函数名为 alias 建 draft；alias 被其他函数占用时追加 -2/-3…。
-    fn ensure_draft_for_func(&mut self, func_name: &str, group: Option<&str>, now: &str) -> String {
+    fn ensure_draft_for_func(
+        &mut self,
+        func_name: &str,
+        group: Option<&str>,
+        doc: Option<&str>,
+        now: &str,
+    ) -> String {
         let func_upper = func_name.trim().to_uppercase();
         let group_upper = group
             .map(str::trim)
             .filter(|g| !g.is_empty())
             .map(|g| g.to_uppercase().to_string());
+        let doc_text = doc
+            .map(str::trim)
+            .filter(|d| !d.is_empty())
+            .unwrap_or_default()
+            .to_string();
         if let Some(e) = self
             .entries
             .values_mut()
             .find(|e| e.func_name == func_upper)
         {
-            // 复活/刷新：只动状态类字段
+            // 复活/刷新：只动状态类字段（doc 非空才覆盖——文档随代码走）
             e.status = EntryStatus::Draft;
             e.group = group_upper.or(e.group.take());
+            if !doc_text.is_empty() {
+                e.doc = doc_text;
+            }
             e.updated_at = now.to_string();
             return e.alias.clone();
         }
@@ -217,6 +237,7 @@ impl Store {
             group: group_upper,
             intent: String::new(),
             notes: String::new(),
+            doc: doc_text,
             example: None,
             status: EntryStatus::Draft,
             origin: EntryOrigin::Auto,
@@ -325,6 +346,11 @@ fn sanitize_alias(func_name: &str) -> String {
 /// 当前时刻 RFC3339 UTC（秒精度）。
 fn now_iso8601() -> String {
     iso8601_from_unix(now_unix())
+}
+
+/// 供其他模块（调用审计）取同一格式的时间戳。
+pub fn now_iso8601_public() -> String {
+    now_iso8601()
 }
 
 fn now_unix() -> u64 {
@@ -469,12 +495,17 @@ fn persist(store: &Store) -> Result<(), RfcError> {
 // ========================================================================
 
 /// 写钩子：rfc_enabled 函数写入成功后自动登记（幂等，保留已有 intent/notes）。
+/// `doc` 非空时随本次写入更新条目文档（文档随代码走）。
 /// 返回 alias。失败返回 Err（调用方降级为警告，绝不影响 SAP 写入结果）。
-pub fn auto_register_func(func_name: &str, group: Option<&str>) -> Result<String, RfcError> {
+pub fn auto_register_func(
+    func_name: &str,
+    group: Option<&str>,
+    doc: Option<&str>,
+) -> Result<String, RfcError> {
     let now = now_iso8601();
     let mut result = String::new();
     with_store(|store| {
-        result = store.ensure_draft_for_func(func_name, group, &now);
+        result = store.ensure_draft_for_func(func_name, group, doc, &now);
         persist(store)
     })?;
     Ok(result)
@@ -589,6 +620,9 @@ pub struct PutBody {
     pub intent: String,
     #[serde(default)]
     pub notes: String,
+    /// 接口文档正文（Markdown，面向消费方；流入 OpenAPI 目录）
+    #[serde(default)]
+    pub doc: String,
     #[serde(default)]
     pub example: Option<serde_json::Value>,
     /// draft（默认）/ published；删除态走 DELETE
@@ -778,6 +812,7 @@ mod tests {
             group: None,
             intent: String::new(),
             notes: String::new(),
+            doc: String::new(),
             example: None,
             status: EntryStatus::Draft,
             origin: EntryOrigin::Auto,
@@ -811,7 +846,7 @@ mod tests {
     #[test]
     fn ensure_draft_new_uses_lowercase_func_as_alias() {
         let mut s = Store::default();
-        let alias = s.ensure_draft_for_func("Z_CALC", Some("ZMATH"), "t1");
+        let alias = s.ensure_draft_for_func("Z_CALC", Some("ZMATH"), None, "t1");
         assert_eq!(alias, "z_calc");
         assert_eq!(s.get("z_calc").unwrap().func_name, "Z_CALC");
         assert_eq!(s.get("z_calc").unwrap().group.as_deref(), Some("ZMATH"));
@@ -825,14 +860,23 @@ mod tests {
             let e = s.entries.get_mut("z_calc").unwrap();
             e.intent = "客户列表查询".into();
             e.notes = "必须传 MAX_ROWS".into();
+            e.doc = "完整文档 v1".into();
             e.status = EntryStatus::Published;
         }
-        let alias = s.ensure_draft_for_func("Z_CALC", None, "t2");
+        // doc=None：保留已有文档（手工完善的文档不被空写入冲掉）
+        let alias = s.ensure_draft_for_func("Z_CALC", None, None, "t2");
         assert_eq!(alias, "z_calc");
         let e = s.get("z_calc").unwrap();
         assert_eq!(e.intent, "客户列表查询", "重登记不清空 intent");
         assert_eq!(e.notes, "必须传 MAX_ROWS", "重登记不清空 notes");
+        assert_eq!(e.doc, "完整文档 v1", "doc=None 保留已有文档");
         assert_eq!(e.updated_at, "t2");
+        // doc 非空：文档随代码更新
+        s.ensure_draft_for_func("Z_CALC", None, Some("完整文档 v2（随代码）"), "t3");
+        assert_eq!(s.get("z_calc").unwrap().doc, "完整文档 v2（随代码）");
+        // doc 空白串视同未提供
+        s.ensure_draft_for_func("Z_CALC", None, Some("   "), "t4");
+        assert_eq!(s.get("z_calc").unwrap().doc, "完整文档 v2（随代码）", "空白 doc 不覆盖");
     }
 
     #[test]
@@ -840,7 +884,7 @@ mod tests {
         let mut s = store_with(draft("z_calc", "Z_CALC"));
         s.tombstone("z_calc", "t0");
         assert_eq!(s.get("z_calc").unwrap().status, EntryStatus::Deleted);
-        let alias = s.ensure_draft_for_func("Z_CALC", None, "t1");
+        let alias = s.ensure_draft_for_func("Z_CALC", None, None, "t1");
         assert_eq!(alias, "z_calc");
         assert_eq!(s.get("z_calc").unwrap().status, EntryStatus::Draft);
     }
@@ -849,7 +893,7 @@ mod tests {
     fn ensure_draft_alias_collision_suffixes() {
         // z_calc 已被另一个函数占用 → 新函数取 z_calc-2
         let mut s = store_with(draft("z_calc", "Z_SOMETHING_ELSE"));
-        let alias = s.ensure_draft_for_func("Z_CALC", None, "t1");
+        let alias = s.ensure_draft_for_func("Z_CALC", None, None, "t1");
         assert_eq!(alias, "z_calc-2");
         assert_eq!(s.get("z_calc-2").unwrap().func_name, "Z_CALC");
     }
@@ -891,6 +935,7 @@ mod tests {
             func_name: "z_calc".into(),
             intent: "intent v2".into(),
             notes: String::new(),
+            doc: String::new(),
             example: Some(serde_json::json!({"inputs": {"IV_A": 1}})),
             status: EntryStatus::Published,
             group: None,
@@ -907,6 +952,7 @@ mod tests {
             func_name: "z_calc".into(),
             intent: String::new(),
             notes: String::new(),
+            doc: String::new(),
             example: None,
             status: EntryStatus::Draft,
             group: None,

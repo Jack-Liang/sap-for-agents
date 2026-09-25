@@ -850,6 +850,51 @@ const SPEC_JSON: &str = r##"{
         }
       }
     },
+    "/api/invokes/audit": {
+      "get": {
+        "tags": [
+          "registry"
+        ],
+        "summary": "Recent invoke audit trail (last ~500, newest first)",
+        "description": "Ring buffer of the most recent calls across /api/rfc, typed invokes and flat invokes: timestamp, source endpoint (via), registry alias when applicable, function name, ok/status, duration in ms, caller IP. For quick troubleshooting without log access.",
+        "responses": {
+          "200": {
+            "description": "Audit records",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "count": {
+                      "type": "integer"
+                    },
+                    "records": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "at": { "type": "string", "description": "RFC3339 UTC" },
+                          "via": { "type": "string", "enum": ["rfc", "functions-invoke", "invokes-alias"] },
+                          "alias": { "type": "string", "nullable": true },
+                          "func": { "type": "string" },
+                          "ok": { "type": "boolean" },
+                          "status": { "type": "integer" },
+                          "ms": { "type": "integer" },
+                          "ip": { "type": "string" }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
     "/api/invokes/{alias}": {
       "post": {
         "tags": [
@@ -2462,6 +2507,10 @@ const SPEC_JSON: &str = r##"{
             "type": "string",
             "description": "Pitfalls / know-how from previous sessions (agent-written)"
           },
+          "doc": {
+            "type": "string",
+            "description": "Consumer-facing Markdown documentation; rendered in the OpenAPI catalog's operation description"
+          },
           "example": {
             "type": "object",
             "description": "Sample invoke body for POST /api/functions/{func_name}/invoke"
@@ -2514,6 +2563,10 @@ const SPEC_JSON: &str = r##"{
           "notes": {
             "type": "string",
             "description": "Pitfalls / usage notes (default empty)"
+          },
+          "doc": {
+            "type": "string",
+            "description": "Consumer-facing Markdown documentation (default empty)"
           },
           "example": {
             "type": "object",
@@ -3333,6 +3386,10 @@ pub fn flat_invoke_operation(entry: &Entry, params: &[FunctionParam]) -> (String
     if !entry.notes.is_empty() {
         description.push_str(&format!("\n\nNotes: {}", entry.notes));
     }
+    // doc 是面向消费方的完整文档正文（Markdown；Redoc 会按 Markdown 渲染）
+    if !entry.doc.is_empty() {
+        description.push_str(&format!("\n\n---\n{}", entry.doc));
+    }
     if let Some(ex) = &entry.example {
         description.push_str(&format!("\n\nExample request body: `{}`", ex));
     }
@@ -3521,6 +3578,7 @@ mod tests {
             "/api/table/read",
             "/api/registry",
             "/api/registry/{alias}",
+            "/api/invokes/audit",
             "/api/invokes/{alias}",
             "/api/dumps",
             "/api/dumps/grouped",
@@ -3718,6 +3776,7 @@ mod tests {
             group: Some("ZMATH".into()),
             intent: "calculator for frontend".into(),
             notes: "integers only".into(),
+            doc: "## Usage\n\nPass two integers; get their sum.".into(),
             example: Some(json!({"iv_a": 1})),
             status: EntryStatus::Published,
             origin: EntryOrigin::Manual,
@@ -3755,6 +3814,7 @@ mod tests {
         assert_eq!(op["post"]["summary"], "calculator for frontend");
         let desc = op["post"]["description"].as_str().unwrap();
         assert!(desc.contains("integers only") && desc.contains("500"), "{desc}");
+        assert!(desc.contains("## Usage"), "doc 正文应流入 description: {desc}");
         // 请求体：IV_A 必填且为 integer
         let body = &op["post"]["requestBody"]["content"]["application/json"]["schema"];
         assert_eq!(body["properties"]["IV_A"]["type"], "integer");

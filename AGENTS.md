@@ -33,6 +33,7 @@ curl -H "Authorization: Bearer <SAP_API_KEY>" http://127.0.0.1:3000/api/function
 | Want to publish/update one API's contract (intent / notes / example) | `PUT /api/registry/{alias}` |
 | External system/frontend wants to call a registered API **without the SAP dialect** (flat JSON in / flat JSON out) | `POST /api/invokes/{alias}` |
 | Want the typed service-catalog spec of all published registry APIs (for codegen) | `GET /openapi.json` (public; or `GET /api/openapi` with no params) |
+| Want recent invoke history for troubleshooting (alias, function, duration, IP) | `GET /api/invokes/audit` |
 | New session → **self-description first**: gateway version/commit, capability switches (auth / read_only / adt / registry / rate limit), SAP sysid & release | `GET /api/version` (public) |
 | Don't know which functions exist → fuzzy search by name | `POST /api/functions/search` |
 | Know the function name, want to know how to fill parameters | `GET /api/functions/{name}` |
@@ -105,14 +106,14 @@ curl -X DELETE 'http://127.0.0.1:3000/api/registry/z_calc'            # → stat
 curl -X DELETE 'http://127.0.0.1:3000/api/registry/z_calc?purge=true' # physical removal
 ```
 
-- Entry fields: `alias` (unique lowercase URL-safe id, `team/name` prefixes allowed), `func_name`, `group`, `intent` (what it's for), `notes` (pitfalls/know-how), `example` (sample invoke body), `status` (`draft`/`published`; tombstones show `deleted`, hidden from the default list — `?include_deleted=true` reveals them), `max_rows` (row cap for flat invokes; default 100).
+- Entry fields: `alias` (unique lowercase URL-safe id, `team/name` prefixes allowed), `func_name`, `group`, `intent` (what it's for), `notes` (pitfalls/know-how), `doc` (consumer-facing Markdown documentation, shown in the OpenAPI catalog), `example` (sample invoke body), `status` (`draft`/`published`; tombstones show `deleted`, hidden from the default list — `?include_deleted=true` reveals them), `max_rows` (row cap for flat invokes; default 100).
 - Deleting the SAP object **tombstones** the entry (never silently removes); writing the same function again revives it. Fugr deletes do not cascade to member FM entries — clean those up manually when you delete whole groups.
 - Re-registering a function keeps your `intent`/`notes`/`example` — only status/group/timestamps are refreshed. Registration failure never fails the SAP write itself (it degrades to a warning in the write response).
 - MCP clients: the `list_registry_apis` tool is the same catalog.
 
 #### Delivery port: `POST /api/invokes/{alias}` (flat JSON in / flat JSON out)
 
-Published (or draft) entries are callable by **external systems without any SAP dialect** — no uppercase-parameter conventions, no output-read declarations. The contract is derived from the function's live interface on every call, so signature drift is followed automatically:
+Published (or draft) entries are callable by **external systems without any SAP dialect** — no uppercase-parameter conventions, no output-read declarations. The contract is derived from the function's interface metadata on every call (drift happening outside this gateway is picked up automatically; signature edits made THROUGH this gateway need a gateway restart before new parameters show — SDK metadata cache, see the write section):
 
 ```bash
 # Frontend/other-language consumer calls a registered API — this is the whole API:
@@ -129,6 +130,7 @@ curl -X POST 'http://127.0.0.1:3000/api/invokes/bapi-users?limit=50' -d {} -H "C
 - All outputs come back by true type; output tables are row-capped (`?limit=`, entry `max_rows`, default 100) — a `"_truncated": [...]` key appears when a table was cut.
 - `GET /openapi.json` (public) carries a **typed operation per published entry** (intent/notes/example flow in) — hand that URL to openapi-generator and consumers get a client SDK. `GET /api/openapi` with no params returns the same catalog, freshly built. The public spec is watcher-preheated and cached, so it stays fast and available even when SAP is down.
 - Tombstoned entries → 404 (their FM was deleted). Draft entries are invocable but stay out of the public catalog until `status:"published"`.
+- `GET /api/invokes/audit` — the last ~500 calls (alias, function, ok/status, duration, caller IP; newest first). Quick troubleshooting without log access.
 
 ### 1. Search functions
 
@@ -311,7 +313,9 @@ curl -X POST http://127.0.0.1:3000/api/objects/prog/ZMY_REPORT/syntax \
   -d '{"source":"REPORT zmy_report.\nWRITE 1."}'
 ```
 
-- `replace` body: `old_string` / `new_string` (+ optional `transport`, `activate` (default true), `group`, `rfc_enabled`). `old_string` must match **exactly one** place (0 → read the current source first; >1 → include more context lines; `\r\n`/`\n` differences are normalized automatically). Empty `old_string` only works on an empty object.
+- **`doc` field (func only, v0.14)**: `create`/`PUT source`/`replace` accept `doc` — consumer-facing Markdown documentation stored on the registry entry and rendered in the OpenAPI catalog. Docs travel with the code: re-writing with a new `doc` updates the entry; omitting it keeps the existing one. (SE37 long text has no remote-write channel on current releases — the registry entry IS the documentation store.)
+- **Post-write consistency (v0.14)**: successful func writes/deletes clear the gateway's metadata cache and drain idle RFC connections, so the next interface introspection / invoke sees the new signature immediately. Remaining caveat: the SAP SDK's process-global descriptor cache cannot be invalidated in-process — *parameter-signature changes* (including delete+recreate) stay invisible to `/api/rfc` and `/api/invokes` until gateway restart. Body/logic edits are NOT affected (values pass through live connections); only the parameter list is cached. ADT-channel reads like `GET /api/objects/func/{n}/source` are always fresh.
+- `replace` body: `old_string` / `new_string` (+ optional `transport`, `activate` (default true), `group`, `rfc_enabled`, `doc`). `old_string` must match **exactly one** place (0 → read the current source first; >1 → include more context lines; `\r\n`/`\n` differences are normalized automatically). Empty `old_string` only works on an empty object.
 - `PUT /source` body: `source` (full text), plus the same optional fields.
 - `syntax` body: `source`. Returns `issues[]` with `severity` (E/W/…), `line`, `offset`, `text`.
 - Response `activated.success` is the **logical** result: an activation failure is HTTP 200 with `activated.messages[]` / `problems[]` ("Line N: text") — read them, fix the source, retry. Transport errors (network, session) are 4xx/5xx as usual.
@@ -474,6 +478,7 @@ curl http://127.0.0.1:3000/api/version
 #   "version": "0.10.0",
 #   "commit": "0fa6d6b",                # git short hash of the build; "-dirty" = uncommitted changes
 #   "capabilities": {
+#     "mode": "full",                  # full = agent workbench; runtime = consumer runtime (SAP_MODE=runtime: only registry reads + /api/invokes)
 #     "auth": false,                     # true = /api/* needs Bearer token (this endpoint excepted)
 #     "read_only": false,                # true = write endpoints return 403 READ_ONLY
 #     "adt": true,                       # true = /api/adt/** and /api/dumps* are usable

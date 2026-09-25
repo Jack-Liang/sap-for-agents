@@ -8,8 +8,10 @@
 //!                              →  {"EV_SUM": 42}
 //! ```
 //!
-//! 契约**按需派生**而非注册时快照：每次调用从 SAP 元数据现推输入/输出分类，
-//! 接口签名漂移自动跟随，注册表里只存覆盖项（如 `max_rows`）。三类输出全部
+//! 契约**按需派生**而非注册时快照：每次调用从接口元数据现推输入/输出分类，
+//! 注册表里只存覆盖项（如 `max_rows`）。注意：经本网关改参数签名后，SDK 的
+//! 进程级描述符缓存仍持有旧接口（网关重启前新参数不可见——正文逻辑修改
+//! 不受影响）；外部发生的签名漂移在下次派生时自然跟随。三类输出全部
 //! 按真实类型序列化（复用 auto 机制：INT→整数、FLOAT→浮点、BYTE→Base64），
 //! 输出表封顶 `?limit=` > 条目 `max_rows` > 默认 100 行（截断时响应带
 //! `_truncated` 列表）。
@@ -365,20 +367,36 @@ async fn flat_invoke_handler(
     apply_output_specs(&contract, &mut req);
 
     // 复用 /api/rfc 的执行+指标+审计（函数名标签用真实 SAP 名）
-    let resp = crate::server::run_invoke_and_log(pool, addr.ip().to_string(), req)
-        .await?
-        .0;
+    let resp = crate::server::run_invoke_and_log(
+        pool,
+        addr.ip().to_string(),
+        req,
+        "invokes-alias",
+        Some(alias.clone()),
+    )
+    .await?
+    .0;
     let cap = effective_cap(q.limit, entry.max_rows);
     Ok(Json(flatten_response(&resp, cap)))
+}
+
+/// GET /api/invokes/audit —— 最近调用的审计快照（最新在前）。
+/// 精确路由优先于 {*alias} 通配；runtime 档位下被守卫拦截（最小面原则）。
+async fn audit_handler() -> Result<Json<serde_json::Value>, RfcError> {
+    let records = crate::server::audit_snapshot();
+    let count = records.len();
+    Ok(Json(serde_json::json!({ "count": count, "records": records })))
 }
 
 /// 交付端口子路由（挂 /api 鉴权层内）。handler 需要连接池 → 状态类型固定。
 /// axum 0.8 语法：{*alias}。
 pub fn router() -> Router<SharedPool> {
-    Router::new().route(
-        "/api/invokes/{*alias}",
-        axum::routing::post(flat_invoke_handler),
-    )
+    Router::new()
+        .route("/api/invokes/audit", axum::routing::get(audit_handler))
+        .route(
+            "/api/invokes/{*alias}",
+            axum::routing::post(flat_invoke_handler),
+        )
 }
 
 // ========================================================================

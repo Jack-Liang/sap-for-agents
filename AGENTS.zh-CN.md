@@ -33,6 +33,7 @@ curl -H "Authorization: Bearer <SAP_API_KEY>" http://127.0.0.1:3000/api/function
 | 想发布/完善某个接口的契约（intent / notes / example） | `PUT /api/registry/{alias}` |
 | 外部系统/前端想调用注册接口且**免学 SAP 方言**（扁平 JSON 进出） | `POST /api/invokes/{alias}` |
 | 想要全部 published 条目的类型化服务目录规范（做 codegen） | `GET /openapi.json`（公开；或无参 `GET /api/openapi`） |
+| 想查最近的调用历史排障（别名、函数、耗时、IP） | `GET /api/invokes/audit` |
 | 新会话先**自描述**：网关版本/commit、能力开关（鉴权/只读/ADT/注册表/限流）、SAP sysid 与 release | `GET /api/version`（公开） |
 | 不知道有哪些函数 → 按名字模糊搜索 | `POST /api/functions/search` |
 | 知道函数名，想知道参数怎么填 | `GET /api/functions/{name}` |
@@ -105,14 +106,14 @@ curl -X DELETE 'http://127.0.0.1:3000/api/registry/z_calc'            # → stat
 curl -X DELETE 'http://127.0.0.1:3000/api/registry/z_calc?purge=true' # 物理删除
 ```
 
-- 条目字段：`alias`（唯一、小写、URL 安全，支持 `team/name` 前缀）、`func_name`、`group`、`intent`（干什么的）、`notes`（踩坑记录/know-how）、`example`（调用示例体）、`status`（`draft`/`published`；墓碑显示 `deleted`，默认列表隐藏——`?include_deleted=true` 可见）、`max_rows`（平坦调用的表行封顶，默认 100）。
+- 条目字段：`alias`（唯一、小写、URL 安全，支持 `team/name` 前缀）、`func_name`、`group`、`intent`（干什么的）、`notes`（踩坑记录/know-how）、`doc`（面向消费方的 Markdown 文档，展示在 OpenAPI 目录）、`example`（调用示例体）、`status`（`draft`/`published`；墓碑显示 `deleted`，默认列表隐藏——`?include_deleted=true` 可见）、`max_rows`（平坦调用的表行封顶，默认 100）。
 - 删除 SAP 对象时条目**转墓碑**（绝不静默消失）；再次写入同名函数自动复活。删除 fugr 不会级联处理其中 FM 的条目——整组删除后需手动清理。
 - 同名函数重复登记会保留你的 `intent`/`notes`/`example`——只刷新 status/group/时间戳。登记失败绝不影响 SAP 写入本身（仅在写响应里降级为 warning）。
 - MCP 客户端：`list_registry_apis` 工具就是这份目录。
 
 #### 交付端口：`POST /api/invokes/{alias}`（扁平 JSON 进 / 扁平 JSON 出）
 
-published（或 draft）条目可被**外部系统零 SAP 方言**调用——不用大写参数约定、不用声明怎么读输出。契约每次调用从函数的**实时接口元数据**派生，签名漂移自动跟随：
+published（或 draft）条目可被**外部系统零 SAP 方言**调用——不用大写参数约定、不用声明怎么读输出。契约每次调用从函数的**接口元数据**派生（网关之外发生的漂移自然跟随；经本网关改参数签名则需重启网关才可见新参数——SDK 元数据缓存，见写入章节）：
 
 ```bash
 # 前端/其他语言的消费方调用注册接口——这就是全部的 API：
@@ -129,6 +130,7 @@ curl -X POST 'http://127.0.0.1:3000/api/invokes/bapi-users?limit=50' -d '{}' -H 
 - 所有输出按真实类型返回；输出表按封顶截断（`?limit=` > 条目 `max_rows` > 默认 100），发生截断时响应带 `"_truncated": [...]`。
 - `GET /openapi.json`（公开）为每个 published 条目携带**类型化 operation**（intent/notes/example 流入）——把这个 URL 交给 openapi-generator，消费方就能生成客户端 SDK。`GET /api/openapi` 无参调用返回同一目录（现算）。公开规范由后台 watcher 预热缓存——SAP 宕机时照样秒回。
 - 墓碑条目 → 404（其函数已删除）。draft 条目可调用但不进公开目录，置 `status:"published"` 后进入。
+- `GET /api/invokes/audit` —— 最近约 500 次调用（别名、函数、成败/状态码、耗时、来源 IP；最新在前），免翻日志的快速排障。
 
 ### 1. 搜索函数
 
@@ -311,7 +313,9 @@ curl -X POST http://127.0.0.1:3000/api/objects/prog/ZMY_REPORT/syntax \
   -d '{"source":"REPORT zmy_report.\nWRITE 1."}'
 ```
 
-- `replace` 请求体：`old_string` / `new_string`（可选 `transport`、`activate`（默认 true）、`group`、`rfc_enabled`）。`old_string` 必须精确匹配**唯一一处**（0 处 → 先读当前源码；多处 → 带更多上下文行；`\r\n`/`\n` 差异自动归一化）。空 `old_string` 仅对空对象有效。
+- **`doc` 字段（仅 func，v0.14）**：`create`/`PUT source`/`replace` 接受 `doc` —— 面向消费方的 Markdown 文档，存入注册表条目并渲染进 OpenAPI 目录。文档随代码走：带新 `doc` 重写即更新条目；不带则保留已有。（当前 release 的 SE37 长文本没有远程写通道——注册表条目就是文档的存放地。）
+- **写后一致性（v0.14）**：函数写入/删除成功后，网关清元数据缓存并排干空闲 RFC 连接——下一次接口自省/调用立刻看到新签名。剩余注意点：SAP SDK 的进程级描述符缓存无法在进程内失效——**参数签名变更**（含删除后重建）在网关重启前对 `/api/rfc` 与 `/api/invokes` 不可见。正文/逻辑修改不受影响（值走活连接）；被缓存的只有参数清单。ADT 通道读取如 `GET /api/objects/func/{n}/source` 永远新鲜。
+- `replace` 请求体：`old_string` / `new_string`（可选 `transport`、`activate`（默认 true）、`group`、`rfc_enabled`、`doc`）。`old_string` 必须精确匹配**唯一一处**（0 处 → 先读当前源码；多处 → 带更多上下文行；`\r\n`/`\n` 差异自动归一化）。空 `old_string` 仅对空对象有效。
 - `PUT /source` 请求体：`source`（全量源码）+ 同上可选字段。
 - `syntax` 请求体：`source`。返回 `issues[]`：`severity`（E/W/…）、`line`、`offset`、`text`。
 - 响应里的 `activated.success` 是**逻辑结果**：激活失败时 HTTP 仍为 200，带 `activated.messages[]` / `problems[]`（"Line N: 文本"）——读它、改源码、重试。传输层错误（网络/会话）才走 4xx/5xx。
@@ -474,6 +478,7 @@ curl http://127.0.0.1:3000/api/version
 #   "version": "0.10.0",
 #   "commit": "0fa6d6b",                # 构建所用 git 短哈希；"-dirty" = 构建时有未提交改动
 #   "capabilities": {
+#     "mode": "full",                  # full = Agent 工作台；runtime = 消费方运行时（SAP_MODE=runtime：仅注册表读 + /api/invokes）
 #     "auth": false,                     # true = /api/* 需 Bearer token（本端点除外）
 #     "read_only": false,                # true = 写端点返回 403 READ_ONLY
 #     "adt": true,                       # true = /api/adt/** 与 /api/dumps* 可用

@@ -103,6 +103,59 @@ pub(crate) fn read_only_active() -> bool {
     read_only_enabled()
 }
 
+/// 运行档位（`SAP_MODE=runtime`）：消费方运行模式（v0.14）。
+///
+/// 语义：网关收缩为纯运行桥——只保留注册表读（消费方发现）、平坦调用
+/// （`/api/invokes/**`）与公开页/探针；开发面全部 403 `RUNTIME_MODE`
+/// （元数据探索、对象读写、ADT 代理、/api/rfc、MCP）。与 `read_only`
+/// 的区别：read_only 是"不许改 SAP"（调用照常），runtime 是"只做交付
+/// 端口的运行时"（Agent 的开发工具面整个收起来）。
+static RUNTIME_MODE: OnceLock<bool> = OnceLock::new();
+
+/// 启动期设置运行档位。
+pub fn init_runtime_mode(enabled: bool) {
+    let _ = RUNTIME_MODE.set(enabled);
+}
+
+/// 运行档位是否启用。pub(crate) 供 /api/version 能力自描述。
+pub(crate) fn runtime_mode_active() -> bool {
+    *RUNTIME_MODE.get().unwrap_or(&false)
+}
+
+/// runtime 档位下该请求是否放行（纯函数，便于单测）。
+/// 放行面：注册表读（GET，消费方发现）+ 平坦调用；其余 /api/* 与 /mcp 全拦。
+fn runtime_mode_allows(method: &axum::http::Method, path: &str) -> bool {
+    if path == "/api/registry" || path.starts_with("/api/registry/") {
+        return *method == axum::http::Method::GET;
+    }
+    if path.starts_with("/api/invokes/") {
+        // 审计端点（GET /api/invokes/audit）不放行：runtime 只留最小面
+        return *method == axum::http::Method::POST;
+    }
+    false
+}
+
+/// runtime 档位守卫：拦截开发面（403 RUNTIME_MODE），与 read_only 守卫同层。
+async fn runtime_mode_guard(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Result<axum::response::Response, RfcError> {
+    let path = req.uri().path().to_string();
+    let method = req.method().clone();
+    if runtime_mode_active() && !runtime_mode_allows(&method, &path) {
+        return Err(RfcError {
+            code: -1,
+            status: 403,
+            message: format!(
+                "运行档位已启用（SAP_MODE=runtime），仅保留注册表读与 /api/invokes 调用: {} {}",
+                method, path
+            ),
+            key: "RUNTIME_MODE".into(),
+        });
+    }
+    Ok(next.run(req).await)
+}
+
 /// 只读模式下该请求是否应被拦截（纯函数，便于单测）。
 fn is_read_only_blocked(method: &axum::http::Method, path: &str) -> bool {
     if path.starts_with("/api/adt/") {
@@ -268,6 +321,7 @@ pub fn app(pool: SharedPool) -> Router {
         // ADT REST 通用代理（dump 正文、类/程序源码等，任何方法透传）
         .route("/api/adt/{*path}", axum::routing::any(crate::adt::adt_proxy))
         .layer(axum::middleware::from_fn(read_only_guard))
+        .layer(axum::middleware::from_fn(runtime_mode_guard))
         .layer(axum::middleware::from_fn(crate::auth::require_api_key))
         .layer(axum::middleware::from_fn(rate_limit_middleware));
 
@@ -618,7 +672,7 @@ async fn invoke_handler(
         message: r.body_text(),
         key: "JSON_INVALID".into(),
     })?;
-    run_invoke_and_log(pool, caller_ip, req).await
+    run_invoke_and_log(pool, caller_ip, req, "rfc", None).await
 }
 
 /// POST /api/functions/{name}/invoke —— 类型化调用（函数名来自路径，请求体免填 func_name）。
@@ -656,15 +710,70 @@ async fn function_invoke_handler(
         message: format!("请求体与 /api/rfc 契约不符: {e}"),
         key: "JSON_INVALID".into(),
     })?;
-    run_invoke_and_log(pool, caller_ip, req).await
+    run_invoke_and_log(pool, caller_ip, req, "functions-invoke", None).await
+}
+
+// ========================================================================
+// 调用审计环形缓冲（v0.14）：最近 N 次调用的可查询记录
+// ========================================================================
+
+/// 环形缓冲容量（覆盖排障场景足够；更久的历史走 tracing 日志/采集系统）。
+const AUDIT_RING_CAPACITY: usize = 500;
+
+/// 一条审计记录。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AuditRecord {
+    /// RFC3339 UTC
+    pub at: String,
+    /// 调用来源端点（rfc / functions-invoke / mcp / invokes-alias）
+    pub via: &'static str,
+    /// 注册表别名（仅平坦调用携带；其余 null）
+    pub alias: Option<String>,
+    /// SAP 函数名
+    pub func: String,
+    /// 成功与否（HTTP 层面）
+    pub ok: bool,
+    /// 失败时的 HTTP 状态码（成功为 200）
+    pub status: u16,
+    /// 耗时毫秒
+    pub ms: u64,
+    /// 调用方 IP
+    pub ip: String,
+}
+
+static AUDIT_RING: OnceLock<std::sync::Mutex<std::collections::VecDeque<AuditRecord>>> =
+    OnceLock::new();
+
+fn audit_ring() -> &'static std::sync::Mutex<std::collections::VecDeque<AuditRecord>> {
+    AUDIT_RING.get_or_init(|| std::sync::Mutex::new(std::collections::VecDeque::new()))
+}
+
+/// 记一条审计（环形容量裁剪；锁毒化时丢弃该条——审计绝不能拖垮调用）。
+fn record_audit(rec: AuditRecord) {
+    if let Ok(mut ring) = audit_ring().lock() {
+        if ring.len() >= AUDIT_RING_CAPACITY {
+            ring.pop_front();
+        }
+        ring.push_back(rec);
+    }
+}
+
+/// 读审计快照（最新在前）。
+pub(crate) fn audit_snapshot() -> Vec<AuditRecord> {
+    match audit_ring().lock() {
+        Ok(ring) => ring.iter().rev().cloned().collect(),
+        Err(_) => Vec::new(),
+    }
 }
 
 /// /api/rfc 与 /api/functions/{name}/invoke 的共享执行段：
-/// 超时控制 → 连接池执行 → 指标采样 → 审计日志。
+/// 超时控制 → 连接池执行 → 指标采样 → 审计日志 + 审计环形缓冲。
 pub(crate) async fn run_invoke_and_log(
     pool: SharedPool,
     caller_ip: String,
     req: InvokeRequest,
+    via: &'static str,
+    alias: Option<String>,
 ) -> Result<Json<InvokeResponse>, RfcError> {
     let started = std::time::Instant::now();
     let func_name = req.func_name.clone();
@@ -690,8 +799,20 @@ pub(crate) async fn run_invoke_and_log(
     gauge!("pool_max").set(pool_stats.max as f64);
 
     // 审计日志 + 指标：成功 info / 失败 warn（失败 = 告警信号）
+    let audit_via = via;
+    let audit_alias = alias;
     match result {
         Ok(resp) => {
+            record_audit(AuditRecord {
+                at: crate::registry::now_iso8601_public(),
+                via: audit_via,
+                alias: audit_alias,
+                func: func_name.clone(),
+                ok: true,
+                status: 200,
+                ms: elapsed_ms,
+                ip: caller_ip.clone(),
+            });
             counter!("rfc_calls_total", "func" => func_name.clone(), "result" => "ok").increment(1);
             histogram!("rfc_call_duration_ms", "func" => func_name.clone())
                 .record(elapsed_ms as f64);
@@ -705,6 +826,16 @@ pub(crate) async fn run_invoke_and_log(
             Ok(Json(resp))
         }
         Err(e) => {
+            record_audit(AuditRecord {
+                at: crate::registry::now_iso8601_public(),
+                via: audit_via,
+                alias: audit_alias,
+                func: func_name.clone(),
+                ok: false,
+                status: e.status,
+                ms: elapsed_ms,
+                ip: caller_ip.clone(),
+            });
             counter!("rfc_calls_total", "func" => func_name.clone(), "result" => "err")
                 .increment(1);
             histogram!("rfc_call_duration_ms", "func" => func_name.clone())
@@ -1501,6 +1632,9 @@ struct ObjectWriteBody {
     /// 函数模块写后设为 remote-enabled（processingType=rfc；仅 func）
     #[serde(default)]
     rfc_enabled: Option<bool>,
+    /// 接口文档（Markdown，仅 func）：随代码存入注册表条目、流入 OpenAPI 目录
+    #[serde(default)]
+    doc: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -1549,6 +1683,7 @@ async fn object_write_handler(
         body.transport.as_deref(),
         body.activate,
         rfc,
+        body.doc.as_deref(),
     )
     .await
     {
@@ -1570,11 +1705,13 @@ async fn object_write_handler(
                 body.transport.as_deref(),
                 body.activate,
                 rfc,
+                body.doc.as_deref(),
             )
             .await?
         }
         Err(e) => return Err(e),
     };
+    crate::objects::drain_pool_after_write(&pool, obj_type);
     Ok(Json(serde_json::to_value(outcome).unwrap_or_default()))
 }
 
@@ -1627,6 +1764,7 @@ async fn object_delete_handler(
     let group = resolve_group_if_needed(&pool, obj_type, &name, q.group).await?;
     let outcome =
         crate::objects::delete_object(obj_type, &name, &group, q.transport.as_deref()).await?;
+    crate::objects::drain_pool_after_write(&pool, obj_type);
     Ok(Json(serde_json::to_value(outcome).unwrap_or_default()))
 }
 
@@ -1709,8 +1847,10 @@ async fn object_post_handler(
                 body.transport.as_deref(),
                 body.activate,
                 body.rfc_enabled.unwrap_or(false),
+                body.doc.as_deref(),
             )
             .await?;
+            crate::objects::drain_pool_after_write(&pool, obj_type);
             let mut v = serde_json::to_value(&outcome).unwrap_or_default();
             v["replaced"] = serde_json::json!(true);
             Ok(Json(v))
@@ -1753,6 +1893,7 @@ async fn object_post_handler(
                 .get("rfc_enabled")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
+            let doc = raw.get("doc").and_then(|v| v.as_str()).map(String::from);
             let mut v = serde_json::json!({
                 "created": true,
                 "type": obj_type.api_name(),
@@ -1767,8 +1908,10 @@ async fn object_post_handler(
                     transport.as_deref(),
                     activate,
                     rfc,
+                    doc.as_deref(),
                 )
                 .await?;
+                crate::objects::drain_pool_after_write(&pool, obj_type);
                 v["write"] = serde_json::to_value(outcome).unwrap_or_default();
             }
             Ok(Json(v))
@@ -1837,6 +1980,9 @@ struct ObjectReplaceBody {
     /// 函数模块写后设为 remote-enabled（仅 func）
     #[serde(default)]
     rfc_enabled: Option<bool>,
+    /// 接口文档（Markdown，仅 func）：随编辑存入注册表条目
+    #[serde(default)]
+    doc: Option<String>,
 }
 
 /// ⑤ GET /api/functions/:name/doc —— 查函数文档（短文本 + SE37 长文本 + 参数说明）
@@ -1901,6 +2047,33 @@ mod tests {
             "hi"
         );
         assert_eq!(mask_value("MAX_ROWS", &ScalarValue::Int(100)), "100");
+    }
+
+    #[test]
+    fn runtime_mode_allows_only_delivery_port() {
+        use axum::http::Method;
+        let get = Method::GET;
+        let post = Method::POST;
+        // 放行：注册表读 + 平坦调用
+        assert!(runtime_mode_allows(&get, "/api/registry"));
+        assert!(runtime_mode_allows(&get, "/api/registry/z_calc"));
+        assert!(runtime_mode_allows(&post, "/api/invokes/z_calc"));
+        // 拦：注册表写、审计读、开发面全部
+        assert!(!runtime_mode_allows(&post, "/api/registry/z_calc"));
+        assert!(!runtime_mode_allows(&get, "/api/invokes/audit"));
+        assert!(!runtime_mode_allows(&post, "/api/rfc"));
+        assert!(!runtime_mode_allows(&get, "/api/functions/BAPI_X"));
+        assert!(!runtime_mode_allows(&post, "/api/functions/search"));
+        assert!(!runtime_mode_allows(&post, "/api/table/read"));
+        assert!(!runtime_mode_allows(&get, "/api/dumps"));
+        assert!(!runtime_mode_allows(&put_method(), "/api/objects/prog/Z/source"));
+        assert!(!runtime_mode_allows(&get, "/api/adt/runtime/dumps"));
+        assert!(!runtime_mode_allows(&post, "/mcp"));
+        // 非业务路径（公开页）不经此守卫（挂载在 api 路由层内）
+    }
+
+    fn put_method() -> axum::http::Method {
+        axum::http::Method::PUT
     }
 
     #[test]

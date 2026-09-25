@@ -68,6 +68,9 @@ pub fn local_info() -> Value {
         "version": env!("CARGO_PKG_VERSION"),
         "commit": git_commit(),
         "capabilities": {
+            // 运行档位：full = 开发工作台（默认）；runtime = 消费方运行桥
+            // （只留注册表读 + /api/invokes，其余 /api/* 返回 403 RUNTIME_MODE）
+            "mode": if crate::server::runtime_mode_active() { "runtime" } else { "full" },
             // true = 已设 SAP_API_KEY，/api/* 需 Bearer token（本端点除外）
             "auth": crate::auth::is_enabled(),
             // true = SAP_READ_ONLY=1，写端点（objects 写 / ADT 写方法）返回 403

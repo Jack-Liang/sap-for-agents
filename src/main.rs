@@ -139,6 +139,11 @@ async fn run_client() -> Result<(), Box<dyn std::error::Error>> {
         &cfg.adt_passwd,
         cfg.request_timeout,
     );
+    // 运行档位（SAP_MODE=runtime）：消费方运行模式——只留交付端口调用面
+    server::init_runtime_mode(cfg.runtime_mode);
+    if cfg.runtime_mode {
+        tracing::warn!("🚀 运行档位（SAP_MODE=runtime）：仅保留 GET /api/registry 与 POST /api/invokes/**，其余 /api/* 返回 403 RUNTIME_MODE");
+    }
     // API 注册表（v0.12：Agent 跨会话记忆；本地 JSON 文件，坏文件自动备份）
     registry::init(cfg.registry_file.clone());
     tracing::info!(
