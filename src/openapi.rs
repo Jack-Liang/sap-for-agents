@@ -65,6 +65,10 @@ const SPEC_JSON: &str = r##"{
       "description": "Transparent table data reader"
     },
     {
+      "name": "registry",
+      "description": "API registry — cross-session memory of agent-built interfaces (gateway-local, survives restarts)"
+    },
+    {
       "name": "ops",
       "description": "Health probes and metrics (unauthenticated)"
     }
@@ -616,6 +620,231 @@ const SPEC_JSON: &str = r##"{
             "$ref": "#/components/responses/Error"
           },
           "502": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/registry": {
+      "get": {
+        "tags": [
+          "registry"
+        ],
+        "summary": "List registered APIs (agent cross-session memory)",
+        "description": "Every remote-enabled function module successfully written through this gateway is auto-registered here as a draft entry; entries carry intent / pitfalls / example invocations and survive restarts. Check this first in a new session before searching SAP. Tombstoned entries (their FM was deleted) are hidden unless include_deleted=true.",
+        "parameters": [
+          {
+            "name": "q",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Substring filter on alias / func_name / intent (case-insensitive)"
+          },
+          {
+            "name": "include_deleted",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": false
+            },
+            "description": "Also list tombstoned entries"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Registry entries (alias-sorted)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "count",
+                    "version",
+                    "entries"
+                  ],
+                  "properties": {
+                    "count": {
+                      "type": "integer"
+                    },
+                    "version": {
+                      "type": "integer",
+                      "description": "Storage schema version"
+                    },
+                    "entries": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/RegistryEntry"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/registry/{alias}": {
+      "get": {
+        "tags": [
+          "registry"
+        ],
+        "summary": "Read one registry entry",
+        "parameters": [
+          {
+            "name": "alias",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^[a-z0-9_/-]{1,60}$"
+            },
+            "description": "Unique lowercase id (team/name prefixes allowed)"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The entry",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RegistryEntry"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "registry"
+        ],
+        "summary": "Create/fully replace a registry entry",
+        "description": "PUT is a FULL replace (GET first, merge, PUT back). Auto-registered drafts keep their origin. status accepts draft/published only (deletion goes through DELETE).",
+        "parameters": [
+          {
+            "name": "alias",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^[a-z0-9_/-]{1,60}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RegistryPutRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Entry after write + created flag",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "created": {
+                      "type": "boolean"
+                    },
+                    "entry": {
+                      "$ref": "#/components/schemas/RegistryEntry"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "registry"
+        ],
+        "summary": "Tombstone (default) or physically remove an entry",
+        "parameters": [
+          {
+            "name": "alias",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "purge",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": false
+            },
+            "description": "true = physical removal (default tombstones for the record)"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "deleted / purged",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "alias": {
+                      "type": "string"
+                    },
+                    "status": {
+                      "type": "string",
+                      "enum": [
+                        "deleted",
+                        "purged"
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
             "$ref": "#/components/responses/Error"
           }
         }
@@ -2123,6 +2352,104 @@ const SPEC_JSON: &str = r##"{
           }
         }
       },
+      "RegistryEntry": {
+        "type": "object",
+        "required": [
+          "alias",
+          "func_name",
+          "status",
+          "origin",
+          "created_at",
+          "updated_at"
+        ],
+        "properties": {
+          "alias": {
+            "type": "string",
+            "description": "Unique lowercase URL-safe id (team/name prefixes allowed)"
+          },
+          "func_name": {
+            "type": "string",
+            "description": "SAP function module name (uppercase, remote-enabled)"
+          },
+          "group": {
+            "type": "string",
+            "description": "Function group (informational)"
+          },
+          "intent": {
+            "type": "string",
+            "description": "What this API is for, who consumes it (agent-written)"
+          },
+          "notes": {
+            "type": "string",
+            "description": "Pitfalls / know-how from previous sessions (agent-written)"
+          },
+          "example": {
+            "type": "object",
+            "description": "Sample invoke body for POST /api/functions/{func_name}/invoke"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "draft",
+              "published",
+              "deleted"
+            ],
+            "description": "deleted = tombstone (FM was deleted; record kept)"
+          },
+          "origin": {
+            "type": "string",
+            "enum": [
+              "auto",
+              "manual"
+            ],
+            "description": "auto = created by the write hook on rfc_enabled FM writes"
+          },
+          "created_at": {
+            "type": "string",
+            "description": "RFC3339 UTC"
+          },
+          "updated_at": {
+            "type": "string",
+            "description": "RFC3339 UTC"
+          }
+        }
+      },
+      "RegistryPutRequest": {
+        "type": "object",
+        "required": [
+          "func_name"
+        ],
+        "properties": {
+          "func_name": {
+            "type": "string",
+            "description": "SAP function module name (uppercase)"
+          },
+          "group": {
+            "type": "string",
+            "description": "Function group (optional)"
+          },
+          "intent": {
+            "type": "string",
+            "description": "What this API is for (default empty)"
+          },
+          "notes": {
+            "type": "string",
+            "description": "Pitfalls / usage notes (default empty)"
+          },
+          "example": {
+            "type": "object",
+            "description": "Sample invoke body (default null = cleared)"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "draft",
+              "published"
+            ],
+            "default": "draft"
+          }
+        }
+      },
       "TableReadResponse": {
         "type": "object",
         "required": [
@@ -2864,6 +3191,8 @@ mod tests {
             "/api/ddic/type/{name}",
             "/api/ddic/field/{table}/{field}",
             "/api/table/read",
+            "/api/registry",
+            "/api/registry/{alias}",
             "/api/dumps",
             "/api/dumps/grouped",
             "/api/dumps/{key}/detail",

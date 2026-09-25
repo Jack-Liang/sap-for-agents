@@ -839,6 +839,10 @@ pub struct WriteOutcome {
     /// 是否已把函数模块设为 remote-enabled（rfc_enabled:true 时出现）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rfc_enabled: Option<bool>,
+    /// 注册表自动登记的 alias（remote-enabled 函数写入成功后出现；
+    /// 登记失败不出现，只在 warnings 里说明）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub registered_alias: Option<String>,
     pub activated: Option<ActivationOutcome>,
     /// 编排过程中的非致命警告（如解锁失败——锁会随会话过期，但应可见）
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -1672,6 +1676,17 @@ pub async fn write_object_source(
         None
     };
 
+    // ⑤ 注册表自动登记：remote-enabled 函数写入成功即获得 draft 条目
+    //    （幂等；保留 Agent 已写的 intent/notes）。登记失败只降级为警告——
+    //    注册表是网关本地状态，绝不让它影响 SAP 写入结果。
+    let mut registered_alias = None;
+    if obj_type == ObjectType::Function && rfc_result == Some(true) {
+        match crate::registry::auto_register_func(&name_upper, (!group.trim().is_empty()).then(|| group.trim())) {
+            Ok(alias) => registered_alias = Some(alias),
+            Err(e) => warnings.push(format!("注册表自动登记失败（不影响写入）: {}", e.message)),
+        }
+    }
+
     Ok(WriteOutcome {
         obj_type: type_name.to_string(),
         name: name.trim().to_uppercase(),
@@ -1680,6 +1695,7 @@ pub async fn write_object_source(
         written: true,
         transport_used,
         rfc_enabled: rfc_result,
+        registered_alias,
         activated,
         warnings,
     })
@@ -2073,6 +2089,12 @@ pub async fn delete_object(
     }
     // 成功：DELETE 已消耗锁柄，直接结束会话
     drop_session(&base, &sess).await;
+    // 注册表钩子：函数删除成功 → 墓碑化（保留条目留档；失败只记警告）
+    if obj_type == ObjectType::Function {
+        if let Err(e) = crate::registry::tombstone_func(name.trim()) {
+            warnings.push(format!("注册表墓碑化失败（不影响删除）: {}", e.message));
+        }
+    }
     Ok(DeleteOutcome {
         obj_type: obj_type.api_name().to_string(),
         name: name.trim().to_uppercase(),

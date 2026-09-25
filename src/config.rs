@@ -33,6 +33,9 @@ pub struct AppConfig {
     /// （objects PUT/replace、ADT 写方法）。`/api/rfc` 不受影响——RFC 无法
     /// 按函数名可靠区分读写，SAP 端授权才是真正的边界。
     pub read_only: bool,
+    /// API 注册表文件路径（`SAP_REGISTRY_FILE`，默认 `./registry.json`）。
+    /// 网关本地 JSON（不依赖 SAP）；目录须可写。
+    pub registry_file: std::path::PathBuf,
     /// 新版本检查（`SAP_UPDATE_CHECK`，默认开启；off/false/0/no 关闭）：
     /// 启动时与每 24h 查 GitHub 最新 Release（仅一个匿名 GET，无遥测），
     /// 结果进 `/api/version` 的 latest 块与首页页脚。
@@ -96,6 +99,10 @@ pub fn load() -> Result<AppConfig, String> {
     let read_only = env::var("SAP_READ_ONLY")
         .map(|v| matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
         .unwrap_or(false);
+    // API 注册表文件（默认工作目录下的 registry.json）
+    let registry_file = std::path::PathBuf::from(
+        env::var("SAP_REGISTRY_FILE").unwrap_or_else(|_| "registry.json".to_string()),
+    );
     // 新版本检查：默认开启；识别 0/false/off/no（大小写不敏感）为关闭
     let update_check = env::var("SAP_UPDATE_CHECK")
         .map(|v| {
@@ -126,6 +133,7 @@ pub fn load() -> Result<AppConfig, String> {
         adt_user,
         adt_passwd,
         read_only,
+        registry_file,
         update_check,
     })
 }
@@ -160,6 +168,7 @@ mod tests {
             "SAP_ADT_PASSWD",
             "SAP_READ_ONLY",
             "SAP_UPDATE_CHECK",
+            "SAP_REGISTRY_FILE",
         ] {
             unsafe {
                 std::env::remove_var(k);

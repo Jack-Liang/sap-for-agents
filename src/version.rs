@@ -74,6 +74,8 @@ pub fn local_info() -> Value {
             "read_only": crate::server::read_only_active(),
             // true = SAP_ADT_BASE_URL 非空，ADT 代理与 dumps 端点可用
             "adt": crate::adt::is_enabled(),
+            // true = API 注册表已启用（GET /api/registry；Agent 跨会话记忆）
+            "registry": crate::registry::is_enabled(),
             // 按 IP 每秒请求上限；null = 不限流
             "rate_limit_rps": crate::server::rate_limit_rps(),
         },
@@ -227,8 +229,8 @@ mod tests {
         assert_eq!(v["name"], "sap-for-agents");
         assert_eq!(v["version"], env!("CARGO_PKG_VERSION"));
         assert!(!v["commit"].as_str().unwrap().is_empty(), "commit 必有值");
-        // 四个能力开关字段都在，且类型正确（rate_limit_rps 可为 null）
-        for key in ["auth", "read_only", "adt"] {
+        // 五个能力开关字段都在，且类型正确（rate_limit_rps 可为 null）
+        for key in ["auth", "read_only", "adt", "registry"] {
             assert!(v["capabilities"][key].is_boolean(), "capabilities.{key} 应为布尔");
         }
         assert!(

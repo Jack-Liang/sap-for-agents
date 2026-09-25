@@ -29,7 +29,9 @@ curl -H "Authorization: Bearer <SAP_API_KEY>" http://127.0.0.1:3000/api/function
 
 | 目标 | 用哪个端点 |
 |------|-----------|
-| 新会话先**自描述**：网关版本/commit、能力开关（鉴权/只读/ADT/限流）、SAP sysid 与 release | `GET /api/version`（公开） |
+| 新会话先**查注册表**：Agent 建过哪些接口的跨会话记忆（别名、意图、踩坑记录、调用示例） | `GET /api/registry` |
+| 想发布/完善某个接口的契约（intent / notes / example） | `PUT /api/registry/{alias}` |
+| 新会话先**自描述**：网关版本/commit、能力开关（鉴权/只读/ADT/注册表/限流）、SAP sysid 与 release | `GET /api/version`（公开） |
 | 不知道有哪些函数 → 按名字模糊搜索 | `POST /api/functions/search` |
 | 知道函数名，想知道参数怎么填 | `GET /api/functions/{name}` |
 | 想读函数的完整文档（用途、示例） | `GET /api/functions/{name}/doc` |
@@ -60,9 +62,10 @@ curl -H "Authorization: Bearer <SAP_API_KEY>" http://127.0.0.1:3000/api/function
 
 ## 标准操作流程
 
-绝大多数任务遵循 **搜索 → 查接口 → 查文档 → 看源码 → 调用** 五步：
+绝大多数任务遵循 **查注册表 → 搜索 → 查接口 → 查文档 → 看源码 → 调用** 六步：
 
 ```
+0. 查注册表  GET  /api/registry             复用之前会话建好的接口（空表可跳过）
 1. 搜函数    POST /api/functions/search     找到目标函数名
 2. 查接口    GET  /api/functions/{name}     看清楚参数名、类型、方向
 3. 查文档    GET  /api/functions/{name}/doc 理解用途、约束、示例
@@ -73,6 +76,37 @@ curl -H "Authorization: Bearer <SAP_API_KEY>" http://127.0.0.1:3000/api/function
 > 不要跳过第 2 步直接调用——SAP 参数名区分大小写且必须大写，类型（CHAR/INT/BCD...）决定如何传值。先查接口能避免 90% 的传参错误。
 
 ## 端点速查（含可复制的示例）
+
+### 0. 注册表——Agent 建过哪些接口的跨会话记忆
+
+注册表是网关的持久记忆：凡是**经本网关**成功写入的 remote-enabled 函数，都会自动登记为 `draft` 条目（幂等；你写过的 intent/notes 不会被清掉）；删除该函数对象时条目转为墓碑。存储为本地 JSON 文件（`SAP_REGISTRY_FILE`，默认 `./registry.json`）——跨网关重启存活、不依赖 SAP。
+
+```bash
+# 之前会话都建了什么？（每个会话的第 0 步）
+curl http://127.0.0.1:3000/api/registry
+# → {"count":1,"version":1,"entries":[{"alias":"z_calc","func_name":"Z_CALC",
+#     "intent":"...","notes":"...","example":{...},"status":"draft",...}]}
+
+# 按子串过滤（alias / func_name / intent，大小写不敏感）
+curl 'http://127.0.0.1:3000/api/registry?q=customer'
+
+# 完善自动登记的 draft（PUT 为全量替换：先 GET、改完再 PUT 回来）
+curl -X PUT http://127.0.0.1:3000/api/registry/z_calc \
+  -H "Content-Type: application/json" \
+  -d '{"func_name":"Z_CALC","group":"ZMATH","intent":"给前端用的客户列表",
+       "notes":"必须传 MAX_ROWS；只读接口无需 commit",
+       "example":{"inputs":{"IV_A":20,"IV_B":22}},"status":"published"}'
+
+# 单条 · 删除（默认墓碑——记录留着可考）
+curl http://127.0.0.1:3000/api/registry/z_calc
+curl -X DELETE 'http://127.0.0.1:3000/api/registry/z_calc'            # → status "deleted"
+curl -X DELETE 'http://127.0.0.1:3000/api/registry/z_calc?purge=true' # 物理删除
+```
+
+- 条目字段：`alias`（唯一、小写、URL 安全，支持 `team/name` 前缀）、`func_name`、`group`、`intent`（干什么的）、`notes`（踩坑记录/know-how）、`example`（调用示例体）、`status`（`draft`/`published`；墓碑显示 `deleted`，默认列表隐藏——`?include_deleted=true` 可见）。
+- 删除 SAP 对象时条目**转墓碑**（绝不静默消失）；再次写入同名函数自动复活。删除 fugr 不会级联处理其中 FM 的条目——整组删除后需手动清理。
+- 同名函数重复登记会保留你的 `intent`/`notes`/`example`——只刷新 status/group/时间戳。登记失败绝不影响 SAP 写入本身（仅在写响应里降级为 warning）。
+- MCP 客户端：`list_registry_apis` 工具就是这份目录。
 
 ### 1. 搜索函数
 
@@ -421,6 +455,7 @@ curl http://127.0.0.1:3000/api/version
 #     "auth": false,                     # true = /api/* 需 Bearer token（本端点除外）
 #     "read_only": false,                # true = 写端点返回 403 READ_ONLY
 #     "adt": true,                       # true = /api/adt/** 与 /api/dumps* 可用
+#     "registry": true,                  # true = /api/registry**（跨会话 API 记忆）可用
 #     "rate_limit_rps": null             # 按 IP 每秒上限；null = 不限流
 #   },
 #   "latest": {                          # 后台 GitHub Release 检查（启动时 + 每 24h）；

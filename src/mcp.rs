@@ -194,6 +194,14 @@ pub fn tools_manifest() -> Vec<Value> {
             }, "required": ["type", "name"] }
         }),
         json!({
+            "name": "list_registry_apis",
+            "description": "List APIs in the gateway's registry — the shared cross-session memory of agent-built interfaces (each entry: alias, func_name, intent, notes/pitfalls, example invoke body, status draft/published). ALWAYS call this FIRST in a new session before searching SAP functions: if a matching entry exists, invoke it via its func_name instead of re-exploring. Remote-enabled functions you create through the gateway are auto-registered as drafts — enrich them via PUT /api/registry/{alias} (REST).",
+            "inputSchema": { "type": "object", "properties": {
+                "q": { "type": "string", "description": "Optional substring filter (alias/func_name/intent, case-insensitive)" },
+                "include_deleted": { "type": "boolean", "description": "Also include tombstoned entries (default false)" }
+            } }
+        }),
+        json!({
             "name": "get_gateway_info",
             "description": "Gateway self-description: version, git commit, capability switches (auth/read_only/adt/rate_limit) and the SAP system info (sysid/release/host/os/client, cached from the first call). Call this first in a new session to learn whether writes are allowed and whether SAP is reachable — never fails on SAP outage (sap becomes null).",
             "inputSchema": { "type": "object", "properties": {} }
@@ -294,7 +302,7 @@ pub async fn mcp_handler(
                     "name": "sap-for-agents",
                     "version": env!("CARGO_PKG_VERSION"),
                 },
-                "instructions": "SAP NWRFC→REST gateway as tools. Workflow: search_functions → get_function_interface → get_function_doc → invoke_rfc. Parameter names are UPPERCASE. Code edits: use the REST API (see /agents.md)."
+                "instructions": "SAP NWRFC→REST gateway as tools. New session? Start with list_registry_apis (cross-session memory of agent-built APIs), then get_gateway_info. Workflow for new work: search_functions → get_function_interface → get_function_doc → invoke_rfc. Parameter names are UPPERCASE. Code edits: use the REST API (see /agents.md)."
             }),
         ),
         "ping" => rpc_result(id, json!({})),
@@ -649,6 +657,19 @@ async fn call_tool(pool: SharedPool, name: &str, args: Value) -> Result<Value, R
                     .await?;
             Ok(serde_json::to_value(outcome).unwrap_or_default())
         }
+        "list_registry_apis" => {
+            let q = args
+                .get("q")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let include_deleted = args
+                .get("include_deleted")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let entries = crate::registry::list_entries(q.as_deref(), include_deleted)?;
+            let count = entries.len();
+            Ok(json!({ "count": count, "entries": entries }))
+        }
         "get_gateway_info" => {
             // 与 GET /api/version 同源（version 模块内含懒加载缓存）
             Ok(crate::version::gateway_info(&pool).await)
@@ -736,6 +757,7 @@ mod tests {
             "list_dumps",
             "get_dump_detail",
             "get_gateway_info",
+            "list_registry_apis",
             "syntax_check",
         ] {
             assert!(names.contains(&expected), "缺少工具 {expected}");

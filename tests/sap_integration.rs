@@ -1289,3 +1289,188 @@ fn mcp_edit_code_and_write_source_tools() {
     let payload: serde_json::Value = serde_json::from_str(text).unwrap();
     assert_eq!(payload["activated"]["success"], true);
 }
+
+// ========================================================================
+// API 注册表（v0.12）：纯网关本地状态，不写 SAP
+// ========================================================================
+
+/// 注册表集成测试用的临时文件路径（每次唯一）。
+fn temp_registry_path(tag: &str) -> String {
+    let dir = std::env::temp_dir().join(format!(
+        "sfa-itest-registry-{}-{}",
+        tag,
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    dir.join("registry.json").to_str().unwrap().to_string()
+}
+
+#[test]
+#[ignore]
+fn registry_crud_and_persistence_across_restart() {
+    let reg_path = temp_registry_path("crud");
+    let _s = start_server_with_env(&[("SAP_REGISTRY_FILE", reg_path.as_str())]);
+
+    // 空表
+    let resp = http_client()
+        .get(format!("{}/api/registry", _s.base_url))
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().unwrap();
+    assert_eq!(body["count"], 0, "新注册表应为空: {body}");
+
+    // capabilities.registry = true
+    let resp = http_client()
+        .get(format!("{}/api/version", _s.base_url))
+        .send()
+        .unwrap();
+    let body: serde_json::Value = resp.json().unwrap();
+    assert_eq!(body["capabilities"]["registry"], true);
+
+    // 创建（带齐三件套：intent/notes/example）
+    let entry = serde_json::json!({
+        "func_name": "Z_ITEST_CALC",
+        "group": "ZITEST",
+        "intent": "integration test calculator",
+        "notes": "must pass IV_A as integer",
+        "example": {"inputs": {"IV_A": 20, "IV_B": 22}},
+        "status": "published"
+    });
+    let resp = http_client()
+        .put(format!("{}/api/registry/z-itest/calc", _s.base_url))
+        .json(&entry)
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().unwrap();
+    assert_eq!(body["created"], true);
+    assert_eq!(body["entry"]["func_name"], "Z_ITEST_CALC");
+    assert_eq!(body["entry"]["status"], "published");
+
+    // 单条 + 过滤
+    let resp = http_client()
+        .get(format!("{}/api/registry/z-itest/calc", _s.base_url))
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().unwrap();
+    assert_eq!(body["notes"], "must pass IV_A as integer");
+
+    let resp = http_client()
+        .get(format!("{}/api/registry?q=CALCULATOR", _s.base_url))
+        .send()
+        .unwrap();
+    let body: serde_json::Value = resp.json().unwrap();
+    assert_eq!(body["count"], 1, "q 命中 intent（大小写不敏感）");
+
+    let resp = http_client()
+        .get(format!("{}/api/registry?q=nomatchxyz", _s.base_url))
+        .send()
+        .unwrap();
+    let body: serde_json::Value = resp.json().unwrap();
+    assert_eq!(body["count"], 0);
+
+    // MCP 工具面：list_registry_apis 能看到
+    let resp = http_client()
+        .post(format!("{}/mcp", _s.base_url))
+        .json(&serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": "list_registry_apis", "arguments": {"q": "calc"}}
+        }))
+        .send()
+        .unwrap();
+    let body: serde_json::Value = resp.json().unwrap();
+    assert_eq!(body["result"]["isError"], false);
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    let payload: serde_json::Value = serde_json::from_str(text).unwrap();
+    assert_eq!(payload["count"], 1, "MCP 列表应含条目: {payload}");
+    assert_eq!(payload["entries"][0]["alias"], "z-itest/calc");
+
+    // 非法 alias / 非法 status → 400
+    let resp = http_client()
+        .put(format!("{}/api/registry/BAD_ALIAS", _s.base_url))
+        .json(&serde_json::json!({"func_name": "Z_X"}))
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    let resp = http_client()
+        .put(format!("{}/api/registry/z-ok", _s.base_url))
+        .json(&serde_json::json!({"func_name": "Z_X", "status": "deleted"}))
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+
+    // 墓碑删除：默认列表不可见，include_deleted 可见
+    let resp = http_client()
+        .delete(format!("{}/api/registry/z-itest/calc", _s.base_url))
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let resp = http_client()
+        .get(format!("{}/api/registry", _s.base_url))
+        .send()
+        .unwrap();
+    let body: serde_json::Value = resp.json().unwrap();
+    assert_eq!(body["count"], 0, "墓碑默认不可见");
+    let resp = http_client()
+        .get(format!("{}/api/registry?include_deleted=true", _s.base_url))
+        .send()
+        .unwrap();
+    let body: serde_json::Value = resp.json().unwrap();
+    assert_eq!(body["count"], 1);
+    assert_eq!(body["entries"][0]["status"], "deleted");
+
+    // 文件落盘校验（schema version + 墓碑条目）
+    let text = std::fs::read_to_string(&reg_path).unwrap();
+    assert!(text.contains("\"version\": 1"), "{text}");
+    assert!(text.contains("Z_ITEST_CALC"));
+
+    // 跨重启持久化：同一文件，第二个 server 实例仍能读到（ revived 场景：
+    // PUT 同 alias 复活墓碑）
+    drop(_s);
+    let _s2 = start_server_with_env(&[("SAP_REGISTRY_FILE", reg_path.as_str())]);
+    let resp = http_client()
+        .put(format!("{}/api/registry/z-itest/calc", _s2.base_url))
+        .json(&entry)
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().unwrap();
+    assert_eq!(body["created"], false, "重启后条目仍在（墓碑复活而非新建）");
+    let resp = http_client()
+        .get(format!("{}/api/registry", _s2.base_url))
+        .send()
+        .unwrap();
+    let body: serde_json::Value = resp.json().unwrap();
+    assert_eq!(body["count"], 1, "复活后默认列表可见");
+}
+
+#[test]
+#[ignore]
+fn registry_corrupt_file_recovers() {
+    // 预置坏文件：网关应备份后以空表启动（而不是崩溃）
+    let reg_path = temp_registry_path("corrupt");
+    std::fs::write(&reg_path, "{ broken json").unwrap();
+    let _s = start_server_with_env(&[("SAP_REGISTRY_FILE", reg_path.as_str())]);
+    let resp = http_client()
+        .get(format!("{}/api/registry", _s.base_url))
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 200, "坏文件不应拖垮网关");
+    let body: serde_json::Value = resp.json().unwrap();
+    assert_eq!(body["count"], 0, "坏文件 → 空表启动");
+    // 备份文件存在
+    let dir = std::path::Path::new(&reg_path).parent().unwrap();
+    let has_backup = std::fs::read_dir(dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .any(|e| e
+            .file_name()
+            .to_string_lossy()
+            .starts_with("registry.json.corrupt-"));
+    assert!(has_backup, "坏文件应被备份而非覆盖丢失");
+}

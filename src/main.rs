@@ -14,6 +14,7 @@ mod objects;
 mod openapi;
 mod mcp;
 mod pool;
+mod registry;
 mod server;
 mod server_config;
 mod server_rfc;
@@ -136,6 +137,12 @@ async fn run_client() -> Result<(), Box<dyn std::error::Error>> {
         &cfg.adt_user,
         &cfg.adt_passwd,
         cfg.request_timeout,
+    );
+    // API 注册表（v0.12：Agent 跨会话记忆；本地 JSON 文件，坏文件自动备份）
+    registry::init(cfg.registry_file.clone());
+    tracing::info!(
+        path = %cfg.registry_file.display(),
+        "API 注册表已启用（GET /api/registry）"
     );
     let shared: server::SharedPool = Arc::new(pool);
 

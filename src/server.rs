@@ -251,6 +251,9 @@ pub fn app(pool: SharedPool) -> Router {
             axum::routing::get(dumps_grouped_handler),
         )
         .route("/api/dumps/*key", axum::routing::get(dump_detail_handler))
+        // API 注册表（v0.12：Agent 跨会话记忆；本地 JSON 存储，不依赖 SAP，
+        // 子路由自带 handler——挂这里只为共享鉴权/限流层）
+        .merge(crate::registry::router())
         // ABAP 对象写入编排（锁→写→解锁→激活一体；replace/syntax 见 dispatcher）
         .route(
             "/api/objects/*path",

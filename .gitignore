@@ -45,3 +45,5 @@ nwrfcsdk/**
 .env
 # Server 模式配置（servers.toml，可能含 SAP gateway 凭据）；模板 servers.toml.example 保留可提交
 servers.toml
+# API 注册表（网关本地状态，不提交）
+registry.json

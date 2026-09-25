@@ -29,7 +29,9 @@ curl -H "Authorization: Bearer <SAP_API_KEY>" http://127.0.0.1:3000/api/function
 
 | Goal | Endpoint |
 |------|-----------|
-| New session → **self-description first**: gateway version/commit, capability switches (auth / read_only / adt / rate limit), SAP sysid & release | `GET /api/version` (public) |
+| New session → **check the registry first**: cross-session memory of agent-built APIs (alias, intent, pitfalls, example invocations) | `GET /api/registry` |
+| Want to publish/update one API's contract (intent / notes / example) | `PUT /api/registry/{alias}` |
+| New session → **self-description first**: gateway version/commit, capability switches (auth / read_only / adt / registry / rate limit), SAP sysid & release | `GET /api/version` (public) |
 | Don't know which functions exist → fuzzy search by name | `POST /api/functions/search` |
 | Know the function name, want to know how to fill parameters | `GET /api/functions/{name}` |
 | Want full function documentation (purpose, examples) | `GET /api/functions/{name}/doc` |
@@ -60,19 +62,51 @@ curl -H "Authorization: Bearer <SAP_API_KEY>" http://127.0.0.1:3000/api/function
 
 ## Standard workflow
 
-Most tasks follow five steps: **search → inspect interface → read docs → view source → invoke**:
+Most tasks follow six steps: **check registry → search → inspect interface → read docs → view source → invoke**:
 
 ```
-1. Search functions  POST /api/functions/search      Find the target function name
-2. Inspect interface GET  /api/functions/{name}      See parameter names, types, directions
-3. Read docs         GET  /api/functions/{name}/doc  Understand purpose, constraints, examples
-4. View source       GET  /api/functions/{name}/source  Understand the implementation (optional)
+0. Check registry   GET  /api/registry              Reuse what earlier sessions built (skip when empty)
+1. Search functions POST /api/functions/search      Find the target function name
+2. Inspect interface GET /api/functions/{name}      See parameter names, types, directions
+3. Read docs         GET /api/functions/{name}/doc  Understand purpose, constraints, examples
+4. View source       GET /api/functions/{name}/source  Understand the implementation (optional)
 5. Invoke            POST /api/rfc                   Fill parameters per the interface and execute
 ```
 
 > Do not skip step 2 and invoke directly — SAP parameter names are case-sensitive and must be uppercase, and the type (CHAR/INT/BCD...) determines how to pass values. Inspecting the interface first avoids 90% of parameter mistakes.
 
 ## Endpoint quick reference (copyable examples)
+
+### 0. Registry — cross-session memory of agent-built APIs
+
+The registry is the gateway's persistent memory: every remote-enabled function module successfully written **through this gateway** is auto-registered as a `draft` entry (idempotent; your intent/notes are never clobbered), and deleting the FM tombstones its entry. Storage is a local JSON file (`SAP_REGISTRY_FILE`, default `./registry.json`) — it survives gateway restarts and does not depend on SAP.
+
+```bash
+# What did previous sessions build? (step 0 of every session)
+curl http://127.0.0.1:3000/api/registry
+# → {"count":1,"version":1,"entries":[{"alias":"z_calc","func_name":"Z_CALC",
+#     "intent":"...","notes":"...","example":{...},"status":"draft",...}]}
+
+# Filter by substring (alias / func_name / intent, case-insensitive)
+curl 'http://127.0.0.1:3000/api/registry?q=customer'
+
+# Enrich an auto-registered draft (PUT = FULL replace: GET first, merge, PUT back)
+curl -X PUT http://127.0.0.1:3000/api/registry/z_calc \
+  -H "Content-Type: application/json" \
+  -d '{"func_name":"Z_CALC","group":"ZMATH","intent":"customer list for the frontend",
+       "notes":"must pass MAX_ROWS; read-only, no commit needed",
+       "example":{"inputs":{"IV_A":20,"IV_B":22}},"status":"published"}'
+
+# One entry · delete (tombstone by default — the record stays for archaeology)
+curl http://127.0.0.1:3000/api/registry/z_calc
+curl -X DELETE 'http://127.0.0.1:3000/api/registry/z_calc'            # → status "deleted"
+curl -X DELETE 'http://127.0.0.1:3000/api/registry/z_calc?purge=true' # physical removal
+```
+
+- Entry fields: `alias` (unique lowercase URL-safe id, `team/name` prefixes allowed), `func_name`, `group`, `intent` (what it's for), `notes` (pitfalls/know-how), `example` (sample invoke body), `status` (`draft`/`published`; tombstones show `deleted`, hidden from the default list — `?include_deleted=true` reveals them).
+- Deleting the SAP object **tombstones** the entry (never silently removes); writing the same function again revives it. Fugr deletes do not cascade to member FM entries — clean those up manually when you delete whole groups.
+- Re-registering a function keeps your `intent`/`notes`/`example` — only status/group/timestamps are refreshed. Registration failure never fails the SAP write itself (it degrades to a warning in the write response).
+- MCP clients: the `list_registry_apis` tool is the same catalog.
 
 ### 1. Search functions
 
@@ -421,6 +455,7 @@ curl http://127.0.0.1:3000/api/version
 #     "auth": false,                     # true = /api/* needs Bearer token (this endpoint excepted)
 #     "read_only": false,                # true = write endpoints return 403 READ_ONLY
 #     "adt": true,                       # true = /api/adt/** and /api/dumps* are usable
+#     "registry": true,                  # true = /api/registry** (cross-session API memory) is usable
 #     "rate_limit_rps": null             # per-IP cap; null = unlimited
 #   },
 #   "latest": {                          # background GitHub release check (startup + every 24h);
