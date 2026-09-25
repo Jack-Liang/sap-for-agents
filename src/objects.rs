@@ -1820,6 +1820,8 @@ async fn write_ddic_source(
         written: true,
         transport_used,
         rfc_enabled: None,
+        // DDIC 写入路径不适用注册表（仅 rfc_enabled 函数会登记）
+        registered_alias: None,
         activated,
         warnings: Vec::new(),
     })
