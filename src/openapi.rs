@@ -850,6 +850,85 @@ const SPEC_JSON: &str = r##"{
         }
       }
     },
+    "/api/invokes/{alias}": {
+      "post": {
+        "tags": [
+          "registry"
+        ],
+        "summary": "Flat invoke of a registered API (consumer-facing delivery port)",
+        "description": "Flat JSON in / flat JSON out — no SAP dialect needed. The contract is derived from the function's live interface metadata: input keys map to parameters (case-insensitive; structures are objects, tables are arrays of row objects), all outputs are returned by true type, output tables are row-capped (?limit= overrides; default 100, entry max_rows overrides the default). Response carries \"_truncated\" listing capped tables when truncation occurred. Unknown body keys are rejected with 400 (allowed keys listed). Alias comes from GET /api/registry; published entries also appear as fully typed operations in this spec.",
+        "parameters": [
+          {
+            "name": "alias",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Registry alias (unique lowercase id)"
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "default": 100,
+              "maximum": 10000
+            },
+            "description": "Row cap for output tables"
+          },
+          {
+            "name": "timeout_secs",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "description": "Per-call timeout override in seconds"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "description": "Flat body: parameter name → value"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Flat result: output parameter name → value",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "502": {
+            "$ref": "#/components/responses/Error"
+          },
+          "504": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
     "/api/dumps": {
       "get": {
         "tags": [
@@ -2858,6 +2937,8 @@ const SPEC_JSON: &str = r##"{
 "##;
 
 /// GET /openapi.json —— 返回 OpenAPI 3.0.3 规范（免鉴权，公开页）。
+/// v0.13 起并入注册表 published 条目的平坦调用 operation（服务目录）——
+/// 读的是后台 watcher 预热的缓存，不碰 SAP：公开页永远秒回、SAP 宕机不受影响。
 pub async fn openapi_handler(
     req: axum::http::Request<axum::body::Body>,
 ) -> axum::response::Response {
@@ -2868,7 +2949,25 @@ pub async fn openapi_handler(
         .and_then(|h| h.to_str().ok())
         .unwrap_or("127.0.0.1:3000");
     let base = format!("http://{host}");
-    let spec = build_spec(&base, crate::auth::is_enabled());
+    let auth_enabled = crate::auth::is_enabled();
+    let mut spec = build_spec(&base, auth_enabled);
+    if let Some(ops) = registry_ops_cached().await {
+        if !ops.is_empty() {
+            if let Some(paths) = spec["paths"].as_object_mut() {
+                for (path, op) in ops.iter() {
+                    paths.insert(path.clone(), op.clone());
+                }
+            }
+            if auth_enabled {
+                mark_api_security(&mut spec);
+            }
+            spec["info"]["description"] = json!(format!(
+                "{} — This document additionally contains the API registry service catalog \
+                 (each published entry maps to POST /api/invokes/{{alias}}, flat JSON in/out).",
+                spec["info"]["description"].as_str().unwrap_or_default()
+            ));
+        }
+    }
     axum::Json(spec).into_response()
 }
 
@@ -2881,7 +2980,8 @@ pub fn build_spec(base_url: &str, auth_enabled: bool) -> Value {
     spec["servers"][0]["url"] = json!(base_url);
     spec["info"]["version"] = json!(env!("CARGO_PKG_VERSION"));
 
-    // 认证：仅在部署方设置 SAP_API_KEY 后声明 Bearer 方案，并给 /api/* 操作打上安全标记
+    // 认证方案 + /api/* 操作的安全标记（合并进来的动态 operation 也走同一段，
+    // 见 mark_api_security——两个调用方共用）
     if auth_enabled {
         spec["components"]["securitySchemes"] = json!({
             "bearerAuth": {
@@ -2890,26 +2990,33 @@ pub fn build_spec(base_url: &str, auth_enabled: bool) -> Value {
                 "description": "Authorization: Bearer <SAP_API_KEY>. Applies to /api/* endpoints only; probes and public pages stay open."
             }
         });
-        if let Some(paths) = spec["paths"].as_object_mut() {
-            for (path, item) in paths.iter_mut() {
-                if !path.starts_with("/api/") {
-                    continue;
-                }
-                // /api/version 刻意公开：Agent 需要在拿到 token 之前知道
-                // capabilities.auth（要不要 token）；SPEC_JSON 里已声明 security: []
-                if path == "/api/version" {
-                    continue;
-                }
-                if let Some(ops) = item.as_object_mut() {
-                    for (_method, op) in ops.iter_mut() {
-                        op["security"] = json!([{ "bearerAuth": [] }]);
-                    }
+        mark_api_security(&mut spec);
+    }
+
+    spec
+}
+
+/// 给 spec 里全部 `/api/*` operation 打上 bearerAuth 标记（`/api/version` 公开例外）。
+/// build_spec 与动态合并（/api/openapi、注册表目录）共用，保证鉴权模式下
+/// 生成器产出的客户端会带 token。
+fn mark_api_security(spec: &mut Value) {
+    if let Some(paths) = spec["paths"].as_object_mut() {
+        for (path, item) in paths.iter_mut() {
+            if !path.starts_with("/api/") {
+                continue;
+            }
+            // /api/version 刻意公开：Agent 需要在拿到 token 之前知道
+            // capabilities.auth（要不要 token）
+            if path == "/api/version" {
+                continue;
+            }
+            if let Some(ops) = item.as_object_mut() {
+                for (_method, op) in ops.iter_mut() {
+                    op["security"] = json!([{ "bearerAuth": [] }]);
                 }
             }
         }
     }
-
-    spec
 }
 
 // ========================================================================
@@ -3164,6 +3271,227 @@ pub fn function_operation_failed(name: &str, err_msg: &str) -> (String, Value) {
     (path, operation)
 }
 
+// ========================================================================
+// 注册表驱动的服务目录（v0.13）：published 条目 → /api/invokes/{alias} 类型化
+// operation，并入公开的 /openapi.json。契约按需派生（与 invoke 模块同一套
+// 输入/输出分类），SAP 侧签名漂移由 TTL 重建自动跟随。
+// ========================================================================
+
+use crate::registry::Entry;
+use std::sync::Arc;
+use std::time::Duration as CacheTtl;
+
+/// 一个 published 条目的平坦调用 operation。纯函数（输入 = 条目 + 接口元数据）。
+/// 请求/响应 schema 全部扁平展开——消费方拿到的就是调用说明本身。
+pub fn flat_invoke_operation(entry: &Entry, params: &[FunctionParam]) -> (String, Value) {
+    // TABLES 双向：可输入（BAPI 选择表惯例）也是输出——与 invoke 模块同口径
+    let is_input = |p: &FunctionParam| {
+        p.direction == "IMPORT" || p.direction == "CHANGING" || p.direction == "TABLES"
+    };
+    let is_output = |p: &FunctionParam| {
+        p.direction == "EXPORT" || p.direction == "CHANGING" || p.direction == "TABLES"
+    };
+    // 请求体：输入参数平铺（required = SAP 标记非可选）
+    let mut req_props = serde_json::Map::new();
+    let mut required = Vec::new();
+    for p in params.iter().filter(|p| is_input(p)) {
+        if !p.description.is_empty() {
+            let mut s = param_schema(p);
+            s["description"] = json!(p.description);
+            req_props.insert(p.name.clone(), s);
+        } else {
+            req_props.insert(p.name.clone(), param_schema(p));
+        }
+        if !p.optional {
+            required.push(p.name.clone());
+        }
+    }
+    // 响应：输出参数平铺 + 截断标记
+    let mut resp_props = serde_json::Map::new();
+    for p in params.iter().filter(|p| is_output(p)) {
+        resp_props.insert(p.name.clone(), param_schema(p));
+    }
+    resp_props.insert(
+        "_truncated".into(),
+        json!({
+            "type": "array", "items": { "type": "string" },
+            "description": "Present only when an output table exceeded its row cap and was truncated"
+        }),
+    );
+    // summary/description：intent 与 notes 是条目的灵魂；example 原样内嵌
+    let summary = if entry.intent.is_empty() {
+        format!("Invoke {} (registered API)", entry.func_name)
+    } else {
+        entry.intent.clone()
+    };
+    let mut description = format!(
+        "Flat invoke of SAP function {}. Response/output tables are row-capped ({} by default; \
+         override per call with ?limit=).",
+        entry.func_name,
+        entry.max_rows.unwrap_or(crate::invoke::DEFAULT_TABLE_CAP),
+    );
+    if !entry.notes.is_empty() {
+        description.push_str(&format!("\n\nNotes: {}", entry.notes));
+    }
+    if let Some(ex) = &entry.example {
+        description.push_str(&format!("\n\nExample request body: `{}`", ex));
+    }
+    let op_id: String = format!(
+        "invoke_{}",
+        entry
+            .alias
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+            .collect::<String>()
+    );
+    let path = format!("/api/invokes/{}", entry.alias);
+    let mut op = json!({
+        "post": {
+            "tags": ["registry"],
+            "operationId": op_id,
+            "summary": summary,
+            "description": description,
+            "parameters": [
+                { "name": "limit", "in": "query", "required": false,
+                  "schema": { "type": "integer", "default": entry.max_rows.unwrap_or(crate::invoke::DEFAULT_TABLE_CAP), "maximum": 10000 },
+                  "description": "Row cap for output tables" },
+                { "name": "timeout_secs", "in": "query", "required": false,
+                  "schema": { "type": "integer", "minimum": 1 },
+                  "description": "Per-call timeout override in seconds" }
+            ],
+            "requestBody": {
+                "required": true,
+                "content": { "application/json": { "schema": {
+                    "type": "object",
+                    "properties": req_props,
+                    "required": required,
+                    "description": "Flat body: parameter name → value (case-insensitive keys; \
+                                    structures are objects, tables are arrays of row objects)"
+                } } }
+            },
+            "responses": {
+                "200": { "description": "Flat result: output parameter name → value", "content": {
+                    "application/json": { "schema": { "type": "object", "properties": resp_props } } } },
+                "400": { "$ref": "#/components/responses/Error" },
+                "401": { "$ref": "#/components/responses/Error" },
+                "404": { "$ref": "#/components/responses/Error" },
+                "502": { "$ref": "#/components/responses/Error" },
+                "504": { "$ref": "#/components/responses/Error" }
+            }
+        }
+    });
+    if crate::auth::is_enabled() {
+        op["post"]["security"] = json!([{ "bearerAuth": [] }]);
+    }
+    (path, op)
+}
+
+/// 注册表 operation 缓存。generation 对齐注册表变更；TTL 兜底签名漂移
+///（FM 接口变了但注册表没动的场景）。
+struct RegistryOpsCache {
+    generation: u64,
+    built_at: std::time::Instant,
+    ops: Arc<Vec<(String, Value)>>,
+}
+
+static REGISTRY_OPS: tokio::sync::RwLock<Option<RegistryOpsCache>> =
+    tokio::sync::RwLock::const_new(None);
+
+/// 缓存 TTL：签名漂移跟随的上限（正常变更走 generation 立即失效）。
+const REGISTRY_OPS_TTL: CacheTtl = CacheTtl::from_secs(600);
+
+/// 重建全部 published 条目的 operation（借连接池逐个拉接口元数据）。
+/// 单条目失败 → 占位 operation（缺口可见，不吞错，不拖垮整个目录）。
+async fn rebuild_registry_ops(pool: &crate::server::SharedPool) -> Vec<(String, Value)> {
+    let entries = match crate::registry::published_entries() {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::warn!(key = %e.key, "注册表目录重建：读取 published 条目失败");
+            return Vec::new();
+        }
+    };
+    let mut ops = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let func = entry.func_name.clone();
+        let r = crate::server::run_blocking(Arc::clone(pool), move |conn| {
+            crate::server::collect_function_params(conn, &func)
+        })
+        .await;
+        let op = match r {
+            Ok(params) => flat_invoke_operation(&entry, &params),
+            Err(e) => {
+                let path = format!("/api/invokes/{}", entry.alias);
+                let placeholder = json!({
+                    "post": {
+                        "tags": ["registry"],
+                        "operationId": format!("invoke_{}", entry.alias.replace('/', "_")),
+                        "summary": format!("{} (interface metadata unavailable)", entry.intent),
+                        "description": format!(
+                            "Interface metadata could not be read for {}: {}. \
+                             The endpoint still works; see GET /api/registry/{}.",
+                            entry.func_name, e.message, entry.alias
+                        ),
+                        "responses": { "200": { "description": "Flat result" } }
+                    }
+                });
+                (path, placeholder)
+            }
+        };
+        ops.push(op);
+    }
+    ops
+}
+
+/// 取注册表 operation（缓存优先：代际一致且未过 TTL 直接复用）。
+/// 重建失败（如 SAP 不可达）时退回旧缓存——公开规范永远可用，最多旧一点。
+pub async fn registry_ops(pool: &crate::server::SharedPool) -> Arc<Vec<(String, Value)>> {
+    let gen = crate::registry::generation();
+    if let Some(cached) = REGISTRY_OPS.read().await.as_ref() {
+        if cached.generation == gen && cached.built_at.elapsed() < REGISTRY_OPS_TTL {
+            return Arc::clone(&cached.ops);
+        }
+    }
+    let ops = Arc::new(rebuild_registry_ops(pool).await);
+    *REGISTRY_OPS.write().await = Some(RegistryOpsCache {
+        generation: gen,
+        built_at: std::time::Instant::now(),
+        ops: Arc::clone(&ops),
+    });
+    ops
+}
+
+/// 只读缓存快照（公开 /openapi.json handler 用——不触碰 SAP，永远秒回；
+/// 缓存由后台 watcher 预热）。
+async fn registry_ops_cached() -> Option<Arc<Vec<(String, Value)>>> {
+    REGISTRY_OPS
+        .read()
+        .await
+        .as_ref()
+        .map(|c| Arc::clone(&c.ops))
+}
+
+/// 后台 watcher（main spawn）：代际变化、缓存为空或 TTL 到期时重建。
+/// 让公开的 /openapi.json 永远命中缓存，不被 SAP 的健康状况绑架。
+pub async fn registry_ops_watcher(pool: crate::server::SharedPool) {
+    loop {
+        tokio::time::sleep(CacheTtl::from_secs(2)).await;
+        let gen = crate::registry::generation();
+        let need = match REGISTRY_OPS.read().await.as_ref() {
+            None => true, // 尚未预热
+            Some(c) => c.generation != gen || c.built_at.elapsed() >= REGISTRY_OPS_TTL,
+        };
+        if need {
+            let ops = rebuild_registry_ops(&pool).await;
+            tracing::info!(count = ops.len(), generation = gen, "注册表服务目录已重建");
+            *REGISTRY_OPS.write().await = Some(RegistryOpsCache {
+                generation: gen,
+                built_at: std::time::Instant::now(),
+                ops: Arc::new(ops),
+            });
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3193,6 +3521,7 @@ mod tests {
             "/api/table/read",
             "/api/registry",
             "/api/registry/{alias}",
+            "/api/invokes/{alias}",
             "/api/dumps",
             "/api/dumps/grouped",
             "/api/dumps/{key}/detail",
@@ -3377,6 +3706,65 @@ mod tests {
         assert_eq!(path, "/api/functions/Z_MISSING/invoke");
         let desc = op["post"]["description"].as_str().unwrap();
         assert!(desc.contains("FU_NOT_FOUND"), "占位应携带错误信息: {desc}");
+    }
+
+    /// v0.13：published 条目 → /api/invokes/{alias} 的平坦 operation。
+    #[test]
+    fn flat_invoke_operation_builds_typed_flat_contract() {
+        use crate::registry::{Entry, EntryOrigin, EntryStatus};
+        let entry = Entry {
+            alias: "z_calc".into(),
+            func_name: "Z_CALC".into(),
+            group: Some("ZMATH".into()),
+            intent: "calculator for frontend".into(),
+            notes: "integers only".into(),
+            example: Some(json!({"iv_a": 1})),
+            status: EntryStatus::Published,
+            origin: EntryOrigin::Manual,
+            max_rows: Some(500),
+            created_at: "t".into(),
+            updated_at: "t".into(),
+        };
+        let params = vec![
+            FunctionParam {
+                name: "IV_A".into(),
+                type_name: "INT",
+                direction: "IMPORT",
+                length: 4,
+                decimals: 0,
+                optional: false,
+                default: String::new(),
+                description: String::new(),
+                fields: None,
+            },
+            FunctionParam {
+                name: "EV_SUM".into(),
+                type_name: "INT",
+                direction: "EXPORT",
+                length: 4,
+                decimals: 0,
+                optional: true,
+                default: String::new(),
+                description: String::new(),
+                fields: None,
+            },
+        ];
+        let (path, op) = flat_invoke_operation(&entry, &params);
+        assert_eq!(path, "/api/invokes/z_calc");
+        assert_eq!(op["post"]["operationId"], "invoke_z_calc");
+        assert_eq!(op["post"]["summary"], "calculator for frontend");
+        let desc = op["post"]["description"].as_str().unwrap();
+        assert!(desc.contains("integers only") && desc.contains("500"), "{desc}");
+        // 请求体：IV_A 必填且为 integer
+        let body = &op["post"]["requestBody"]["content"]["application/json"]["schema"];
+        assert_eq!(body["properties"]["IV_A"]["type"], "integer");
+        assert_eq!(body["required"][0], "IV_A");
+        // 响应：EV_SUM 平铺 + _truncated 说明
+        let resp = &op["post"]["responses"]["200"]["content"]["application/json"]["schema"];
+        assert_eq!(resp["properties"]["EV_SUM"]["type"], "integer");
+        assert!(resp["properties"].get("_truncated").is_some());
+        // limit 默认值来自条目 max_rows
+        assert_eq!(op["post"]["parameters"][0]["schema"]["default"], 500);
     }
 
     #[test]

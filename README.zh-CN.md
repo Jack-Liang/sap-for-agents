@@ -164,6 +164,7 @@ curl -X POST http://127.0.0.1:3000/api/rfc \
 | BCD/INT8/二进制 输入 | ✅ `{"type":"BCD",...}` / `{"type":"INT8",...}` / `{"type":"BYTES",...}`（BYTES 用 Base64） |
 | 元数据自动发现 | ✅ 字段长度缓存，无需手填 max_len（标量/表/结构体输出均生效） |
 | API 注册表（Agent 记忆） | ✅ 经网关写入的 remote-enabled 函数自动登记（`GET /api/registry`），后续会话/其他 Agent 直接复用免重探索；条目携带意图、踩坑记录与调用示例，跨重启存活（`SAP_REGISTRY_FILE`） |
+| 交付端口（平坦调用） | ✅ `POST /api/invokes/{alias}`——外部系统用扁平 JSON 进/出调用注册接口（键大小写不敏感、输出按真实类型、表行封顶）；`GET /openapi.json` 提供 published 条目的类型化服务目录，可直接 codegen 客户端 |
 | Server 端（被 SAP 回调）| ✅ 配置驱动 webhook 转发（`SAP_ROLE=server`），详见 [§9](#9-server-端模式被-sap-调用) |
 | tRFC/qRFC/bgRFC | ❌ 不支持 |
 | SSO/SNC 安全登录 | ❌ 仅用户名密码 |

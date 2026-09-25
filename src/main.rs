@@ -9,6 +9,7 @@ mod error;
 mod executor;
 mod ffi;
 mod function;
+mod invoke;
 mod metadata;
 mod objects;
 mod openapi;
@@ -145,6 +146,10 @@ async fn run_client() -> Result<(), Box<dyn std::error::Error>> {
         "API 注册表已启用（GET /api/registry）"
     );
     let shared: server::SharedPool = Arc::new(pool);
+
+    // 注册表服务目录预热（v0.13）：后台 watcher 维护 published 条目的类型化
+    // operation 缓存，公开的 /openapi.json 只读缓存——不被 SAP 健康状况绑架
+    tokio::spawn(openapi::registry_ops_watcher(Arc::clone(&shared)));
 
     // 新版本检查（GitHub Releases，后台任务：启动即查 + 每 24h；失败静默）
     if cfg.update_check {

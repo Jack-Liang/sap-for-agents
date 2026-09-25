@@ -1474,3 +1474,141 @@ fn registry_corrupt_file_recovers() {
             .starts_with("registry.json.corrupt-"));
     assert!(has_backup, "坏文件应被备份而非覆盖丢失");
 }
+
+// ========================================================================
+// 交付端口（v0.13）：/api/invokes/{alias} 平坦调用 + 注册表驱动的 OpenAPI
+// 全程只读 SAP（用标准函数手工注册，不建 Z 对象）
+// ========================================================================
+
+#[test]
+#[ignore]
+fn flat_invoke_and_registry_catalog() {
+    let reg_path = temp_registry_path("flat");
+    let _s = start_server_with_env(&[("SAP_REGISTRY_FILE", reg_path.as_str())]);
+
+    // 注册 STFC_CONNECTION（标准 RFC 测试函数：REQUTEXT → ECHOTEXT/RESPTEXT）
+    let resp = http_client()
+        .put(format!("{}/api/registry/stfc-echo", _s.base_url))
+        .json(&serde_json::json!({
+            "func_name": "STFC_CONNECTION",
+            "intent": "connectivity check echo",
+            "status": "published"
+        }))
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    // 平坦调用：小写键也能命中（大小写不敏感）
+    let resp = http_client()
+        .post(format!("{}/api/invokes/stfc-echo", _s.base_url))
+        .json(&serde_json::json!({"requtext": "hello flat"}))
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().unwrap();
+    assert_eq!(body["ECHOTEXT"], "hello flat", "扁平响应: {body}");
+    assert!(
+        body["RESPTEXT"].as_str().map(|s| !s.is_empty()).unwrap_or(false),
+        "RESPTEXT 应非空: {body}"
+    );
+    // 响应就是扁平对象：没有 /api/rfc 的 scalars/tables 包装
+    assert!(body.get("scalars").is_none(), "不应有泛型包装: {body}");
+
+    // 未知参数 → 400（带合法参数清单）
+    let resp = http_client()
+        .post(format!("{}/api/invokes/stfc-echo", _s.base_url))
+        .json(&serde_json::json!({"typo": 1}))
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    let body: serde_json::Value = resp.json().unwrap();
+    assert_eq!(body["error"]["key"], "INVOKE_PARAM_UNKNOWN");
+    assert!(
+        body["error"]["message"].as_str().unwrap().contains("REQUTEXT"),
+        "错误应列出合法参数: {body}"
+    );
+
+    // 未知别名 → 404
+    let resp = http_client()
+        .post(format!("{}/api/invokes/no_such", _s.base_url))
+        .json(&serde_json::json!({}))
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+
+    // 表封顶：BAPI_USER_GETLIST 注册时给 max_rows=5（默认表封顶可被条目覆盖）
+    let resp = http_client()
+        .put(format!("{}/api/registry/bapi-users", _s.base_url))
+        .json(&serde_json::json!({
+            "func_name": "BAPI_USER_GETLIST", "status": "published", "max_rows": 5
+        }))
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let resp = http_client()
+        .post(format!("{}/api/invokes/bapi-users", _s.base_url))
+        .json(&serde_json::json!({}))
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().unwrap();
+    let n = body["USERLIST"].as_array().map(|a| a.len()).unwrap_or(0);
+    assert!(n <= 5, "条目 max_rows=5 应生效，实得 {n} 行: {body}");
+    // ?limit=2 覆盖条目值
+    let resp = http_client()
+        .post(format!("{}/api/invokes/bapi-users?limit=2", _s.base_url))
+        .json(&serde_json::json!({}))
+        .send()
+        .unwrap();
+    let body: serde_json::Value = resp.json().unwrap();
+    let n = body["USERLIST"].as_array().map(|a| a.len()).unwrap_or(0);
+    assert!(n <= 2, "?limit=2 应生效，实得 {n} 行");
+
+    // 公开 /openapi.json：watcher 预热后应含两个 published 条目的类型化 operation
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let body: serde_json::Value = http_client()
+            .get(format!("{}/openapi.json", _s.base_url))
+            .send()
+            .unwrap()
+            .json()
+            .unwrap();
+        if body["paths"]["/api/invokes/stfc-echo"].is_object()
+            && body["paths"]["/api/invokes/bapi-users"].is_object()
+        {
+            // intent 流入 summary；请求体 schema 已按接口展开
+            assert_eq!(
+                body["paths"]["/api/invokes/stfc-echo"]["post"]["summary"],
+                "connectivity check echo"
+            );
+            let schema = &body["paths"]["/api/invokes/stfc-echo"]["post"]["requestBody"]
+                ["content"]["application/json"]["schema"];
+            assert_eq!(schema["properties"]["REQUTEXT"]["type"], "string");
+            break;
+        }
+        assert!(Instant::now() < deadline, "openapi 目录未在 15s 内出现: {body}");
+        std::thread::sleep(Duration::from_millis(500));
+    }
+
+    // /api/openapi 无参模式 = 注册表目录（新鲜构建，立即含条目）
+    let body: serde_json::Value = http_client()
+        .get(format!("{}/api/openapi", _s.base_url))
+        .send()
+        .unwrap()
+        .json()
+        .unwrap();
+    assert!(body["paths"]["/api/invokes/stfc-echo"].is_object());
+
+    // 墓碑后不可调用
+    let resp = http_client()
+        .delete(format!("{}/api/registry/stfc-echo", _s.base_url))
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let resp = http_client()
+        .post(format!("{}/api/invokes/stfc-echo", _s.base_url))
+        .json(&serde_json::json!({"requtext": "x"}))
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 404, "墓碑条目应 404");
+}

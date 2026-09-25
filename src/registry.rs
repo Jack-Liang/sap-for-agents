@@ -80,6 +80,10 @@ pub struct Entry {
     pub status: EntryStatus,
     /// 条目来源：auto（写钩子自动登记）/ manual（Agent 手工创建）
     pub origin: EntryOrigin,
+    /// 平坦调用（/api/invokes/{alias}）的输出表行数封顶；
+    /// None → 用默认 100（调用方还能用 ?limit= 覆盖）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_rows: Option<u32>,
     /// RFC3339 UTC
     pub created_at: String,
     /// RFC3339 UTC
@@ -176,6 +180,7 @@ impl Store {
             status: body.status,
             // 手工 PUT 保留 origin（auto 条目被 Agent 完善后仍是 auto 起源）
             origin: existing.map_or(EntryOrigin::Manual, |e| e.origin),
+            max_rows: body.max_rows,
             created_at: existing.map_or(now.to_string(), |e| e.created_at.clone()),
             updated_at: now.to_string(),
         };
@@ -215,6 +220,7 @@ impl Store {
             example: None,
             status: EntryStatus::Draft,
             origin: EntryOrigin::Auto,
+            max_rows: None,
             created_at: now.to_string(),
             updated_at: now.to_string(),
         };
@@ -359,6 +365,19 @@ struct RegistryState {
 
 static REGISTRY: OnceLock<RegistryState> = OnceLock::new();
 
+/// 变更代际（原子递增）：每次成功落盘 +1。/openapi.json 的注册表 operation
+/// 缓存靠它感知"该重建了"——不持有锁、不轮询文件。
+static GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// 当前代际（缓存方读取）。
+pub fn generation() -> u64 {
+    GENERATION.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn bump_generation() {
+    GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// 启动期初始化（main 调一次）：加载文件；不存在则空表启动；
 /// 文件损坏/版本不识 → 备份为 `<path>.corrupt-<时间戳>` 后空表启动
 /// （坏文件不该拖垮网关，但也不能被覆盖丢失）。
@@ -423,7 +442,8 @@ fn with_store<R>(f: impl FnOnce(&mut Store) -> Result<R, RfcError>) -> Result<R,
     f(&mut store)
 }
 
-/// 持久化：临时文件 + 原子 rename（读侧永远不会看到半截 JSON）。
+/// 持久化：临时文件 + 原子 rename（读侧永远不会看到半截 JSON），
+/// 成功后递增代际（通知 /openapi.json 缓存重建）。
 /// 失败返回 RfcError（调用方决定降级为警告或暴露给请求方）。
 fn persist(store: &Store) -> Result<(), RfcError> {
     let state = REGISTRY.get().ok_or_else(disabled_err)?;
@@ -440,6 +460,7 @@ fn persist(store: &Store) -> Result<(), RfcError> {
         message: format!("注册表落盘失败（{}）: {}", state.path.display(), e),
         key: "REGISTRY_STORE_ERROR".into(),
     })?;
+    bump_generation();
     Ok(())
 }
 
@@ -473,6 +494,18 @@ pub fn tombstone_func(func_name: &str) -> Result<usize, RfcError> {
 /// 列表（GET /api/registry）。
 pub fn list_entries(q: Option<&str>, include_deleted: bool) -> Result<Vec<Entry>, RfcError> {
     with_store(|store| Ok(store.list(q, include_deleted).into_iter().cloned().collect()))
+}
+
+/// 全部 published 条目（/openapi.json 的服务目录来源）。
+pub fn published_entries() -> Result<Vec<Entry>, RfcError> {
+    with_store(|store| {
+        Ok(store
+            .entries
+            .values()
+            .filter(|e| e.status == EntryStatus::Published)
+            .cloned()
+            .collect())
+    })
 }
 
 /// 单条（GET /api/registry/{alias}）。
@@ -563,6 +596,9 @@ pub struct PutBody {
     pub status: EntryStatus,
     #[serde(default)]
     pub group: Option<String>,
+    /// 平坦调用输出表行数封顶（可选；null/缺省 = 默认 100）
+    #[serde(default)]
+    pub max_rows: Option<u32>,
 }
 
 fn default_status() -> EntryStatus {
@@ -744,6 +780,7 @@ mod tests {
             example: None,
             status: EntryStatus::Draft,
             origin: EntryOrigin::Auto,
+            max_rows: None,
             created_at: "2026-09-25T00:00:00Z".into(),
             updated_at: "2026-09-25T00:00:00Z".into(),
         }
@@ -856,10 +893,12 @@ mod tests {
             example: Some(serde_json::json!({"inputs": {"IV_A": 1}})),
             status: EntryStatus::Published,
             group: None,
+            max_rows: Some(500),
         };
         let (entry, created) = s.put("z_calc", &body, "t9").unwrap();
         assert!(!created, "已存在条目不是新建");
         assert_eq!(entry.intent, "intent v2");
+        assert_eq!(entry.max_rows, Some(500));
         assert_eq!(entry.created_at, "2026-09-25T00:00:00Z", "创建时间保留");
         assert_eq!(entry.updated_at, "t9");
         // 全量替换：未带的 example=null 即清空
@@ -870,9 +909,11 @@ mod tests {
             example: None,
             status: EntryStatus::Draft,
             group: None,
+            max_rows: None,
         };
         let (entry2, _) = s.put("z_calc", &body2, "t10").unwrap();
         assert!(entry2.example.is_none(), "PUT 全量替换：null 即清空");
+        assert_eq!(entry2.max_rows, None, "PUT 全量替换：max_rows 一并复位");
     }
 
     // ---- HTTP 端点（全局单例 → 串行）----

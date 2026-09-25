@@ -31,6 +31,8 @@ curl -H "Authorization: Bearer <SAP_API_KEY>" http://127.0.0.1:3000/api/function
 |------|-----------|
 | New session → **check the registry first**: cross-session memory of agent-built APIs (alias, intent, pitfalls, example invocations) | `GET /api/registry` |
 | Want to publish/update one API's contract (intent / notes / example) | `PUT /api/registry/{alias}` |
+| External system/frontend wants to call a registered API **without the SAP dialect** (flat JSON in / flat JSON out) | `POST /api/invokes/{alias}` |
+| Want the typed service-catalog spec of all published registry APIs (for codegen) | `GET /openapi.json` (public; or `GET /api/openapi` with no params) |
 | New session → **self-description first**: gateway version/commit, capability switches (auth / read_only / adt / registry / rate limit), SAP sysid & release | `GET /api/version` (public) |
 | Don't know which functions exist → fuzzy search by name | `POST /api/functions/search` |
 | Know the function name, want to know how to fill parameters | `GET /api/functions/{name}` |
@@ -77,7 +79,7 @@ Most tasks follow six steps: **check registry → search → inspect interface �
 
 ## Endpoint quick reference (copyable examples)
 
-### 0. Registry — cross-session memory of agent-built APIs
+### 0. Registry — cross-session memory **and** delivery port
 
 The registry is the gateway's persistent memory: every remote-enabled function module successfully written **through this gateway** is auto-registered as a `draft` entry (idempotent; your intent/notes are never clobbered), and deleting the FM tombstones its entry. Storage is a local JSON file (`SAP_REGISTRY_FILE`, default `./registry.json`) — it survives gateway restarts and does not depend on SAP.
 
@@ -103,10 +105,30 @@ curl -X DELETE 'http://127.0.0.1:3000/api/registry/z_calc'            # → stat
 curl -X DELETE 'http://127.0.0.1:3000/api/registry/z_calc?purge=true' # physical removal
 ```
 
-- Entry fields: `alias` (unique lowercase URL-safe id, `team/name` prefixes allowed), `func_name`, `group`, `intent` (what it's for), `notes` (pitfalls/know-how), `example` (sample invoke body), `status` (`draft`/`published`; tombstones show `deleted`, hidden from the default list — `?include_deleted=true` reveals them).
+- Entry fields: `alias` (unique lowercase URL-safe id, `team/name` prefixes allowed), `func_name`, `group`, `intent` (what it's for), `notes` (pitfalls/know-how), `example` (sample invoke body), `status` (`draft`/`published`; tombstones show `deleted`, hidden from the default list — `?include_deleted=true` reveals them), `max_rows` (row cap for flat invokes; default 100).
 - Deleting the SAP object **tombstones** the entry (never silently removes); writing the same function again revives it. Fugr deletes do not cascade to member FM entries — clean those up manually when you delete whole groups.
 - Re-registering a function keeps your `intent`/`notes`/`example` — only status/group/timestamps are refreshed. Registration failure never fails the SAP write itself (it degrades to a warning in the write response).
 - MCP clients: the `list_registry_apis` tool is the same catalog.
+
+#### Delivery port: `POST /api/invokes/{alias}` (flat JSON in / flat JSON out)
+
+Published (or draft) entries are callable by **external systems without any SAP dialect** — no uppercase-parameter conventions, no output-read declarations. The contract is derived from the function's live interface on every call, so signature drift is followed automatically:
+
+```bash
+# Frontend/other-language consumer calls a registered API — this is the whole API:
+curl -X POST http://127.0.0.1:3000/api/invokes/z_calc \
+  -H "Content-Type: application/json" \
+  -d {"iv_a": 20, "iv_b": 22}
+# → {"EV_SUM": 42}          ← flat response, true types (INT→integer, BYTE→Base64)
+
+# Row cap for output tables: ?limit= > entry max_rows > default 100
+curl -X POST 'http://127.0.0.1:3000/api/invokes/bapi-users?limit=50' -d {} -H "Content-Type: application/json"
+```
+
+- Body keys are **case-insensitive** (`requtext` = `REQUTEXT`); unknown keys → `400 INVOKE_PARAM_UNKNOWN` (with the allowed list — catches typos instead of swallowing them). Structures are JSON objects, tables are arrays of row objects.
+- All outputs come back by true type; output tables are row-capped (`?limit=`, entry `max_rows`, default 100) — a `"_truncated": [...]` key appears when a table was cut.
+- `GET /openapi.json` (public) carries a **typed operation per published entry** (intent/notes/example flow in) — hand that URL to openapi-generator and consumers get a client SDK. `GET /api/openapi` with no params returns the same catalog, freshly built. The public spec is watcher-preheated and cached, so it stays fast and available even when SAP is down.
+- Tombstoned entries → 404 (their FM was deleted). Draft entries are invocable but stay out of the public catalog until `status:"published"`.
 
 ### 1. Search functions
 

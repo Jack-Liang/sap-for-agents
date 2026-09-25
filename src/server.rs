@@ -254,6 +254,8 @@ pub fn app(pool: SharedPool) -> Router {
         // API 注册表（v0.12：Agent 跨会话记忆；本地 JSON 存储，不依赖 SAP，
         // 子路由自带 handler——挂这里只为共享鉴权/限流层）
         .merge(crate::registry::router())
+        // 交付端口（v0.13：注册表条目的平坦化调用，消费方免学 SAP 方言）
+        .merge(crate::invoke::router())
         // ABAP 对象写入编排（锁→写→解锁→激活一体；replace/syntax 见 dispatcher）
         .route(
             "/api/objects/*path",
@@ -658,7 +660,7 @@ async fn function_invoke_handler(
 
 /// /api/rfc 与 /api/functions/{name}/invoke 的共享执行段：
 /// 超时控制 → 连接池执行 → 指标采样 → 审计日志。
-async fn run_invoke_and_log(
+pub(crate) async fn run_invoke_and_log(
     pool: SharedPool,
     caller_ip: String,
     req: InvokeRequest,
@@ -735,8 +737,8 @@ async fn run_invoke_and_log(
 /// 时生成带错误说明的占位 operation（缺口可见，不吞错）。
 #[derive(serde::Deserialize)]
 pub(crate) struct DynamicSpecQuery {
-    /// 逗号分隔的函数名列表
-    functions: String,
+    /// 逗号分隔的函数名列表；缺省 = 注册表目录模式（全部 published 条目）
+    functions: Option<String>,
 }
 
 /// functions 列表上限：防止一次请求拖垮元数据拉取
@@ -747,8 +749,26 @@ async fn openapi_dynamic_handler(
     axum::extract::Host(host): axum::extract::Host,
     axum::extract::Query(q): axum::extract::Query<DynamicSpecQuery>,
 ) -> Result<Json<serde_json::Value>, RfcError> {
-    let names: Vec<String> = q
-        .functions
+    let auth_enabled = crate::auth::is_enabled();
+    // 无 functions → 注册表目录模式：published 条目的平坦调用 operation
+    //（契约按需派生 + 代际/TTL 缓存，见 openapi::registry_ops）
+    let given = q.functions.as_deref().map(str::trim).unwrap_or("");
+    if given.is_empty() {
+        let ops = crate::openapi::registry_ops(&pool).await;
+        let mut spec = crate::openapi::build_spec(&format!("http://{host}"), auth_enabled);
+        if let Some(paths) = spec["paths"].as_object_mut() {
+            for (path, op) in ops.iter() {
+                paths.insert(path.clone(), op.clone());
+            }
+        }
+        spec["info"]["description"] = serde_json::json!(format!(
+            "{} — This document additionally contains the API registry service catalog \
+             (each published entry maps to POST /api/invokes/{{alias}}, flat JSON in/out).",
+            spec["info"]["description"].as_str().unwrap_or_default()
+        ));
+        return Ok(Json(spec));
+    }
+    let names: Vec<String> = given
         .split(',')
         .map(|s| s.trim().to_uppercase())
         .filter(|s| !s.is_empty())

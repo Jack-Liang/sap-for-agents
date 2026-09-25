@@ -163,6 +163,7 @@ curl -X POST http://127.0.0.1:3000/api/rfc \
 | BCD/INT8/binary input | ✅ `{"type":"BCD",...}` / `{"type":"INT8",...}` / `{"type":"BYTES",...}` (BYTES as Base64) |
 | Metadata auto-discovery | ✅ field-length caching, no manual `max_len` needed (works for scalar/table/structure outputs) |
 | API registry (agent memory) | ✅ every remote-enabled FM written through the gateway is auto-registered (`GET /api/registry`), so later sessions/agents reuse instead of re-explore; entries carry intent, pitfalls and example invocations and survive restarts (`SAP_REGISTRY_FILE`) |
+| Delivery port (flat invoke) | ✅ `POST /api/invokes/{alias}` — registered APIs callable by external systems with flat JSON in/out (case-insensitive keys, true-typed outputs, row caps); `GET /openapi.json` serves a typed service catalog of published entries for client codegen |
 | Server mode (called back by SAP) | ✅ config-driven webhook forwarding (`SAP_ROLE=server`); see [§9](#9-server-mode-called-by-sap) |
 | tRFC/qRFC/bgRFC | ❌ Not supported |
 | SSO/SNC secure logon | ❌ Username/password only |

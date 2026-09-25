@@ -499,13 +499,21 @@ async fn lock_object(base: &str, sess: &mut WriteSession) -> Result<LockInfo, Rf
     sess.absorb(&resp);
     if resp.status != 200 {
         let body = String::from_utf8_lossy(&resp.body).to_string();
+        // 失败响应体带 SAP 的一手原因（会话限额/授权/服务状态），必须落日志——
+        // 只给调用方一个 502 会把真实原因埋掉
+        tracing::warn!(
+            status = resp.status,
+            base = %base,
+            body = %truncate(&body, 1200),
+            "ADT 锁定失败原始响应"
+        );
         if body.contains("exc:exception") {
             return Err(adt_exception_error(&body, "锁定对象失败"));
         }
         return Err(RfcError {
             code: -1,
             status: 502,
-            message: format!("锁定对象失败（ADT 返回 {}）", resp.status),
+            message: format!("锁定对象失败（ADT 返回 {}）: {}", resp.status, truncate(&body, 200)),
             key: "ADT_LOCK_FAILED".into(),
         });
     }
