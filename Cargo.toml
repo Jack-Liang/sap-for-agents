@@ -1,6 +1,6 @@
 [package]
 name = "sap_for_agents"
-version = "0.13.0"
+version = "0.13.1"
 license = "MIT"
 edition = "2021"
 rust-version = "1.75"
@@ -12,7 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 # Web 服务（client 模式）
-axum = "0.7"
+axum = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "signal", "macros"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -29,7 +29,7 @@ metrics-exporter-prometheus = "0.18"
 governor = "0.10"
 # Server 模式：同步 HTTP 客户端（回调线程内调用）+ TOML 配置
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
-toml = "0.8"
+toml = "1.1"
 # ST22 结构化读取：解析 ADT runtime dumps 的 Atom feed（/api/dumps/**）
 quick-xml = "0.42"
 

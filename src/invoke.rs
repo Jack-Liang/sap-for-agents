@@ -373,9 +373,10 @@ async fn flat_invoke_handler(
 }
 
 /// 交付端口子路由（挂 /api 鉴权层内）。handler 需要连接池 → 状态类型固定。
+/// axum 0.8 语法：{*alias}。
 pub fn router() -> Router<SharedPool> {
     Router::new().route(
-        "/api/invokes/*alias",
+        "/api/invokes/{*alias}",
         axum::routing::post(flat_invoke_handler),
     )
 }

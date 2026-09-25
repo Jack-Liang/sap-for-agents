@@ -700,11 +700,12 @@ struct PurgeQuery {
 }
 
 /// 注册表子路由。合并进 server::app 的 /api 鉴权层内（不依赖连接池）。
+/// axum 0.8 语法：{*alias}（alias 可含 / 的 team/name 前缀）。
 pub fn router<S: Clone + Send + Sync + 'static>() -> Router<S> {
     Router::new()
         .route("/api/registry", get(registry_list_handler))
         .route(
-            "/api/registry/*alias",
+            "/api/registry/{*alias}",
             get(registry_get_handler)
                 .put(registry_put_handler)
                 .delete(registry_delete_handler),

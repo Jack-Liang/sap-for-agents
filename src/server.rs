@@ -227,21 +227,22 @@ pub fn app(pool: SharedPool) -> Router {
         .route("/mcp", axum::routing::post(crate::mcp::mcp_handler))
         // 函数名可能带 /NS/ 命名空间前缀（如 /SDF/X），路径参数无法匹配多段路径，
         // 统一用通配路由捕获后按尾部 /doc、/source 分发（见 function_route_dispatcher）。
+        // axum 0.8 语法：{*name}（0.7 的 *name 已废弃，旧语法启动即 panic）
         .route(
-            "/api/functions/*name",
+            "/api/functions/{*name}",
             axum::routing::get(function_route_dispatcher).post(function_invoke_handler),
         )
         .route(
-            "/api/programs/:name/source",
+            "/api/programs/{name}/source",
             axum::routing::get(program_source_handler),
         )
         .route("/api/table/read", post(table_read_handler))
         .route(
-            "/api/ddic/type/:name",
+            "/api/ddic/type/{name}",
             axum::routing::get(ddic_type_handler),
         )
         .route(
-            "/api/ddic/field/:table/:field",
+            "/api/ddic/field/{table}/{field}",
             axum::routing::get(ddic_field_handler),
         )
         // ABAP 短转储结构化读取（解析自 ADT，免拉 45KB–1MB 原始文本）
@@ -250,7 +251,7 @@ pub fn app(pool: SharedPool) -> Router {
             "/api/dumps/grouped",
             axum::routing::get(dumps_grouped_handler),
         )
-        .route("/api/dumps/*key", axum::routing::get(dump_detail_handler))
+        .route("/api/dumps/{*key}", axum::routing::get(dump_detail_handler))
         // API 注册表（v0.12：Agent 跨会话记忆；本地 JSON 存储，不依赖 SAP，
         // 子路由自带 handler——挂这里只为共享鉴权/限流层）
         .merge(crate::registry::router())
@@ -258,14 +259,14 @@ pub fn app(pool: SharedPool) -> Router {
         .merge(crate::invoke::router())
         // ABAP 对象写入编排（锁→写→解锁→激活一体；replace/syntax 见 dispatcher）
         .route(
-            "/api/objects/*path",
+            "/api/objects/{*path}",
             axum::routing::put(object_write_handler)
                 .post(object_post_handler)
                 .get(object_get_handler)
                 .delete(object_delete_handler),
         )
         // ADT REST 通用代理（dump 正文、类/程序源码等，任何方法透传）
-        .route("/api/adt/*path", axum::routing::any(crate::adt::adt_proxy))
+        .route("/api/adt/{*path}", axum::routing::any(crate::adt::adt_proxy))
         .layer(axum::middleware::from_fn(read_only_guard))
         .layer(axum::middleware::from_fn(crate::auth::require_api_key))
         .layer(axum::middleware::from_fn(rate_limit_middleware));
@@ -746,9 +747,17 @@ const DYNAMIC_SPEC_MAX_FUNCTIONS: usize = 50;
 
 async fn openapi_dynamic_handler(
     axum::extract::State(pool): axum::extract::State<SharedPool>,
-    axum::extract::Host(host): axum::extract::Host,
     axum::extract::Query(q): axum::extract::Query<DynamicSpecQuery>,
+    req: axum::extract::Request,
 ) -> Result<Json<serde_json::Value>, RfcError> {
+    // Host 提取器在 axum 0.8 被移除（移至 axum-extra）；不引新依赖，
+    // 手动读 Host 头——与 index_handler/openapi_handler 同一策略
+    let host = req
+        .headers()
+        .get(axum::http::header::HOST)
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or("127.0.0.1:3000")
+        .to_string();
     let auth_enabled = crate::auth::is_enabled();
     // 无 functions → 注册表目录模式：published 条目的平坦调用 operation
     //（契约按需派生 + 代际/TTL 缓存，见 openapi::registry_ops）
