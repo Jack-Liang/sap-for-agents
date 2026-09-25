@@ -44,15 +44,17 @@ pub async fn gateway_info(pool: &SharedPool) -> Value {
     // latest 与 SAP 块独立：任一不可用不影响另一个
     out["latest"] = latest_json().await;
     match fetch_cached_sap_info(pool).await {
-        Ok(info) => out["sap"] = json!({
-            "sysid": info.sysid,
-            "release": info.release,
-            "host": info.host,
-            "os": info.os,
-            "destination": info.destination,
-            // 客户端号来自本地配置（RFC 层免费），失败场景也照常给出
-            "client": SAP_CLIENT.get().cloned().unwrap_or_default(),
-        }),
+        Ok(info) => {
+            out["sap"] = json!({
+                "sysid": info.sysid,
+                "release": info.release,
+                "host": info.host,
+                "os": info.os,
+                "destination": info.destination,
+                // 客户端号来自本地配置（RFC 层免费），失败场景也照常给出
+                "client": SAP_CLIENT.get().cloned().unwrap_or_default(),
+            })
+        }
         Err(e) => {
             out["sap"] = Value::Null;
             out["sap_error"] = json!(e.message);
@@ -87,17 +89,18 @@ pub fn local_info() -> Value {
 
 /// 取缓存的 SAP 系统信息；未缓存时借连接调一次 `RFC_SYSTEM_INFO`。
 /// 成功 → 写缓存永久复用；失败 → 不缓存，调用方拿到错误（下次重试）。
-async fn fetch_cached_sap_info(pool: &SharedPool) -> Result<Arc<RemoteSystemInfo>, crate::error::RfcError> {
+async fn fetch_cached_sap_info(
+    pool: &SharedPool,
+) -> Result<Arc<RemoteSystemInfo>, crate::error::RfcError> {
     if let Some(cached) = SAP_INFO.read().await.clone() {
         return Ok(cached);
     }
     // 未缓存：取一次（并发首批请求可能重复取，无害——池有多条连接，结果幂等）
-    let fetched = crate::server::run_blocking_with_timeout(
-        Arc::clone(pool),
-        SAP_INFO_TIMEOUT,
-        |conn| conn.system_info(),
-    )
-    .await?;
+    let fetched =
+        crate::server::run_blocking_with_timeout(Arc::clone(pool), SAP_INFO_TIMEOUT, |conn| {
+            conn.system_info()
+        })
+        .await?;
     let info = Arc::new(fetched);
     *SAP_INFO.write().await = Some(Arc::clone(&info));
     tracing::info!(
@@ -234,7 +237,10 @@ mod tests {
         assert!(!v["commit"].as_str().unwrap().is_empty(), "commit 必有值");
         // 五个能力开关字段都在，且类型正确（rate_limit_rps 可为 null）
         for key in ["auth", "read_only", "adt", "registry"] {
-            assert!(v["capabilities"][key].is_boolean(), "capabilities.{key} 应为布尔");
+            assert!(
+                v["capabilities"][key].is_boolean(),
+                "capabilities.{key} 应为布尔"
+            );
         }
         assert!(
             v["capabilities"]["rate_limit_rps"].is_null()

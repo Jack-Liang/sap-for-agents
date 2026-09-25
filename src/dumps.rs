@@ -150,7 +150,10 @@ fn dump_key_from(id_or_href: &str) -> String {
 /// 元素限定名的本地部分（去掉命名空间前缀，如 `atom:entry` → `entry`）。
 /// quick-xml ≥0.42 文本 API 统一为 `&str`（QName 即 str 包装）。
 pub(crate) fn xml_local_name_of(qname: &str) -> &str {
-    qname.split_once(':').map(|(_, local)| local).unwrap_or(qname)
+    qname
+        .split_once(':')
+        .map(|(_, local)| local)
+        .unwrap_or(qname)
 }
 
 /// XML 文本/属性值解码（UTF-8 宽松 + 实体反转义）。
@@ -247,15 +250,27 @@ pub fn parse_feed(xml: &str) -> Result<Vec<DumpEntry>, RfcError> {
                 }
                 if name == "category" {
                     let attrs = read_attrs(&e);
-                    let term = attrs.iter().find(|(k, _)| k == "term").map(|(_, v)| v.clone());
-                    let label = attrs.iter().find(|(k, _)| k == "label").map(|(_, v)| v.clone());
+                    let term = attrs
+                        .iter()
+                        .find(|(k, _)| k == "term")
+                        .map(|(_, v)| v.clone());
+                    let label = attrs
+                        .iter()
+                        .find(|(k, _)| k == "label")
+                        .map(|(_, v)| v.clone());
                     if let (Some(t), Some(l)) = (term, label) {
                         e_categories.push((t, l));
                     }
                 } else if name == "link" {
                     let attrs = read_attrs(&e);
-                    let rel = attrs.iter().find(|(k, _)| k == "rel").map(|(_, v)| v.clone());
-                    let href = attrs.iter().find(|(k, _)| k == "href").map(|(_, v)| v.clone());
+                    let rel = attrs
+                        .iter()
+                        .find(|(k, _)| k == "rel")
+                        .map(|(_, v)| v.clone());
+                    let href = attrs
+                        .iter()
+                        .find(|(k, _)| k == "href")
+                        .map(|(_, v)| v.clone());
                     if rel.as_deref() == Some("self") {
                         if let Some(h) = href {
                             e_self_href = Some(h);
@@ -631,10 +646,7 @@ fn parse_termination(lines: &[&str]) -> (String, u32) {
         return (String::new(), 0);
     };
     let rest = &text[i + needle.len()..];
-    let digits: String = rest
-        .chars()
-        .take_while(|c| c.is_ascii_digit())
-        .collect();
+    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
     let Ok(line) = digits.parse::<u32>() else {
         return (String::new(), 0);
     };
@@ -718,11 +730,7 @@ fn parse_stack(lines: &[&str]) -> Vec<DumpFrame> {
 }
 
 fn parse_frame_row(row: &str) -> Option<DumpFrame> {
-    let fields: Vec<&str> = row
-        .trim()
-        .trim_matches('|')
-        .split_whitespace()
-        .collect();
+    let fields: Vec<&str> = row.trim().trim_matches('|').split_whitespace().collect();
     // 帧号 + 类型 + 程序 + include + 行号，至少 5 个字段
     if fields.len() < 5 {
         return None;
@@ -1028,7 +1036,9 @@ Except.                CX_DYNAMIC_CHECK\r
         let f = parse_frame_row("|4    FORM  PROG1   ???   7|").unwrap();
         assert_eq!(f.include, "");
         // 表头行/名字行不是帧行
-        assert!(parse_frame_row("|No   Ty.          Program                        Include|").is_none());
+        assert!(
+            parse_frame_row("|No   Ty.          Program                        Include|").is_none()
+        );
         assert!(parse_frame_row("|REMOTE_FUNCTION_CALL|").is_none());
         // 横线不是帧名
         assert!(parse_frame_name("|------------------|").is_none());

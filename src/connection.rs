@@ -145,10 +145,7 @@ impl RfcConnection {
 
     /// 按 DDIC 类型名（结构/表/类型，如 MARA、BAPIRETURN）取类型描述符。
     /// 返回的 type_handle 可传给 get_field_infos() 读字段元数据。
-    pub fn get_type_desc(
-        &self,
-        type_name: &str,
-    ) -> Result<RFC_TYPE_DESC_HANDLE, RfcError> {
+    pub fn get_type_desc(&self, type_name: &str) -> Result<RFC_TYPE_DESC_HANDLE, RfcError> {
         unsafe {
             let mut error_info = std::mem::zeroed::<RFC_ERROR_INFO>();
             let name_uc = crate::string_utils::str_to_sap_uc(type_name);
@@ -274,7 +271,7 @@ pub unsafe fn get_field_infos(
             char_length: char_length as usize,
             direction: 0, // 字段没有方向
             decimals: fdesc.decimals,
-            optional: false, // 字段没有 optional 标记
+            optional: false,               // 字段没有 optional 标记
             parameter_text: String::new(), // RFC_FIELD_DESC 无 parameterText
             default_value: String::new(),  // RFC_FIELD_DESC 无 defaultValue
             type_desc_handle: if fdesc.typeDescHandle.handle.is_null() {

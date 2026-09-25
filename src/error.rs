@@ -96,12 +96,12 @@ fn status_for_rc(rc: RFC_RC, key: &str) -> u16 {
                 400
             }
         }
-        RFC_NOT_FOUND => 404,                              // 函数/DDIC/结构定义不存在
+        RFC_NOT_FOUND => 404, // 函数/DDIC/结构定义不存在
         RFC_INVALID_PARAMETER | RFC_CONVERSION_FAILURE => 400, // 传参错/类型转换失败
-        RFC_AUTHORIZATION_FAILURE => 403,                  // 权限不足
+        RFC_AUTHORIZATION_FAILURE => 403, // 权限不足
         // 5xx：上游/网络错误
-        RFC_COMMUNICATION_FAILURE | RFC_CLOSED => 502,     // 网络/网关/连接问题
-        RFC_TIMEOUT => 504,                                // SAP 端超时
+        RFC_COMMUNICATION_FAILURE | RFC_CLOSED => 502, // 网络/网关/连接问题
+        RFC_TIMEOUT => 504,                            // SAP 端超时
         RFC_BUFFER_TOO_SMALL => 500, // 内部重试码：正常被自适应重读吸收，漏到这里归 500
         _ => 500, // 其余（ABAP_RUNTIME_FAILURE=3 / MEMORY_INSUFFICIENT=9 / 未知码）
     }
@@ -228,7 +228,7 @@ mod tests {
         assert_eq!(status_for_rc(RFC_TIMEOUT, ""), 504); // 真实 8（此前误用 9=MEMORY_INSUFFICIENT）
         assert_eq!(status_for_rc(RFC_AUTHORIZATION_FAILURE, ""), 403); // 真实 29（此前误用 25=TABLE_MOVE_EOF）
         assert_eq!(status_for_rc(RFC_CONVERSION_FAILURE, ""), 400); // 真实 22（此前误并入 23）
-        // BUFFER_TOO_SMALL(23) 是内部自适应重试码，正常不会暴露给用户；万一漏到这里归 500
+                                                                    // BUFFER_TOO_SMALL(23) 是内部自适应重试码，正常不会暴露给用户；万一漏到这里归 500
         assert_eq!(status_for_rc(RFC_BUFFER_TOO_SMALL, ""), 500);
         // RFC_CLOSED 真实值是 6（此前常量错写成 7）；锁住其 502 语义
         assert_eq!(status_for_rc(RFC_CLOSED, ""), 502);

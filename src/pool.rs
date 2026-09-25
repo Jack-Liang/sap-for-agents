@@ -250,10 +250,7 @@ impl RfcConnectionPool {
                         // 计数减一后继续循环——取下一个空闲或新建
                         tracing::warn!(code = e.code, key = %e.key, "空闲连接校验失败，丢弃并重建");
                         drop(entry.conn);
-                        guard = self
-                            .inner
-                            .lock()
-                            .map_err(|e2| poison_err("连接池锁", e2))?;
+                        guard = self.inner.lock().map_err(|e2| poison_err("连接池锁", e2))?;
                         guard.total = guard.total.saturating_sub(1);
                         // 腾出一个可建配额，唤醒等待者重估（持锁 notify 合法）
                         self.cv.notify_one();

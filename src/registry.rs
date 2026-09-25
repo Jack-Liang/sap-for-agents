@@ -306,9 +306,9 @@ fn validate_alias(alias: &str) -> Result<(), RfcError> {
     let ok = (1..=ALIAS_MAX_LEN).contains(&alias.chars().count())
         && !alias.starts_with('/')
         && !alias.ends_with('/')
-        && alias
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_' || c == '/')
+        && alias.chars().all(|c| {
+            c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_' || c == '/'
+        })
         && !alias.split('/').any(|s| s.is_empty());
     if ok {
         Ok(())
@@ -456,15 +456,12 @@ fn disabled_err() -> RfcError {
 /// 互斥锁访问辅助：poisoned 视作内部错误（不 panic——注册表坏了不该拖垮请求）。
 fn with_store<R>(f: impl FnOnce(&mut Store) -> Result<R, RfcError>) -> Result<R, RfcError> {
     let state = REGISTRY.get().ok_or_else(disabled_err)?;
-    let mut store = state
-        .store
-        .lock()
-        .map_err(|_| RfcError {
-            code: -1,
-            status: 500,
-            message: "注册表内部锁中毒".into(),
-            key: "REGISTRY_STORE_ERROR".into(),
-        })?;
+    let mut store = state.store.lock().map_err(|_| RfcError {
+        code: -1,
+        status: 500,
+        message: "注册表内部锁中毒".into(),
+        key: "REGISTRY_STORE_ERROR".into(),
+    })?;
     f(&mut store)
 }
 
@@ -524,7 +521,13 @@ pub fn tombstone_func(func_name: &str) -> Result<usize, RfcError> {
 
 /// 列表（GET /api/registry）。
 pub fn list_entries(q: Option<&str>, include_deleted: bool) -> Result<Vec<Entry>, RfcError> {
-    with_store(|store| Ok(store.list(q, include_deleted).into_iter().cloned().collect()))
+    with_store(|store| {
+        Ok(store
+            .list(q, include_deleted)
+            .into_iter()
+            .cloned()
+            .collect())
+    })
 }
 
 /// 全部 published 条目（/openapi.json 的服务目录来源）。
@@ -543,15 +546,12 @@ pub fn published_entries() -> Result<Vec<Entry>, RfcError> {
 pub fn get_entry(alias: &str) -> Result<Entry, RfcError> {
     validate_alias(alias)?;
     with_store(|store| {
-        store
-            .get(alias)
-            .cloned()
-            .ok_or_else(|| RfcError {
-                code: -1,
-                status: 404,
-                message: format!("注册表无此条目: {alias}"),
-                key: "REGISTRY_NOT_FOUND".into(),
-            })
+        store.get(alias).cloned().ok_or_else(|| RfcError {
+            code: -1,
+            status: 404,
+            message: format!("注册表无此条目: {alias}"),
+            key: "REGISTRY_NOT_FOUND".into(),
+        })
     })
 }
 
@@ -640,7 +640,9 @@ fn default_status() -> EntryStatus {
 }
 
 /// `status`/`intent` 等枚举字段反序列化失败时给出可读错误（而非 serde 天书）。
-fn parse_put_body(raw: Result<Json<serde_json::Value>, axum::extract::rejection::JsonRejection>) -> Result<PutBody, RfcError> {
+fn parse_put_body(
+    raw: Result<Json<serde_json::Value>, axum::extract::rejection::JsonRejection>,
+) -> Result<PutBody, RfcError> {
     let Json(raw) = raw.map_err(|r| RfcError {
         code: -1,
         status: r.status().as_u16(),
@@ -710,7 +712,9 @@ async fn registry_put_handler(
     let alias = alias_from_path(&alias)?;
     let body = parse_put_body(body)?;
     let (entry, created) = put_entry(&alias, &body)?;
-    Ok(Json(serde_json::json!({ "created": created, "entry": entry })))
+    Ok(Json(
+        serde_json::json!({ "created": created, "entry": entry }),
+    ))
 }
 
 async fn registry_delete_handler(
@@ -758,19 +762,25 @@ mod tests {
 
     #[test]
     fn alias_validation_rules() {
-        for ok in ["z_calc", "calc2", "team/customer-list", "a_b-c/d_e", &"x".repeat(60)] {
+        for ok in [
+            "z_calc",
+            "calc2",
+            "team/customer-list",
+            "a_b-c/d_e",
+            &"x".repeat(60),
+        ] {
             assert!(validate_alias(ok).is_ok(), "应合法: {ok}");
         }
         for bad in [
-            "",                                 // 空
-            "Z_CALC",                           // 大写
-            "z calc",                           // 空格
-            "z.calc",                           // 点
-            "/leading",                         // 以 / 开头
-            "trailing/",                        // 以 / 结尾
-            "a//b",                             // 空段
-            &"x".repeat(61),                    // 超长
-            "中文",                              // 非 ASCII
+            "",              // 空
+            "Z_CALC",        // 大写
+            "z calc",        // 空格
+            "z.calc",        // 点
+            "/leading",      // 以 / 开头
+            "trailing/",     // 以 / 结尾
+            "a//b",          // 空段
+            &"x".repeat(61), // 超长
+            "中文",          // 非 ASCII
         ] {
             assert!(validate_alias(bad).is_err(), "应非法: {bad:?}");
         }
@@ -779,7 +789,10 @@ mod tests {
     #[test]
     fn sanitize_alias_lowercases_and_replaces() {
         assert_eq!(sanitize_alias("Z_CALC"), "z_calc");
-        assert_eq!(sanitize_alias("/SDF/EWA_GET_ABAP_DUMPS"), "/sdf/ewa_get_abap_dumps");
+        assert_eq!(
+            sanitize_alias("/SDF/EWA_GET_ABAP_DUMPS"),
+            "/sdf/ewa_get_abap_dumps"
+        );
         assert_eq!(sanitize_alias("Z FM"), "z-fm");
     }
 
@@ -825,8 +838,7 @@ mod tests {
     #[test]
     fn store_roundtrip_keeps_version_and_sort() {
         let mut s = Store::default();
-        s.entries
-            .insert("b".into(), draft("b", "Z_B"));
+        s.entries.insert("b".into(), draft("b", "Z_B"));
         s.entries.insert("a".into(), draft("a", "Z_A"));
         let json = s.to_json();
         assert!(json.contains("\"version\": 1"));
@@ -839,7 +851,10 @@ mod tests {
     #[test]
     fn store_rejects_bad_version_and_bad_json() {
         assert!(Store::from_json("{}").is_err(), "缺 version");
-        assert!(Store::from_json("{\"version\":2,\"entries\":[]}").is_err(), "未来版本");
+        assert!(
+            Store::from_json("{\"version\":2,\"entries\":[]}").is_err(),
+            "未来版本"
+        );
         assert!(Store::from_json("not json").is_err());
     }
 
@@ -876,7 +891,11 @@ mod tests {
         assert_eq!(s.get("z_calc").unwrap().doc, "完整文档 v2（随代码）");
         // doc 空白串视同未提供
         s.ensure_draft_for_func("Z_CALC", None, Some("   "), "t4");
-        assert_eq!(s.get("z_calc").unwrap().doc, "完整文档 v2（随代码）", "空白 doc 不覆盖");
+        assert_eq!(
+            s.get("z_calc").unwrap().doc,
+            "完整文档 v2（随代码）",
+            "空白 doc 不覆盖"
+        );
     }
 
     #[test]
@@ -1080,16 +1099,18 @@ mod tests {
         assert_eq!(st, 400, "{body}");
         assert!(body.contains("REGISTRY_ALIAS_INVALID"), "{body}");
         // 非法 status
-        let (st, body) = call(
-            put_req("z_ok", &serde_json::json!({"func_name": "Z_X", "status": "deleted"})),
-        )
+        let (st, body) = call(put_req(
+            "z_ok",
+            &serde_json::json!({"func_name": "Z_X", "status": "deleted"}),
+        ))
         .await;
         assert_eq!(st, 400, "{body}");
         assert!(body.contains("REGISTRY_STATUS_INVALID"), "{body}");
         // 非法函数名（SAP 规则）
-        let (st, body) = call(
-            put_req("z_ok", &serde_json::json!({"func_name": "bad name!"})),
-        )
+        let (st, body) = call(put_req(
+            "z_ok",
+            &serde_json::json!({"func_name": "bad name!"}),
+        ))
         .await;
         assert_eq!(st, 400, "{body}");
         // 404
@@ -1113,9 +1134,10 @@ mod tests {
         .await;
         assert_eq!(st, 404);
         // slashed alias 合法创建
-        let (st, body) = call(
-            put_req("team/z-calc", &serde_json::json!({"func_name": "Z_CALC"})),
-        )
+        let (st, body) = call(put_req(
+            "team/z-calc",
+            &serde_json::json!({"func_name": "Z_CALC"}),
+        ))
         .await;
         assert_eq!(st, 200, "{body}");
     }

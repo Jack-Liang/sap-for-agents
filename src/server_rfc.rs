@@ -110,7 +110,7 @@ unsafe fn create_function_desc(name: &str) -> Result<RFC_FUNCTION_DESC_HANDLE, R
             message: sap_uc_to_string(err.message.as_ptr(), 256),
             key: sap_uc_to_string(err.key.as_ptr(), 64),
             ..Default::default()
-                    });
+        });
     }
     Ok(h)
 }
@@ -128,13 +128,13 @@ unsafe fn add_parameter(desc: RFC_FUNCTION_DESC_HANDLE, p: &ParamDef) -> Result<
         message: e,
         key: String::new(),
         ..Default::default()
-                })?;
+    })?;
     pdesc.direction = p.direction_mask().map_err(|e| RfcError {
         code: -1,
         message: e,
         key: String::new(),
         ..Default::default()
-                })?;
+    })?;
     // charLength = ucLength/2；ucLength 用字节（2 bytes/SAP_CHAR）
     if let Some(len) = p.length {
         pdesc.ucLength = (len * 2) as u32;
@@ -250,7 +250,7 @@ unsafe fn get_func_name(func_handle: RFC_FUNCTION_HANDLE) -> Result<String, RfcE
             message: "RfcDescribeFunction 失败".into(),
             key: String::new(),
             ..Default::default()
-                    });
+        });
     }
     let mut buf = [0u16; 31]; // RFC_ABAP_NAME 长度
     let rc = RfcGetFunctionName(desc, buf.as_mut_ptr(), &mut err);
@@ -260,7 +260,7 @@ unsafe fn get_func_name(func_handle: RFC_FUNCTION_HANDLE) -> Result<String, RfcE
             message: "RfcGetFunctionName 失败".into(),
             key: String::new(),
             ..Default::default()
-                    });
+        });
     }
     Ok(sap_uc_to_string(buf.as_ptr(), 30))
 }
@@ -319,7 +319,10 @@ fn write_outputs(
                 Ok(rfctype::INT) | Ok(rfctype::INT2) | Ok(rfctype::INT1) => {
                     let v: i32 = val.parse().map_err(|e| RfcError {
                         code: -1,
-                        message: format!("回填参数 {} 的整数值解析失败 (\"{}\"): {}", p.name, val, e),
+                        message: format!(
+                            "回填参数 {} 的整数值解析失败 (\"{}\"): {}",
+                            p.name, val, e
+                        ),
                         key: String::new(),
                         ..Default::default()
                     })?;
@@ -328,7 +331,10 @@ fn write_outputs(
                 Ok(rfctype::INT8) => {
                     let v: i64 = val.parse().map_err(|e| RfcError {
                         code: -1,
-                        message: format!("回填参数 {} 的 INT8 值解析失败 (\"{}\"): {}", p.name, val, e),
+                        message: format!(
+                            "回填参数 {} 的 INT8 值解析失败 (\"{}\"): {}",
+                            p.name, val, e
+                        ),
                         key: String::new(),
                         ..Default::default()
                     })?;
@@ -337,7 +343,10 @@ fn write_outputs(
                 Ok(rfctype::FLOAT) => {
                     let v: f64 = val.parse().map_err(|e| RfcError {
                         code: -1,
-                        message: format!("回填参数 {} 的 FLOAT 值解析失败 (\"{}\"): {}", p.name, val, e),
+                        message: format!(
+                            "回填参数 {} 的 FLOAT 值解析失败 (\"{}\"): {}",
+                            p.name, val, e
+                        ),
                         key: String::new(),
                         ..Default::default()
                     })?;
@@ -348,7 +357,10 @@ fn write_outputs(
                         .decode(val.as_bytes())
                         .map_err(|e| RfcError {
                             code: -1,
-                            message: format!("回填参数 {} 的 Base64 解码失败 (\"{}\"): {}", p.name, val, e),
+                            message: format!(
+                                "回填参数 {} 的 Base64 解码失败 (\"{}\"): {}",
+                                p.name, val, e
+                            ),
                             key: String::new(),
                             ..Default::default()
                         })?;

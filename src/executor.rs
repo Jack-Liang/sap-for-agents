@@ -72,5 +72,9 @@ fn resolve_meta(conn: &RfcConnection, req: &InvokeRequest) -> crate::api::Resolv
         structures.insert(struct_name.clone(), field_map);
     }
 
-    crate::api::ResolvedMeta { scalars, tables, structures }
+    crate::api::ResolvedMeta {
+        scalars,
+        tables,
+        structures,
+    }
 }

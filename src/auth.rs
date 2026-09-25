@@ -66,7 +66,10 @@ fn token_matches(provided: Option<&str>, expected: &str) -> bool {
 }
 
 /// axum 中间件：未配置 key → 放行；配置了 → 校验 `Authorization`，失败回 401。
-pub async fn require_api_key(req: axum::extract::Request, next: axum::middleware::Next) -> Response {
+pub async fn require_api_key(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
     // 未配置 key → 免鉴权（本机默认，向后兼容）
     let Some(expected) = configured_key() else {
         return next.run(req).await;
@@ -95,10 +98,8 @@ fn unauthorized() -> Response {
         }
     }));
     let mut resp = (StatusCode::UNAUTHORIZED, body).into_response();
-    resp.headers_mut().insert(
-        header::WWW_AUTHENTICATE,
-        HeaderValue::from_static("Bearer"),
-    );
+    resp.headers_mut()
+        .insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
     resp
 }
 

@@ -101,7 +101,12 @@ pub fn load() -> Result<AppConfig, String> {
     let adt_passwd = env::var("SAP_ADT_PASSWD").unwrap_or_else(|_| passwd.clone());
     // 只读模式：识别 1/true/yes/on（大小写不敏感），其余值视为关闭
     let read_only = env::var("SAP_READ_ONLY")
-        .map(|v| matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .map(|v| {
+            matches!(
+                v.trim().to_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
         .unwrap_or(false);
     // API 注册表文件（默认工作目录下的 registry.json）
     let registry_file = std::path::PathBuf::from(
@@ -297,7 +302,10 @@ mod tests {
         // 未设 → 默认开启
         clear_env();
         set_all_required();
-        assert!(load().unwrap().update_check, "未设 SAP_UPDATE_CHECK 应默认开启");
+        assert!(
+            load().unwrap().update_check,
+            "未设 SAP_UPDATE_CHECK 应默认开启"
+        );
         // off/false/0/no（大小写不敏感）→ 关闭
         for val in ["off", "false", "0", "NO", " Off "] {
             clear_env();
@@ -317,7 +325,10 @@ mod tests {
             unsafe {
                 std::env::set_var("SAP_UPDATE_CHECK", val);
             }
-            assert!(load().unwrap().update_check, "SAP_UPDATE_CHECK={val} 应开启");
+            assert!(
+                load().unwrap().update_check,
+                "SAP_UPDATE_CHECK={val} 应开启"
+            );
         }
     }
 
@@ -371,7 +382,10 @@ mod tests {
         set_all_required();
         // 未设 → 按 ashost 推导默认端口 50000，认证沿用 SAP_USER/PASSWD
         let cfg = load().unwrap();
-        assert_eq!(cfg.adt_base_url.as_deref(), Some("http://sap.example.com:50000"));
+        assert_eq!(
+            cfg.adt_base_url.as_deref(),
+            Some("http://sap.example.com:50000")
+        );
         assert_eq!(cfg.adt_user, "TESTUSER");
         assert_eq!(cfg.adt_passwd, "secret");
 
@@ -381,7 +395,10 @@ mod tests {
             std::env::set_var("SAP_ADT_PASSWD", "adtpass");
         }
         let cfg = load().unwrap();
-        assert_eq!(cfg.adt_base_url.as_deref(), Some("https://sap.example.com:44300"));
+        assert_eq!(
+            cfg.adt_base_url.as_deref(),
+            Some("https://sap.example.com:44300")
+        );
         assert_eq!(cfg.adt_user, "ADTUSER");
 
         // 显式空串 → 禁用

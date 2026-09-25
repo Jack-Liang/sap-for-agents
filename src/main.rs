@@ -10,10 +10,10 @@ mod executor;
 mod ffi;
 mod function;
 mod invoke;
+mod mcp;
 mod metadata;
 mod objects;
 mod openapi;
-mod mcp;
 mod pool;
 mod registry;
 mod server;
@@ -96,7 +96,9 @@ async fn run_client() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("❌ SAP SDK 的 ICU 库加载失败: {}", e);
         eprintln!("   macOS 上 libsapnwrfc.dylib 以裸名引用 ICU（rpath 不生效）。两种解法：");
         eprintln!("   1. 用启动脚本:  ./start.sh   (自动设置库路径)");
-        eprintln!("   2. 直跑二进制前设置:  export DYLD_LIBRARY_PATH=<项目>/nwrfcsdk/lib/darwin-aarch64");
+        eprintln!(
+            "   2. 直跑二进制前设置:  export DYLD_LIBRARY_PATH=<项目>/nwrfcsdk/lib/darwin-aarch64"
+        );
         eprintln!("   （详见 README §Quick Start）");
         std::process::exit(255);
     }
@@ -111,11 +113,8 @@ async fn run_client() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_default();
     version::init_sap_client(sap_client);
 
-    let pool = RfcConnectionPool::with_max_size(
-        cfg.conn_params,
-        cfg.pool_size,
-        cfg.pool_idle_validate,
-    )?;
+    let pool =
+        RfcConnectionPool::with_max_size(cfg.conn_params, cfg.pool_size, cfg.pool_idle_validate)?;
     tracing::info!(pool_size = cfg.pool_size, "SAP 系统连接成功（多连接池）");
     // 认证：未设 SAP_API_KEY → None（免鉴权）；设置后 /api/* 要求 Bearer token
     let auth_enabled = cfg.api_key.is_some();
@@ -266,8 +265,12 @@ fn print_config_guide(err: &str, dotenv_not_found: bool) {
 /// 任何一个能打开即通过（SDK 运行时会按同样顺序解析）。
 #[cfg(target_os = "macos")]
 fn probe_macos_icu() -> Result<(), String> {
-    let libs = ["libicuuc57.dylib", "libicudata57.dylib", "libicui18n57.dylib"]
-        .map(String::from);
+    let libs = [
+        "libicuuc57.dylib",
+        "libicudata57.dylib",
+        "libicui18n57.dylib",
+    ]
+    .map(String::from);
     // 与 build.rs 同款目录约定：nwrfcsdk/lib/darwin-<arch>
     let arch = match std::env::var("SAP_SDK_DIR") {
         Ok(dir) => format!("{}/lib/darwin-{}", dir, std::env::consts::ARCH),

@@ -17,7 +17,13 @@ pub fn ensure_sap_env() {
     // 集成测试需要 SAP 连接。.env 在 cargo test 运行时不会被自动加载，
     // 这里手动加载 + 检查关键变量。
     let _ = dotenvy::dotenv();
-    for key in ["SAP_ASHOST", "SAP_SYSNR", "SAP_CLIENT", "SAP_USER", "SAP_PASSWD"] {
+    for key in [
+        "SAP_ASHOST",
+        "SAP_SYSNR",
+        "SAP_CLIENT",
+        "SAP_USER",
+        "SAP_PASSWD",
+    ] {
         if std::env::var(key).is_err() {
             eprintln!("跳过 SAP 集成测试：缺少环境变量 {}", key);
             std::process::exit(0);
