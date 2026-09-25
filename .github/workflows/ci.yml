@@ -3,8 +3,9 @@ name: CI
 # 每次 push / PR 跑 clippy + 单测，保证回归。
 # 集成测试（#[ignore]，需真 SAP）不在 CI 跑——CI 无 SAP NWRFC SDK。
 #
-# 关键：CI 用空的 libsapnwrfc.so 占位（stub）满足编译期链接 + 单测运行期 load。
-# 单测不调 SAP FFI，stub 不影响；集成测试标 #[ignore] 默认跳过。
+# 关键：CI 用 stub libsapnwrfc.so 占位（导出全部 Rfc* 桩符号）满足
+# 编译期链接 + 单测运行期 load（含新版 rustc 的 -z now 急切解析）。
+# 单测不调 SAP FFI，桩函数体为空不影响；集成测试标 #[ignore] 默认跳过。
 
 on:
   push:
@@ -35,16 +36,22 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
-      # CI 无真实 SAP SDK（受版权限制）。生成空 libsapnwrfc.so 占位：
+      # CI 无真实 SAP SDK（受版权限制）。生成 stub libsapnwrfc.so：
       # - 编译期：build.rs 要求链接 sapnwrfc，stub 提供符号占位
-      # - 运行期：单测启动 load stub（不调 SAP FFI，无影响）
+      # - 运行期：单测启动 load stub。stub 导出 ffi.rs 里 extern 声明的全部
+      #   Rfc* 符号（void 桩）：新版 rustc 在 Linux 默认 full RELRO（-z now），
+      #   测试二进制加载期急切解析所有符号——零符号的空 stub 会以
+      #   "undefined symbol: RfcXxx" 拒载（2026-09-25 实证）。符号清单从
+      #   ffi.rs 自动生成，新增 extern 自动覆盖。
       - name: Prepare stub SAP SDK
         run: |
           STUB=nwrfcsdk/lib/linux-x86_64
           mkdir -p "$STUB"
-          echo "int sapnwrfc_stub;" > /tmp/stub.c
-          cc -c /tmp/stub.c -o /tmp/stub.o
-          cc -shared -o "$STUB/libsapnwrfc.so" /tmp/stub.o
+          grep -hoE 'pub fn Rfc[A-Za-z0-9_]+' src/ffi.rs \
+            | awk '{print "void " $3 "(void) {}"}' > /tmp/stub.c
+          echo "int sapnwrfc_stub;" >> /tmp/stub.c
+          echo "stub symbols: $(grep -c '^void Rfc' /tmp/stub.c)"
+          cc -shared -fPIC -o "$STUB/libsapnwrfc.so" /tmp/stub.c
           ls -la "$STUB"
 
       # clippy：质量门禁（-D warnings 阻断；代码已清干净）
