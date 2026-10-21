@@ -19,6 +19,7 @@ mod registry;
 mod server;
 mod server_config;
 mod server_rfc;
+mod setup;
 mod string_utils;
 mod systems;
 mod version;
@@ -103,18 +104,9 @@ async fn run_client() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(255);
     }
 
-    // 版本自描述（/api/version）：客户端号来自本地配置，零 RFC 成本
-    // （须在 conn_params move 进系统注册表之前取出；多系统下取默认系统的 CLIENT）
-    let sap_client = cfg
-        .conn_params
-        .iter()
-        .find(|(k, _)| *k == "CLIENT")
-        .map(|(_, v)| v.clone())
-        .unwrap_or_default();
-    version::init_sap_client(sap_client);
-
     // 多系统组装（v0.16）：无 sap_systems.toml 时从环境变量合成单系统 default
     //（行为与旧版逐字节一致）；默认系统急切建首连（fail-fast 保留），其余惰性。
+    // v0.17：连接配置全缺 → 未配置模式（空注册表照样监听，setup API 引导配置）。
     let specs = match systems::load_specs(&cfg) {
         Ok(s) => s,
         Err(e) => {
@@ -123,19 +115,40 @@ async fn run_client() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
     let n_systems = specs.len();
+
+    // 版本自描述（/api/version）：客户端号来自本地配置，零 RFC 成本。
+    // 取**默认系统**的 CLIENT（env 合成或 toml 声明皆准）；未配置模式跳过
+    // （setup 首个系统热加载时补写，见 setup.rs）。须在 specs move 前取出。
+    if let Some(client) = specs.iter().find(|s| s.is_default).and_then(|s| {
+        s.conn_params
+            .iter()
+            .find(|(k, _)| *k == "CLIENT")
+            .map(|(_, v)| v.clone())
+    }) {
+        version::init_sap_client(client);
+    }
+
     let registry = match systems::build_registry(specs, &cfg) {
         Ok(r) => r,
         Err(e) => {
-            print_config_guide(&format!("多系统注册表组装失败: {}", e), false);
+            print_config_guide(&e, false);
             return Err(e.into());
         }
     };
     let state: server::SharedState = Arc::new(registry);
-    tracing::info!(
-        systems = n_systems,
-        default = %state.default().name,
-        "SAP 系统注册表已组装（多连接池）"
-    );
+    match state.default() {
+        Some(d) => tracing::info!(
+            systems = n_systems,
+            default = %d.name,
+            "SAP 系统注册表已组装（多连接池）"
+        ),
+        None => tracing::warn!(
+            systems = 0,
+            "未配置模式启动：无任何 SAP 系统。网关照常监听，业务端点返回 503 \
+             SYSTEM_NOT_CONFIGURED；Agent 引导配置：GET /api/setup → 采集 → \
+             POST /api/setup/system（试连通过即落盘热加载，无需重启）"
+        ),
+    }
 
     // 认证：未设 SAP_API_KEY → None（免鉴权）；设置后 /api/* 要求 Bearer token
     let auth_enabled = cfg.api_key.is_some();
@@ -151,8 +164,17 @@ async fn run_client() -> Result<(), Box<dyn std::error::Error>> {
     server::init_metrics();
     // 可选限流（按 IP；未设 SAP_RATE_LIMIT_RPS 则不限流）
     server::init_rate_limiter(cfg.rate_limit_rps);
-    // ADT 能力自描述按默认系统视角（每系统真实开关看 /api/version 的 systems 块）
-    adt::init_capability_adt(state.default().adt.is_some());
+    // ADT 能力自描述按默认系统视角（每系统真实开关看 /api/version 的 systems 块）；
+    // 未配置模式为 false（setup 首个默认系统热加载时会翻转）
+    adt::init_capability_adt(state.default().is_some_and(|d| d.adt.is_some()));
+    // 引导式配置开关（SAP_SETUP=off 禁用 POST /api/setup/system；GET 状态仍公开）
+    setup::init(cfg.setup_enabled);
+    if !cfg.setup_enabled {
+        tracing::info!("引导式配置已禁用（SAP_SETUP=off）：POST /api/setup/system 返回 403");
+    }
+    // 未配置模式自动打开引导页（SAP_OPEN_BROWSER=off 关；已配置部署从不弹）。
+    // server::run 在监听成功后触发——浏览器打开时页面必然可访问。
+    setup::init_auto_open(state.default().is_none() && cfg.open_browser);
     // 运行档位（SAP_MODE=runtime）：消费方运行模式——只留交付端口调用面
     server::init_runtime_mode(cfg.runtime_mode);
     if cfg.runtime_mode {

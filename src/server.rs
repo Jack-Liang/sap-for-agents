@@ -175,7 +175,10 @@ async fn read_only_guard(
         .extensions()
         .get::<Scope>()
         .map(|s| s.0.read_only)
-        .unwrap_or_else(|| state.default().read_only);
+        // 未配置模式无默认系统：按非只读处理（写端点随后在 Sap 提取器处
+        // 503 SYSTEM_NOT_CONFIGURED；setup 端点不属 SAP 写，不应被此守卫拦）
+        .or_else(|| state.default().map(|d| d.read_only))
+        .unwrap_or(false);
     if read_only && is_read_only_blocked(req.method(), req.uri().path()) {
         return Err(RfcError {
             code: -1,
@@ -294,6 +297,10 @@ pub fn static_app<S: Clone + Send + Sync + 'static>() -> Router<S> {
         // /docs：Redoc 交互式文档（渲染 /openapi.json；离线时降级为提示页）
         .route("/docs", axum::routing::get(docs_handler))
         .route("/health", axum::routing::get(health_handler))
+        // /setup：首次启动引导页（v0.17，公开）。未配置模式下双击运行的
+        // 网关会自动在浏览器打开它；页面给用户一段可复制的「交接文字」，
+        // 粘给 AI 助手即可接手 /api/setup 引导流程。状态由页面 JS 实时拉取。
+        .route("/setup", axum::routing::get(setup_page_handler))
 }
 
 /// 构建带多系统状态的 Router：静态路由 + SAP 业务路由 + 作用域改写层。
@@ -355,6 +362,10 @@ pub fn app(state: SharedState) -> Router {
         )
         // ADT REST 通用代理（dump 正文、类/程序源码等，任何方法透传）
         .route("/api/adt/{*path}", axum::routing::any(adt_proxy_handler))
+        // 引导式配置写入（v0.17：Agent 引导用户采集连接信息，试连通过即
+        // 落盘 sap_systems.toml 并热加载；与业务面同守卫栈——鉴权/限流/
+        // runtime/只读。GET /api/setup 挂公开侧）
+        .route("/api/setup/system", post(crate::setup::add_handler))
         .layer(axum::middleware::from_fn(runtime_mode_guard))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
@@ -371,6 +382,12 @@ pub fn app(state: SharedState) -> Router {
         .route("/api/version", axum::routing::get(version_handler))
         // 多系统清单（v0.16）：Agent 会话第一步——有哪些系统、谁是默认、健康度
         .route("/api/systems", axum::routing::get(systems_handler))
+        // 引导式配置状态（v0.17）：公开免鉴权——未配置模式下 Agent 还没有
+        // token/上下文，第一步就得能发现"需要引导配置"与字段清单
+        .route(
+            "/api/setup",
+            axum::routing::get(crate::setup::status_handler),
+        )
         .route("/metrics", axum::routing::get(metrics_handler))
         .merge(api)
         .fallback(fallback_handler)
@@ -484,16 +501,18 @@ impl tower::Service<axum::extract::Request> for ScopeService {
 
 /// `GET /api/systems` —— 多系统清单（公开免鉴权）：Agent 会话第一步。
 /// name / 是否默认 / read_only / ADT 启用 / 已登记的 SYSID / 隔离状态。
+/// 未配置模式：count=0、default=null，指向 setup 引导。
 async fn systems_handler(
     axum::extract::State(state): axum::extract::State<SharedState>,
 ) -> Json<serde_json::Value> {
+    let default = state.default();
     let systems: Vec<serde_json::Value> = state
         .list()
         .iter()
         .map(|s| {
             serde_json::json!({
                 "name": s.name,
-                "default": Arc::ptr_eq(s, state.default()),
+                "default": default.as_ref().is_some_and(|d| Arc::ptr_eq(s, d)),
                 "read_only": s.read_only,
                 "adt": s.adt.is_some(),
                 "sysid": s.sysid(),
@@ -503,9 +522,13 @@ async fn systems_handler(
         .collect();
     Json(serde_json::json!({
         "count": systems.len(),
-        "default": state.default().name,
+        "default": default.as_ref().map(|d| d.name.clone()),
         "systems": systems,
-        "note": "作用域前缀形态：/api/s/{系统名}/...（如 /api/s/prd/rfc）；无前缀 = 默认系统",
+        "note": if systems.is_empty() {
+            "网关未配置任何 SAP 系统（未配置模式）。引导式配置：GET /api/setup"
+        } else {
+            "作用域前缀形态：/api/s/{系统名}/...（如 /api/s/prd/rfc）；无前缀 = 默认系统"
+        },
     }))
 }
 
@@ -614,6 +637,20 @@ pub async fn run(
         listen_addr.to_string()
     };
     tracing::info!("✅ 服务就绪！");
+    // 未配置模式（双击运行/全新部署）：自动在默认浏览器打开引导页——
+    // 页面给用户一段「复制给 AI 助手」的交接文字，agent 接手 /api/setup 流程。
+    // 已配置部署不打扰（与既有行为一致）；SAP_OPEN_BROWSER=off 可关。
+    if crate::setup::should_auto_open() {
+        let url = format!("http://{}/setup", display_host);
+        tracing::info!("   👉 首次配置引导页（正在尝试打开浏览器）: {}", url);
+        std::thread::spawn(move || {
+            if let Err(e) = open_in_browser(&url) {
+                // 无头/容器环境常态（docker 里没有浏览器）——debug 级即可，
+                // 引导页 URL 已在上方日志里，用户手动打开同样有效
+                tracing::debug!("自动打开浏览器失败（可手动访问上方 URL）: {}", e);
+            }
+        });
+    }
     tracing::info!("   👉 浏览器打开:         http://{}", display_host);
     tracing::info!(
         "   👉 给 AI/Agent 的文档: http://{}/agents.md",
@@ -634,6 +671,44 @@ pub async fn run(
     )
     .with_graceful_shutdown(shutdown)
     .await
+}
+
+/// 用系统默认浏览器打开 URL（零依赖：按平台调系统命令）。
+/// 独立线程调用（命令可能阻塞几百毫秒）；失败由调用方降级处理。
+fn open_in_browser(url: &str) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        // `cmd /c start "" <url>`：空串是 start 的窗口标题占位。
+        // CREATE_NO_WINDOW (0x0800_0000) 防止闪一个黑色 cmd 窗。
+        use std::os::windows::process::CommandExt;
+        std::process::Command::new("cmd")
+            .args(["/c", "start", "", url])
+            .creation_flags(0x0800_0000)
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| format!("cmd start 失败: {}", e))
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg(url)
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| format!("open 失败: {}", e))
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        std::process::Command::new("xdg-open")
+            .arg(url)
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| format!("xdg-open 失败: {}", e))
+    }
+    #[cfg(not(any(windows, unix)))]
+    {
+        let _ = url;
+        Err("该平台不支持自动打开浏览器，请手动访问日志中的 URL".into())
+    }
 }
 
 /// GET /health —— 不触碰 SAP，便于外部探活（liveness）
@@ -730,25 +805,7 @@ async fn index_handler(req: axum::http::Request<axum::body::Body>) -> axum::resp
 
     // 语言选择：?lang=zh → 中文，?lang=<其他> → 英文；未带 lang 时按 Accept-Language
     // （含 zh 开头 → 中文）；默认英文。与 README/AGENTS 双语策略一致（英文为主）。
-    let lang_param = req.uri().query().and_then(|q| {
-        q.split('&').find_map(|kv| {
-            let (k, v) = kv.split_once('=')?;
-            (k == "lang").then_some(v)
-        })
-    });
-    let prefer_zh = match lang_param {
-        Some("zh") => true,
-        Some(_) => false,
-        None => req
-            .headers()
-            .get(axum::http::header::ACCEPT_LANGUAGE)
-            .and_then(|h| h.to_str().ok())
-            .map(|al| {
-                al.split(',')
-                    .any(|r| r.trim().to_lowercase().starts_with("zh"))
-            })
-            .unwrap_or(false),
-    };
+    let prefer_zh = lang_prefers_zh(&req);
     let template = if prefer_zh {
         include_str!("index.zh.html")
     } else {
@@ -773,6 +830,46 @@ async fn index_handler(req: axum::http::Request<axum::body::Body>) -> axum::resp
     axum::response::Html(html)
 }
 
+/// 语言偏好（index 与 /setup 共用）：`?lang=zh` → 中文、`?lang=<其他>` → 英文；
+/// 未带 lang 时按 Accept-Language（含 zh 开头 → 中文）；默认英文。
+fn lang_prefers_zh(req: &axum::http::Request<axum::body::Body>) -> bool {
+    let lang_param = req.uri().query().and_then(|q| {
+        q.split('&').find_map(|kv| {
+            let (k, v) = kv.split_once('=')?;
+            (k == "lang").then_some(v)
+        })
+    });
+    match lang_param {
+        Some("zh") => true,
+        Some(_) => false,
+        None => req
+            .headers()
+            .get(axum::http::header::ACCEPT_LANGUAGE)
+            .and_then(|h| h.to_str().ok())
+            .map(|al| {
+                al.split(',')
+                    .any(|r| r.trim().to_lowercase().starts_with("zh"))
+            })
+            .unwrap_or(false),
+    }
+}
+
+/// `GET /setup` —— 首次启动引导页（公开，双语）。页面自包含：JS 实时拉
+/// `/api/setup` 状态、自动填入本机访问地址、提供「复制给 AI 助手」的交接
+/// 文字；未配置模式下双击运行会自动打开本页（见 [`open_in_browser`]）。
+async fn setup_page_handler(
+    req: axum::http::Request<axum::body::Body>,
+) -> impl axum::response::IntoResponse {
+    let template = if lang_prefers_zh(&req) {
+        include_str!("setup.zh.html")
+    } else {
+        include_str!("setup.html")
+    };
+    (
+        [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        template,
+    )
+}
 /// 审计用：把请求参数压缩成可读摘要（敏感值脱敏、长值截断、键排序稳定）。
 fn summarize_params(req: &InvokeRequest) -> String {
     let mut parts: Vec<String> = Vec::new();
@@ -2935,6 +3032,8 @@ mod tests {
             runtime_mode: false,
             update_check: false,
             systems_file: "no-such.toml".into(),
+            setup_enabled: true,
+            open_browser: false,
         };
         let direct = || {
             vec![
@@ -3094,5 +3193,222 @@ mod tests {
         assert_eq!(resp.status(), axum::http::StatusCode::OK);
         let body = body_string(resp.into_body()).await;
         assert!(body.contains("\"status\":\"ok\""));
+    }
+
+    // ====================================================================
+    // v0.17 未配置模式 + setup 引导（全 lazy / test:false，不触 FFI）
+    // ====================================================================
+
+    /// 未配置状态：空注册表 + systems_file 指向不存在的临时文件。
+    fn unconfigured_state(toml_path: &std::path::Path) -> SharedState {
+        let cfg = crate::config::AppConfig {
+            conn_params: vec![],
+            listen_addr: "127.0.0.1:3000".into(),
+            pool_size: 1,
+            pool_idle_validate: Duration::from_secs(30),
+            api_key: None,
+            request_timeout: Duration::from_secs(5),
+            rate_limit_rps: None,
+            adt_base_url: None,
+            adt_user: String::new(),
+            adt_passwd: String::new(),
+            read_only: false,
+            registry_file: "test-registry.json".into(),
+            runtime_mode: false,
+            update_check: false,
+            systems_file: toml_path.to_path_buf(),
+            setup_enabled: true,
+            open_browser: false,
+        };
+        Arc::new(
+            crate::systems::build_registry_all_lazy(vec![], &cfg)
+                .expect("空 specs 应组装出未配置注册表"),
+        )
+    }
+
+    #[tokio::test]
+    async fn unconfigured_setup_flow_end_to_end() {
+        let dir = std::env::temp_dir().join(format!("sap-gw-setup-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let toml_path = dir.join("systems.toml");
+        let _ = std::fs::remove_file(&toml_path);
+        let app = app(unconfigured_state(&toml_path));
+
+        // 1) 引导状态：未配置 + 可写 + 字段清单（Agent 采访用户的依据）
+        let resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/setup")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let v: serde_json::Value =
+            serde_json::from_str(&body_string(resp.into_body()).await).unwrap();
+        assert_eq!(v["configured"], false);
+        assert_eq!(v["writable"], true);
+        assert!(!v["fields"].as_array().unwrap().is_empty());
+
+        // 2) 业务端点统一 503 SYSTEM_NOT_CONFIGURED（Sap 提取器拒绝，指向引导）
+        let resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/ready")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        let body = body_string(resp.into_body()).await;
+        assert!(
+            body.contains("SYSTEM_NOT_CONFIGURED"),
+            "应指向未配置引导: {body}"
+        );
+
+        // 3) 引导写入（test:false 跳过试连——CI 无 SAP SDK）→ 落盘 + 热加载
+        let req_body = serde_json::json!({
+            "name": "a4h", "ashost": "vhcala4h", "sysnr": "00",
+            "client": "001", "user": "dev", "passwd": "pw", "test": false,
+        });
+        let resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method(axum::http::Method::POST)
+                    .uri("/api/setup/system")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(req_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let v: serde_json::Value =
+            serde_json::from_str(&body_string(resp.into_body()).await).unwrap();
+        assert_eq!(v["saved"], true);
+        assert_eq!(v["default"], true, "首个系统无条件成为默认");
+        assert_eq!(v["connection"]["tested"], false);
+        let written = std::fs::read_to_string(&toml_path).unwrap();
+        assert!(written.contains("[systems.a4h]"), "配置应落盘: {written}");
+
+        // 4) 系统清单确认热加载生效（无需重启）
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/systems")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&body_string(resp.into_body()).await).unwrap();
+        assert_eq!(v["count"], 1);
+        assert_eq!(v["default"], "a4h");
+        let _ = std::fs::remove_file(&toml_path);
+    }
+
+    #[tokio::test]
+    async fn setup_rejects_bad_input_without_writing() {
+        let dir = std::env::temp_dir().join(format!("sap-gw-setup-bad-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let toml_path = dir.join("systems.toml");
+        let _ = std::fs::remove_file(&toml_path);
+        let app = app(unconfigured_state(&toml_path));
+
+        // 拼写错误的字段 → 422（deny_unknown_fields 拦截），不落盘
+        let resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method(axum::http::Method::POST)
+                    .uri("/api/setup/system")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({"name": "x", "ashost": "h", "sysnr": "00",
+                                           "user": "u", "passwd": "p",
+                                           "hostname_typo": "oops", "test": false})
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(!toml_path.exists(), "非法输入不应写文件");
+
+        // 缺连接目标 → 400 SETUP_PARAM_INVALID
+        let resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method(axum::http::Method::POST)
+                    .uri("/api/setup/system")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({"name": "x", "user": "u", "passwd": "p",
+                                           "test": false})
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::BAD_REQUEST);
+        let body = body_string(resp.into_body()).await;
+        assert!(body.contains("SETUP_PARAM_INVALID"), "应报参数错误: {body}");
+        assert!(!toml_path.exists(), "校验失败不应写文件");
+    }
+
+    #[tokio::test]
+    async fn setup_page_serves_both_languages() {
+        // /setup 引导页：公开、双语（?lang 切换），含交接文字模板与状态 JS。
+        // 用 test_state（已配置）也不影响——页面是静态模板，状态由前端拉取。
+        let app = app(test_state());
+        for (uri, marker) in [
+            ("/setup", "Guided Setup"),         // 默认英文
+            ("/setup?lang=en", "Guided Setup"), // 显式英文
+            ("/setup?lang=zh", "首次配置引导"), // 中文
+        ] {
+            let resp = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri(uri)
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), axum::http::StatusCode::OK, "GET {uri}");
+            let body = body_string(resp.into_body()).await;
+            assert!(body.contains(marker), "{uri} 应含「{marker}」");
+            // 交接文字模板：{{ORIGIN}} 占位由前端 JS 替换为实际地址
+            assert!(
+                body.contains("handoff-tpl") && body.contains("{{ORIGIN}}"),
+                "{uri} 应含交接文字模板"
+            );
+        }
+        // Accept-Language: zh → 中文
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/setup")
+                    .header("accept-language", "zh-CN,zh;q=0.9,en;q=0.8")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = body_string(resp.into_body()).await;
+        assert!(
+            body.contains("首次配置引导"),
+            "Accept-Language: zh 应出中文页"
+        );
     }
 }

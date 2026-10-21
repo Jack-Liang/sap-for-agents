@@ -66,16 +66,18 @@ pub(crate) fn adt_disabled() -> RfcError {
 /// `/api/version` capabilities.adt 的数据源（**默认系统**视角）。
 /// v0.16 起 ADT 按系统实例化，能力自描述保留进程级布尔——main 组装注册表后
 /// 按默认系统写入；逐系统的真实开关看 `systems.{name}.adt`。
-static CAPABILITY_ADT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+/// AtomicBool（而非 OnceLock）：未配置模式启动为 false，setup API 热加载
+/// 首个默认系统时翻转（见 setup.rs），全程与运行态一致。
+static CAPABILITY_ADT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// 启动期写入 capabilities.adt（main 调一次，传默认系统的 adt.is_some()）。
+/// 写入 capabilities.adt（main 启动期 + setup 首个默认系统热加载时）。
 pub fn init_capability_adt(enabled: bool) {
-    let _ = CAPABILITY_ADT.set(enabled);
+    CAPABILITY_ADT.store(enabled, std::sync::atomic::Ordering::SeqCst);
 }
 
-/// capabilities.adt 当前值（未初始化 = false）。
+/// capabilities.adt 当前值。
 pub fn capabilities_adt_enabled() -> bool {
-    *CAPABILITY_ADT.get().unwrap_or(&false)
+    CAPABILITY_ADT.load(std::sync::atomic::Ordering::SeqCst)
 }
 
 impl AdtEndpoint {

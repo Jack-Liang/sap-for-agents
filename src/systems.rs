@@ -7,6 +7,8 @@
 //!   单系统——存量部署零感知。toml 存在时系统集合完全由 toml 定义（.env 的
 //!   `SAP_ASHOST` 一族被忽略，启动打提示日志）；全局默认值（池大小/超时/只读）
 //!   仍来自 .env，toml 每系统字段可覆盖。密码支持 `${VAR}` 环境变量插值。
+//!   两者都缺 → **未配置模式**：空注册表照样监听，系统由 setup API
+//!   （`POST /api/setup/system`，见 setup.rs）引导写入后热加载。
 //! - **运行态**（[`SystemHandle`]/[`SystemRegistry`]）：每系统一个连接池 +
 //!   ADT 端点 + 元数据缓存。默认系统急切建首连（保留 fail-fast），其余惰性
 //!   （目标系统暂时不可达不阻塞网关启动）。
@@ -58,33 +60,34 @@ pub struct SystemSpec {
     pub read_only: Option<bool>,
 }
 
-/// `sap_systems.toml` 原始形态（serde 反序列化用）。
+/// `sap_systems.toml` 原始形态（serde 反序列化用；setup API 的请求体
+/// 转成同构再走 [`build_spec`]，保证两条路径校验完全一致）。
 #[derive(Debug, Deserialize)]
-struct SystemsFile {
-    systems: BTreeMap<String, RawSystem>,
+pub(crate) struct SystemsFile {
+    pub(crate) systems: BTreeMap<String, RawSystem>,
 }
 
 #[derive(Debug, Deserialize)]
-struct RawSystem {
-    ashost: Option<String>,
-    sysnr: Option<String>,
-    client: Option<String>,
-    user: Option<String>,
-    passwd: Option<String>,
-    lang: Option<String>,
+pub(crate) struct RawSystem {
+    pub(crate) ashost: Option<String>,
+    pub(crate) sysnr: Option<String>,
+    pub(crate) client: Option<String>,
+    pub(crate) user: Option<String>,
+    pub(crate) passwd: Option<String>,
+    pub(crate) lang: Option<String>,
     #[serde(default)]
-    default: bool,
-    pool_size: Option<usize>,
-    idle_validate_secs: Option<u64>,
-    request_timeout_secs: Option<u64>,
-    adt_base_url: Option<String>,
-    adt_user: Option<String>,
-    adt_passwd: Option<String>,
-    read_only: Option<bool>,
+    pub(crate) default: bool,
+    pub(crate) pool_size: Option<usize>,
+    pub(crate) idle_validate_secs: Option<u64>,
+    pub(crate) request_timeout_secs: Option<u64>,
+    pub(crate) adt_base_url: Option<String>,
+    pub(crate) adt_user: Option<String>,
+    pub(crate) adt_passwd: Option<String>,
+    pub(crate) read_only: Option<bool>,
     /// 自由键值透传（键大写化后直接进 `RfcOpenConnection`，
     /// 为 MSHOST/GROUP 负载均衡等形态留后门）。
     #[serde(default)]
-    conn: BTreeMap<String, String>,
+    pub(crate) conn: BTreeMap<String, String>,
 }
 
 /// `${VAR}` 环境变量插值。未设置的变量报错（密码缺失应在启动期炸掉）。
@@ -141,7 +144,8 @@ const SHORTCUT_KEYS: [(&str, &str); 6] = [
 ];
 
 /// 把原始系统定义组装成 [`SystemSpec`]：合并快捷字段与 conn 透传、插值、校验。
-fn build_spec(name: &str, raw: &RawSystem) -> Result<SystemSpec, String> {
+/// （启动期解析与 setup API 写入共用——两路径校验完全一致）
+pub(crate) fn build_spec(name: &str, raw: &RawSystem) -> Result<SystemSpec, String> {
     validate_name(name)?;
     let ctx = format!("systems.{}", name);
     let mut params: Vec<(&'static str, String)> = Vec::new();
@@ -246,11 +250,32 @@ fn synth_from_env(cfg: &AppConfig) -> SystemSpec {
     }
 }
 
+/// 环境变量合成的存量系统（仅"无 toml 且有连接环境变量"的运行态存在）。
+/// setup API 首写 toml 时把它一并落盘——toml 出现后 env 连接变量被忽略，
+/// 不落盘的话重启后该系统会静默消失。
+pub(crate) fn synth_env_spec(cfg: &AppConfig) -> Option<SystemSpec> {
+    if !cfg.systems_file.exists() && !cfg.conn_params.is_empty() {
+        Some(synth_from_env(cfg))
+    } else {
+        None
+    }
+}
+
 /// 加载系统集合：`sap_systems.toml` 存在则解析之（.env 的连接变量被忽略，
-/// 打提示日志）；不存在则从环境变量合成单系统。
+/// 打提示日志）；不存在则从环境变量合成单系统；环境变量也全缺 → 空集合
+/// （未配置模式：网关照常监听，系统由 setup API 引导写入后热加载）。
 pub fn load_specs(cfg: &AppConfig) -> Result<Vec<SystemSpec>, String> {
     let path = cfg.systems_file.clone();
     if !path.exists() {
+        if cfg.conn_params.is_empty() {
+            tracing::warn!(
+                file = %path.display(),
+                "未检测到任何 SAP 连接配置（无 sap_systems.toml，SAP_* 环境变量全缺）——\
+                 以未配置模式启动：SAP 业务端点返回 503 SYSTEM_NOT_CONFIGURED，\
+                 引导式配置见 GET /api/setup"
+            );
+            return Ok(vec![]);
+        }
         return Ok(vec![synth_from_env(cfg)]);
     }
 
@@ -440,35 +465,86 @@ impl SystemHandle {
 }
 
 /// 多系统注册表：axum 共享状态（`SharedState = Arc<SystemRegistry>`）。
+///
+/// 内部可变（RwLock）：setup API 可在运行期热加载新系统（`add_system`），
+/// 无需重启网关；读路径（`resolve`/`default`/`list`）全部短临界区取 Arc，
+/// 锁内不 await。**可为空**：未配置模式（无 toml、无环境变量）下
+/// `default` 为 None，`Sap` 提取器对无前缀请求返回 503 SYSTEM_NOT_CONFIGURED。
 pub struct SystemRegistry {
+    inner: std::sync::RwLock<RegistryInner>,
+    /// 全局默认值（池/超时/只读）：setup 热加载新系统时组装 handle 用
+    cfg: AppConfig,
+}
+
+struct RegistryInner {
     systems: HashMap<String, Arc<SystemHandle>>,
     /// 声明序（`/api/systems` 稳定输出）
     order: Vec<String>,
-    default: Arc<SystemHandle>,
+    /// 默认系统（无前缀路径的目标）。未配置模式为 None。
+    default: Option<Arc<SystemHandle>>,
 }
 
 impl SystemRegistry {
     /// 按名解析系统（`/api/s/{name}` 的 URL 段）。
     pub fn resolve(&self, name: &str) -> Option<Arc<SystemHandle>> {
-        self.systems.get(name).cloned()
+        self.inner
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .systems
+            .get(name)
+            .cloned()
     }
 
-    /// 默认系统（无前缀路径的目标）。
-    pub fn default(&self) -> &Arc<SystemHandle> {
-        &self.default
+    /// 默认系统（无前缀路径的目标）。未配置模式返回 None。
+    pub fn default(&self) -> Option<Arc<SystemHandle>> {
+        self.inner
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .default
+            .clone()
     }
 
-    /// 全部系统（声明序）。
+    /// 全部系统（声明序 + setup 热加载序）。
     pub fn list(&self) -> Vec<Arc<SystemHandle>> {
-        self.order
+        let inner = self.inner.read().unwrap_or_else(|e| e.into_inner());
+        inner
+            .order
             .iter()
-            .filter_map(|n| self.systems.get(n).cloned())
+            .filter_map(|n| inner.systems.get(n).cloned())
             .collect()
     }
 
     /// 全部系统名（错误信息用）。
     pub fn names(&self) -> Vec<String> {
-        self.order.clone()
+        self.inner
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .order
+            .clone()
+    }
+
+    /// 全局配置（setup 热加载组装 handle 时取默认值用）。
+    pub fn cfg(&self) -> &AppConfig {
+        &self.cfg
+    }
+
+    /// 热加载一个系统（setup API）：插入注册表并按需提升为默认。
+    /// `make_default` 且已有默认 → 取代旧默认；当前无默认 → 无条件成为默认
+    /// （无前缀路径必须有目标）。同名系统已存在是调用方（setup）的前置校验。
+    pub fn add_system(&self, handle: Arc<SystemHandle>, make_default: bool) {
+        let name = handle.name.clone();
+        let mut inner = self.inner.write().unwrap_or_else(|e| e.into_inner());
+        let became_default = make_default || inner.default.is_none();
+        if became_default {
+            inner.default = Some(Arc::clone(&handle));
+        }
+        inner.order.push(name.clone());
+        inner.systems.insert(name.clone(), handle);
+        tracing::info!(
+            system = %name,
+            default = became_default,
+            "系统已热加载（setup API，无需重启）"
+        );
     }
 }
 
@@ -507,16 +583,63 @@ fn build_adt(spec: &SystemSpec, timeout: Duration) -> Option<crate::adt::AdtEndp
     Some(ep)
 }
 
+/// 组装单个系统运行句柄（启动装配与 setup 热加载共用）。
+/// `eager` = 立即建首连（仅启动期默认系统用，密码错启动即炸的 fail-fast）；
+/// 惰性池不触 FFI，不可达交给调用期重试。
+pub(crate) fn make_handle(
+    spec: &SystemSpec,
+    cfg: &AppConfig,
+    eager: bool,
+) -> Result<Arc<SystemHandle>, String> {
+    let pool_size = spec.pool_size.unwrap_or(cfg.pool_size);
+    let idle_validate = spec.idle_validate.unwrap_or(cfg.pool_idle_validate);
+    let request_timeout = spec.request_timeout.unwrap_or(cfg.request_timeout);
+    let read_only = spec.read_only.unwrap_or(cfg.read_only);
+
+    let pool = if eager {
+        Arc::new(
+            RfcConnectionPool::with_max_size(spec.conn_params.clone(), pool_size, idle_validate)
+                .map_err(|e| {
+                    format!(
+                        "默认系统 {} 建立连接失败: {} ({})",
+                        spec.name, e.message, e.key
+                    )
+                })?,
+        )
+    } else {
+        Arc::new(RfcConnectionPool::lazy(
+            spec.conn_params.clone(),
+            pool_size,
+            idle_validate,
+        ))
+    };
+    let adt = build_adt(spec, request_timeout);
+
+    Ok(Arc::new(SystemHandle {
+        name: spec.name.clone(),
+        pool,
+        adt,
+        meta: crate::metadata::MetadataCache::new(),
+        read_only,
+        request_timeout,
+        backend: backend_key(&spec.conn_params),
+        sysid: OnceLock::new(),
+        quarantined: AtomicBool::new(false),
+        sap_info: tokio::sync::RwLock::new(None),
+    }))
+}
+
 /// 组装运行态注册表。默认系统急切建首连（失败即返回错误——保留单系统部署
 /// "密码错启动即炸"的 fail-fast）；其余系统惰性，可达性交给探测任务。
+/// 空集合合法（未配置模式，default = None）。
 pub fn build_registry(specs: Vec<SystemSpec>, cfg: &AppConfig) -> Result<SystemRegistry, String> {
     build_registry_inner(specs, cfg, true)
 }
 
 /// 全惰性组装（不触 FFI）：路由级单测在无 SAP SDK 环境下构造 app() 用。
 /// 生产路径走 [`build_registry`]（默认系统急切）。
-// 非 test 构建无调用方（保留 pub 以便未来运行时热加载复用）
-#[allow(dead_code)]
+// 非 test 构建无调用方（测试代码在 cfg(test) 里，非测试编译看不到）
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn build_registry_all_lazy(
     specs: Vec<SystemSpec>,
     cfg: &AppConfig,
@@ -534,63 +657,30 @@ fn build_registry_inner(
     let mut default = None;
 
     for spec in specs {
-        let pool_size = spec.pool_size.unwrap_or(cfg.pool_size);
-        let idle_validate = spec.idle_validate.unwrap_or(cfg.pool_idle_validate);
-        let request_timeout = spec.request_timeout.unwrap_or(cfg.request_timeout);
-        let read_only = spec.read_only.unwrap_or(cfg.read_only);
-
-        let pool = if spec.is_default && eager_default {
-            Arc::new(
-                RfcConnectionPool::with_max_size(
-                    spec.conn_params.clone(),
-                    pool_size,
-                    idle_validate,
-                )
-                .map_err(|e| {
-                    format!(
-                        "默认系统 {} 建立连接失败: {} ({})",
-                        spec.name, e.message, e.key
-                    )
-                })?,
-            )
-        } else {
-            Arc::new(RfcConnectionPool::lazy(
-                spec.conn_params.clone(),
-                pool_size,
-                idle_validate,
-            ))
-        };
-        let adt = build_adt(&spec, request_timeout);
-
-        let handle = Arc::new(SystemHandle {
-            name: spec.name.clone(),
-            pool,
-            adt,
-            meta: crate::metadata::MetadataCache::new(),
-            read_only,
-            request_timeout,
-            backend: backend_key(&spec.conn_params),
-            sysid: OnceLock::new(),
-            quarantined: AtomicBool::new(false),
-            sap_info: tokio::sync::RwLock::new(None),
-        });
+        let handle = make_handle(&spec, cfg, spec.is_default && eager_default)?;
         tracing::info!(
             system = %spec.name,
             default = spec.is_default,
-            read_only,
+            read_only = spec.read_only.unwrap_or(cfg.read_only),
             "系统已配置"
         );
         if spec.is_default {
-            default = Some(handle.clone());
+            default = Some(Arc::clone(&handle));
         }
         order.push(spec.name.clone());
         systems.insert(spec.name, handle);
     }
 
+    // load_specs 校验保证非空集合恰有一个默认系统；空集合 = 未配置模式
+    debug_assert!(default.is_some() || order.is_empty());
+
     Ok(SystemRegistry {
-        systems,
-        order,
-        default: default.expect("load_specs 校验保证恰有一个默认系统"),
+        inner: std::sync::RwLock::new(RegistryInner {
+            systems,
+            order,
+            default,
+        }),
+        cfg: cfg.clone(),
     })
 }
 
@@ -658,6 +748,9 @@ pub async fn probe_all(registry: Arc<SystemRegistry>) {
 pub struct Scope(pub Arc<SystemHandle>);
 
 /// handler 提取器：优先取作用域系统（`/api/s/{name}/...`），否则默认系统。
+/// 未配置模式（注册表为空）下无前缀请求 → 503 `SYSTEM_NOT_CONFIGURED`
+/// （指向 GET /api/setup 引导）；作用域请求在 ScopeService 已按名解析，
+/// 未知系统在那里就是 404，不会走到本提取器的默认分支。
 ///
 /// ```ignore
 /// async fn handler(State(_): State<SharedState>, sap: Sap) { sap.pool... }
@@ -683,7 +776,7 @@ where
     S: Send + Sync,
     Arc<SystemRegistry>: axum::extract::FromRef<S>,
 {
-    type Rejection = std::convert::Infallible;
+    type Rejection = RfcError;
 
     async fn from_request_parts(
         parts: &mut axum::http::request::Parts,
@@ -693,7 +786,15 @@ where
             return Ok(Sap(scope.0.clone()));
         }
         let registry = <Arc<SystemRegistry> as axum::extract::FromRef<S>>::from_ref(state);
-        Ok(Sap(registry.default().clone()))
+        registry.default().map(Sap).ok_or_else(|| RfcError {
+            code: -1,
+            status: 503,
+            message: "网关尚未配置任何 SAP 系统（未配置模式）。\
+                          引导式配置：GET /api/setup 查看所需字段，向用户采集后 \
+                          POST /api/setup/system 写入并热加载；或手工创建 sap_systems.toml 后重启"
+                .into(),
+            key: "SYSTEM_NOT_CONFIGURED".into(),
+        })
     }
 }
 
@@ -730,6 +831,8 @@ mod tests {
             runtime_mode: false,
             update_check: false,
             systems_file: "no-such-file.toml".into(),
+            setup_enabled: true,
+            open_browser: false,
         }
     }
 
@@ -742,6 +845,37 @@ mod tests {
             ("PASSWD", "P".into()),
             ("LANG", "EN".into()),
         ]
+    }
+
+    #[test]
+    fn unconfigured_mode_builds_empty_registry_and_hot_adds() {
+        // 未配置模式：无 toml + 无环境变量 → 空注册表；首个热加载系统无条件成为默认
+        let cfg = test_cfg(vec![]);
+        let specs = load_specs(&cfg).unwrap();
+        assert!(specs.is_empty(), "未配置模式应得到空系统集合");
+        let reg = build_registry_all_lazy(specs, &cfg).unwrap();
+        assert!(reg.default().is_none(), "空注册表无默认系统");
+        assert!(reg.names().is_empty());
+
+        let toml = "[systems]\n[systems.a4h]\nashost=\"h\"\nsysnr=\"00\"\nuser=\"u\"\npasswd=\"p\"";
+        let file: SystemsFile = toml::from_str(toml).unwrap();
+        let (name, raw) = file.systems.iter().next().unwrap();
+        let spec = build_spec(name, raw).unwrap();
+        let handle = make_handle(&spec, &cfg, false).unwrap();
+        reg.add_system(handle, false); // 即便 make_default=false，无默认时也提升
+        assert_eq!(reg.default().unwrap().name, "a4h");
+        assert!(reg.resolve("a4h").is_some());
+        assert_eq!(reg.names(), vec!["a4h".to_string()]);
+
+        // 第二个系统 make_default=true → 取代默认
+        let toml2 =
+            "[systems]\n[systems.prd]\nashost=\"h2\"\nsysnr=\"01\"\nuser=\"u\"\npasswd=\"p\"";
+        let file2: SystemsFile = toml::from_str(toml2).unwrap();
+        let (name2, raw2) = file2.systems.iter().next().unwrap();
+        let spec2 = build_spec(name2, raw2).unwrap();
+        reg.add_system(make_handle(&spec2, &cfg, false).unwrap(), true);
+        assert_eq!(reg.default().unwrap().name, "prd");
+        assert_eq!(reg.names().len(), 2);
     }
 
     #[test]

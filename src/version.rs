@@ -44,26 +44,36 @@ pub async fn gateway_info(state: &SharedState) -> Value {
     let mut out = local_info();
     // latest 与 SAP 块独立：任一不可用不影响另一个
     out["latest"] = latest_json().await;
-    match fetch_cached_sap_info(state.default()).await {
-        Ok(info) => {
-            out["sap"] = sap_info_json(&info, SAP_CLIENT.get().cloned().unwrap_or_default());
-        }
-        Err(e) => {
+    match state.default() {
+        Some(default) => match fetch_cached_sap_info(&default).await {
+            Ok(info) => {
+                out["sap"] = sap_info_json(&info, SAP_CLIENT.get().cloned().unwrap_or_default());
+            }
+            Err(e) => {
+                out["sap"] = Value::Null;
+                out["sap_error"] = json!(e.message);
+            }
+        },
+        // 未配置模式：不是 SAP 故障，是还没有任何系统——指路 setup 引导
+        None => {
             out["sap"] = Value::Null;
-            out["sap_error"] = json!(e.message);
+            out["sap_error"] =
+                json!("网关未配置任何 SAP 系统（未配置模式）；引导式配置见 GET /api/setup");
         }
     }
     // 全量系统块：并行取各系统信息（每系统首取 ≤10s，并行后整体 ≤10s）
     let handles = state.list();
+    let default = state.default();
     let infos = futures_join_all(handles).await;
     let mut systems = serde_json::Map::new();
     for (sys, info) in infos {
+        let is_default = default.as_ref().is_some_and(|d| Arc::ptr_eq(&sys, d));
         match info {
             Ok(i) => {
                 systems.insert(
                     sys.name.clone(),
                     json!({
-                        "default": Arc::ptr_eq(&sys, state.default()),
+                        "default": is_default,
                         "read_only": sys.read_only,
                         "adt": sys.adt.is_some(),
                         "quarantined": sys.is_quarantined(),
@@ -79,7 +89,7 @@ pub async fn gateway_info(state: &SharedState) -> Value {
                 systems.insert(
                     sys.name.clone(),
                     json!({
-                        "default": Arc::ptr_eq(&sys, state.default()),
+                        "default": is_default,
                         "read_only": sys.read_only,
                         "adt": sys.adt.is_some(),
                         "quarantined": sys.is_quarantined(),
@@ -151,6 +161,8 @@ pub fn local_info() -> Value {
             "adt": crate::adt::capabilities_adt_enabled(),
             // true = API 注册表已启用（GET /api/registry；Agent 跨会话记忆）
             "registry": crate::registry::is_enabled(),
+            // true = 引导式配置可写（POST /api/setup/system；SAP_SETUP=off 关闭）
+            "setup": crate::setup::is_enabled(),
             // 按 IP 每秒请求上限；null = 不限流
             "rate_limit_rps": crate::server::rate_limit_rps(),
         },

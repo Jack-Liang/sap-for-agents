@@ -186,11 +186,16 @@ All configuration goes through environment variables, written to `.env` in the p
 
 | Variable | Required | Default | Description |
 |---|:---:|---|---|
-| `SAP_ASHOST` | ✅ | — | SAP application server hostname/IP |
-| `SAP_SYSNR` | ✅ | — | System number, e.g. `00` |
-| `SAP_CLIENT` | ✅ | — | Client number, e.g. `001` |
-| `SAP_USER` | ✅ | — | Logon account |
-| `SAP_PASSWD` | ✅ | — | Logon password |
+| `SAP_ASHOST` | ✅* | — | SAP application server hostname/IP |
+| `SAP_SYSNR` | ✅* | — | System number, e.g. `00` |
+| `SAP_CLIENT` | ✅* | — | Client number, e.g. `001` |
+| `SAP_USER` | ✅* | — | Logon account |
+| `SAP_PASSWD` | ✅* | — | Logon password |
+
+> \* The five connection vars are **all-or-nothing**: all set → single system (or `.env` globals when `sap_systems.toml` exists); **none** set and no `sap_systems.toml` → the gateway still starts in **unconfigured mode** (business endpoints answer `503 SYSTEM_NOT_CONFIGURED`) and can be configured through the [guided setup](#guided-setup-v017) API. A partially filled set is still a startup error.
+
+| Variable | Required | Default | Description |
+|---|:---:|---|---|
 | `SAP_LANG` | ❌ | `EN` | Logon language (also sets the default language for doc endpoints) |
 | `SAP_LISTEN_ADDR` | ❌ | `127.0.0.1:3000` | HTTP service listen address |
 | `SAP_POOL_SIZE` | ❌ | `8` | SAP connection pool cap (number of concurrent calls), ≥1 |
@@ -204,8 +209,28 @@ All configuration goes through environment variables, written to `.env` in the p
 | `SAP_ROLE` | ❌ | `client` | Run mode: `client`/`server`/`both` (server mode: see [§9](#9-server-mode-called-by-sap)) |
 | `SAP_SDK_DIR` | ❌ | `./nwrfcsdk` | SDK root directory (for Docker/CI/custom paths) |
 | `SAP_SYSTEMS_FILE` | ❌ | `./sap_systems.toml` | Multi-system config file (v0.16). Absent → single system synthesized from the `SAP_*` vars above (behavior identical to previous versions). Present → the set of systems is defined entirely by this file (the `SAP_ASHOST` family in `.env` is ignored; a startup log line notes this). See [Multiple systems](#multiple-systems-v016) below |
+| `SAP_SETUP` | ❌ | _(on)_ | Guided-setup switch (v0.17): `off`/`false`/`0`/`no` disables `POST /api/setup/system` (the write side of agent-guided configuration returns `403 SETUP_DISABLED`; the public `GET /api/setup` status stays). Lock down locked-down deployments |
+| `SAP_OPEN_BROWSER` | ❌ | _(on)_ | Auto-open the guided-setup page in the default browser (v0.17). Only ever fires in **unconfigured mode** (double-click the downloaded binary → browser opens `http://127.0.0.1:3000/setup` with copyable agent-handoff text); configured deployments never pop a browser. `off` disables for headless/server runs |
 
 > **Production deployment tip**: do not bake `.env` into the image layer. Use your orchestration system's secret injection (K8s Secret / Docker Swarm secret) instead.
+
+### Guided setup (v0.17)
+
+You no longer need a config file to boot. With no `sap_systems.toml` and no `SAP_*` connection vars the gateway starts in **unconfigured mode** — alive and listening, business endpoints answering `503 SYSTEM_NOT_CONFIGURED` — and an agent (or you) can configure it over HTTP:
+
+```bash
+# What's missing + the field checklist to interview the user with (public)
+curl http://127.0.0.1:3000/api/setup
+
+# Write a system: validated → real test connection → persisted → hot-loaded, no restart
+curl -X POST http://127.0.0.1:3000/api/setup/system -H "Content-Type: application/json" \
+  -d '{"name":"a4h","ashost":"vhcala4h","sysnr":"00","client":"001",
+       "user":"developer","passwd":"${SAP_A4H_PASSWD}"}'
+```
+
+The write is fail-safe by construction: nothing hits disk until the connection parameters are validated **and** a real RFC connection succeeds (bad host/password → `502 SETUP_CONNECT_FAILED`, file untouched). Success appends to `sap_systems.toml` (existing entries preserved) and hot-loads the system immediately; the first system becomes the default, more can be added the same way later. Errors: `409 SETUP_NAME_EXISTS` / `409 SYSTEM_SYSID_CONFLICT`, `403 SETUP_DISABLED` (deployer set `SAP_SETUP=off`). The full agent workflow is documented in [AGENTS.md](./AGENTS.md) → "First-run setup".
+
+**Zero-click onboarding**: on a desktop machine, unzipping the prebuilt binary and double-clicking it is the whole story — the gateway starts unconfigured, **automatically opens your browser** at `http://127.0.0.1:3000/setup`, and that page hands you a copy-paste message for your AI assistant (the address is filled in automatically). Paste it to Claude Code / Cursor / Copilot CLI and answer its questions; the page turns green the moment the system goes live. `SAP_OPEN_BROWSER=off` suppresses the popup (servers/headless); configured deployments never auto-open.
 
 ### Multiple systems (v0.16)
 

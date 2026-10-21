@@ -1,0 +1,236 @@
+<!doctype html>
+<html lang="zh" class="light">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>首次配置引导 · sap-for-agents</title>
+<script src="https://cdn.tailwindcss.com?plugins=forms,container-queries"></script>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@500;700&family=Space+Grotesk:wght@600;700&family=Geist:wght@400&display=swap" rel="stylesheet"/>
+<script>
+tailwind.config = {
+    darkMode: "class",
+    theme: {
+        extend: {
+            colors: {
+                "on-background": "#191c1e",
+                "surface-bright": "#f7f9fb",
+                "surface-container-low": "#f2f4f6",
+                "primary-container": "#06b6d4",
+                "surface-container-lowest": "#ffffff",
+                "primary": "#00687a",
+                "primary-fixed": "#acedff",
+                "surface-container": "#eceef0",
+                "outline": "#6d797d",
+                "on-surface-variant": "#3d494c",
+                "secondary": "#8127cf",
+                "on-secondary": "#ffffff",
+                "outline-variant": "#bcc9cd",
+                "error": "#ba1a1a",
+                "background": "#f7f9fb",
+                "surface-container-high": "#e6e8ea",
+                "on-primary": "#ffffff",
+                "surface": "#f7f9fb",
+                "surface-container-highest": "#e0e3e5"
+            },
+            fontFamily: {
+                "display-lg": ["Space Grotesk", "sans-serif"],
+                "headline-md": ["Space Grotesk", "sans-serif"],
+                "body-lg": ["Geist", "sans-serif"],
+                "body-md": ["Geist", "sans-serif"],
+                "code-md": ["JetBrains Mono", "monospace"],
+                "code-sm": ["JetBrains Mono", "monospace"]
+            },
+            fontSize: {
+                "code-md": ["13px", { lineHeight: "20px", fontWeight: "400" }],
+                "body-sm": ["13px", { lineHeight: "18px", fontWeight: "400" }],
+                "body-lg": ["16px", { lineHeight: "24px", fontWeight: "400" }],
+                "display-lg": ["40px", { lineHeight: "1.1", letterSpacing: "-0.02em", fontWeight: "700" }],
+                "body-md": ["15px", { lineHeight: "22px", fontWeight: "400" }],
+                "headline-md": ["24px", { lineHeight: "32px", letterSpacing: "-0.01em", fontWeight: "600" }]
+            }
+        }
+    }
+};
+</script>
+<style>
+    /* 与 index.zh.html 同一套视觉基调：蓝图网格 + 网格辉光 + 玻璃卡片 */
+    .blueprint-bg {
+        background-image:
+            linear-gradient(to right, rgba(109, 121, 125, 0.06) 1px, transparent 1px),
+            linear-gradient(to bottom, rgba(109, 121, 125, 0.06) 1px, transparent 1px);
+        background-size: 24px 24px;
+    }
+    .mesh-gradient {
+        background:
+            radial-gradient(circle at 15% 10%, rgba(6, 182, 212, 0.10) 0%, transparent 40%),
+            radial-gradient(circle at 85% 90%, rgba(156, 72, 234, 0.10) 0%, transparent 40%);
+    }
+    .bento-card {
+        background: rgba(255, 255, 255, 0.8);
+        backdrop-filter: blur(16px);
+        -webkit-backdrop-filter: blur(16px);
+        border: 1px solid rgba(226, 232, 240, 0.6);
+        border-radius: 0.5rem;
+        padding: 24px;
+    }
+</style>
+</head>
+<body class="font-body-md min-h-screen flex flex-col blueprint-bg mesh-gradient">
+
+<nav class="fixed top-0 w-full z-50 bg-surface/80 backdrop-blur-md border-b border-outline-variant/30">
+    <div class="flex justify-between items-center px-6 h-16 max-w-3xl mx-auto">
+        <a href="/" class="font-bold text-[20px] font-bold text-primary tracking-tighter" style="font-family:'Space Grotesk',sans-serif">sap-for-agents</a>
+        <div class="flex items-center gap-3">
+            <div class="flex items-center gap-1 text-[12px]" style="font-family:'JetBrains Mono',monospace">
+                <a href="/setup?lang=en" class="text-on-surface-variant hover:text-primary transition-colors">English</a>
+                <span class="text-on-surface-variant/50">/</span>
+                <a href="/setup?lang=zh" class="text-primary font-bold">中文</a>
+            </div>
+            <div class="flex items-center gap-1.5 px-2 py-0.5 bg-surface-container-high rounded-full" id="status-pill">
+                <span id="status-dot" class="w-2 h-2 rounded-full bg-amber-400 animate-pulse"></span>
+                <span id="status-text" class="text-[12px] text-on-surface-variant" style="font-family:'JetBrains Mono',monospace">检查中…</span>
+            </div>
+        </div>
+    </div>
+</nav>
+
+<main class="flex-grow pt-28 pb-12 px-6 max-w-3xl mx-auto w-full">
+
+    <section class="mb-8">
+        <h1 class="text-[34px] font-bold text-on-background mb-2 tracking-tighter" style="font-family:'Space Grotesk',sans-serif">首次配置引导</h1>
+        <p class="text-body-lg text-on-surface-variant">网关已在本地运行，但还没有配置任何 SAP 系统。把下面这段话交给你的 AI 助手，它会引导你完成剩下的配置——大约需要回答 5 个问题。</p>
+    </section>
+
+    <!-- 复制给 Agent 的交接文字 -->
+    <section class="bento-card mb-6" id="handoff-card">
+        <div class="flex items-center justify-between mb-3">
+            <h2 class="text-[18px] font-semibold text-on-background" style="font-family:'Space Grotesk',sans-serif">① 复制这段话，发给你的 AI 助手</h2>
+            <button id="copy-btn" class="px-4 py-1.5 bg-primary text-on-primary rounded text-[13px] font-bold hover:opacity-90 transition-opacity" style="font-family:'JetBrains Mono',monospace">复制</button>
+        </div>
+        <pre id="handoff-text" class="text-[13px] leading-[20px] bg-surface-container-low border border-outline-variant/40 rounded p-4 overflow-x-auto whitespace-pre-wrap" style="font-family:'JetBrains Mono',monospace"></pre>
+        <p class="text-[12px] text-on-surface-variant mt-2">适用于本机运行的 AI 助手（Claude Code / Cursor / Copilot CLI 等）。内容已自动填入本网关地址。</p>
+    </section>
+
+    <!-- 接下来会发生什么 -->
+    <section class="bento-card mb-6">
+        <h2 class="text-[18px] font-semibold text-on-background mb-3" style="font-family:'Space Grotesk',sans-serif">② 接下来会发生什么</h2>
+        <ol class="space-y-2 text-body-md text-on-surface-variant list-decimal list-inside">
+            <li>AI 助手向网关询问需要哪些字段，然后向你提问：SAP 服务器地址、系统号、客户端、账号、密码，以及一个简短的系统名。</li>
+            <li>它把信息提交给网关——<strong class="text-on-background">网关会先真实试连一次</strong>，连不上不会保存，你不会得到一个坏配置。</li>
+            <li>试连通过后配置立即生效（<strong class="text-on-background">无需重启</strong>），本页面会自动变成绿色。</li>
+        </ol>
+        <p class="text-[12px] text-on-surface-variant mt-3">提示：密码支持 <code class="bg-surface-container px-1 rounded" style="font-family:'JetBrains Mono',monospace">${环境变量名}</code> 引用形式，让密文留在环境变量里、不进入对话记录。</p>
+    </section>
+
+    <!-- 手工配置（可折叠） -->
+    <section class="bento-card mb-6">
+        <details>
+            <summary class="text-[15px] font-semibold text-on-background cursor-pointer select-none" style="font-family:'Space Grotesk',sans-serif">不想用 AI？手工配置（点击展开）</summary>
+            <div class="mt-4 space-y-3 text-body-md text-on-surface-variant">
+                <p>在网关运行目录创建 <code class="bg-surface-container px-1 rounded" style="font-family:'JetBrains Mono',monospace">sap_systems.toml</code>（模板见 <code style="font-family:'JetBrains Mono',monospace">sap_systems.toml.example</code>）：</p>
+                <pre class="text-[13px] leading-[20px] bg-surface-container-low border border-outline-variant/40 rounded p-4 overflow-x-auto" style="font-family:'JetBrains Mono',monospace">[systems.a4h]
+ashost  = "你的SAP服务器地址"
+sysnr   = "00"
+client  = "001"
+user    = "账号"
+passwd  = "密码"
+default = true</pre>
+                <p>保存后重启网关即可。或者直接 curl 一行完成（网关会先试连再落盘）：</p>
+                <pre class="text-[13px] leading-[20px] bg-surface-container-low border border-outline-variant/40 rounded p-4 overflow-x-auto" style="font-family:'JetBrains Mono',monospace">curl -X POST http://127.0.0.1:3000/api/setup/system \
+  -H "Content-Type: application/json" \
+  -d '{"name":"a4h","ashost":"主机","sysnr":"00","client":"001","user":"账号","passwd":"密码"}'</pre>
+            </div>
+        </details>
+    </section>
+
+    <!-- 配置完成（初始隐藏） -->
+    <section class="bento-card mb-6 hidden" id="done-card" style="border-color:#16a34a">
+        <div class="flex items-center gap-3 mb-3">
+            <span class="w-3 h-3 rounded-full bg-green-500"></span>
+            <h2 class="text-[18px] font-semibold text-on-background" style="font-family:'Space Grotesk',sans-serif">配置完成，网关已就绪</h2>
+        </div>
+        <div id="done-systems" class="text-body-md text-on-surface-variant mb-4"></div>
+        <div class="flex gap-3">
+            <a href="/" class="px-4 py-2 bg-primary text-on-primary rounded text-[13px] font-bold hover:opacity-90 transition-opacity" style="font-family:'JetBrains Mono',monospace">打开首页</a>
+            <a href="/docs" class="px-4 py-2 border border-primary text-primary rounded text-[13px] font-bold hover:bg-surface-container transition-colors" style="font-family:'JetBrains Mono',monospace">API 文档</a>
+        </div>
+    </section>
+
+</main>
+
+<footer class="pb-8 text-center text-[12px] text-on-surface-variant/70">
+    <a href="/agents.md" class="hover:text-primary transition-colors">Agent 文档</a> ·
+    <a href="/openapi.json" class="hover:text-primary transition-colors">OpenAPI</a> ·
+    <a href="https://github.com/Jack-Liang/sap-for-agents" class="hover:text-primary transition-colors">GitHub</a>
+</footer>
+
+<script type="text/plain" id="handoff-tpl">我刚在本机启动了 sap-for-agents（SAP NWRFC → REST 网关），还没有配置任何 SAP 系统。网关地址：{{ORIGIN}}
+
+请引导我完成首次配置，步骤如下：
+1. GET {{ORIGIN}}/api/setup —— 查看配置状态，以及「需要向我询问哪些字段」的清单；
+2. 按清单向我询问 SAP 连接信息：应用服务器主机（ashost）、系统号（sysnr）、客户端（client）、账号（user）、密码（passwd），外加一个简短的小写系统名（如 a4h）；
+3. 密码请建议我用 ${环境变量名} 引用形式提供（例如 ${SAP_A4H_PASSWD}），避免明文出现在对话里——网关建立连接时才做插值；
+4. 把采集到的信息 POST 到 {{ORIGIN}}/api/setup/system（JSON 字段：name/ashost/sysnr/client/user/passwd）。网关会先真实试连一次，连不上不会落盘——把失败原因转述给我，修正后重试即可；
+5. 成功后 GET {{ORIGIN}}/api/systems 确认系统已上线，然后告诉我网关可以开始使用了。
+
+补充：你的完整工作文档在 {{ORIGIN}}/agents.md（需要更多端点能力时再读）。</script>
+
+<script>
+(function () {
+    var ORIGIN = window.location.origin;
+    // 交接文字：模板填入实际地址
+    var tpl = document.getElementById('handoff-tpl').textContent;
+    var handoff = tpl.replace(/\{\{ORIGIN\}\}/g, ORIGIN);
+    document.getElementById('handoff-text').textContent = handoff;
+
+    // 复制按钮（127.0.0.1 是可信来源，clipboard API 可用；留 execCommand 兜底）
+    var btn = document.getElementById('copy-btn');
+    btn.addEventListener('click', function () {
+        function ok() {
+            btn.textContent = '✓ 已复制';
+            setTimeout(function () { btn.textContent = '复制'; }, 2000);
+        }
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+            navigator.clipboard.writeText(handoff).then(ok, fallback);
+        } else { fallback(); }
+        function fallback() {
+            var ta = document.createElement('textarea');
+            ta.value = handoff;
+            document.body.appendChild(ta);
+            ta.select();
+            try { document.execCommand('copy'); ok(); } catch (e) { /* 选区兜底 */ }
+            document.body.removeChild(ta);
+        }
+    });
+
+    // 实时状态：未配置 → 每 3s 轮询；配置成功后切绿并停止
+    var dot = document.getElementById('status-dot');
+    var text = document.getElementById('status-text');
+    var timer = null;
+    function refresh() {
+        fetch('/api/setup').then(function (r) { return r.json(); }).then(function (v) {
+            if (v.configured) {
+                dot.className = 'w-2 h-2 rounded-full bg-green-500';
+                dot.removeAttribute('style');
+                text.textContent = '已配置';
+                document.getElementById('handoff-card').classList.add('hidden');
+                var names = (v.systems || []).join('、');
+                document.getElementById('done-systems').textContent =
+                    '已连接的系统：' + names + '。无前缀路径走默认系统；按系统访问用 /api/s/{系统名}/...。';
+                document.getElementById('done-card').classList.remove('hidden');
+                if (timer) { clearInterval(timer); timer = null; }
+            } else {
+                dot.className = 'w-2 h-2 rounded-full bg-amber-400 animate-pulse';
+                text.textContent = v.writable ? '待配置' : '待配置（写入已禁用）';
+                timer = timer || setInterval(refresh, 3000);
+            }
+        }).catch(function () {
+            text.textContent = '网关无响应';
+            timer = timer || setInterval(refresh, 3000);
+        });
+    }
+    refresh();
+})();
+</script>
+</body>
+</html>

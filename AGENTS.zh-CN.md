@@ -29,6 +29,7 @@ curl -H "Authorization: Bearer <SAP_API_KEY>" http://127.0.0.1:3000/api/function
 
 | 目标 | 用哪个端点 |
 |------|-----------|
+| 网关还没配置过（首次启动）→ **引导式配置**：拿「该问用户什么」清单，采集后写入并热加载 | `GET /api/setup`（公开）→ `POST /api/setup/system` |
 | 新会话先**列系统清单**（多系统部署；单系统只返回一条——见下文「多系统」节） | `GET /api/systems`（公开） |
 | 新会话先**查注册表**：Agent 建过哪些接口的跨会话记忆（别名、意图、踩坑记录、调用示例） | `GET /api/registry` |
 | 想发布/完善某个接口的契约（intent / notes / example） | `PUT /api/registry/{alias}` |
@@ -64,6 +65,37 @@ curl -H "Authorization: Bearer <SAP_API_KEY>" http://127.0.0.1:3000/api/function
 | 你是 MCP 客户端（Claude 等）——把网关挂载为 MCP 工具服务器 | `POST /mcp`（Streamable HTTP 无状态） |
 | 人类友好的交互式 API 文档 | `GET /docs`（Redoc 渲染规范） |
 
+## 首次启动引导（Agent 引导配置）
+
+全新部署（无 `sap_systems.toml`、无 `SAP_*` 连接环境变量）**照样启动监听**——配置完成前所有 SAP 业务端点统一返回 `503 SYSTEM_NOT_CONFIGURED`。看到这个状态就是你去引导用户的信号：
+
+```bash
+# 1. 探明状态：缺什么、该问用户哪些字段、写入是否允许
+curl http://127.0.0.1:3000/api/setup
+# → {"configured":false,"writable":true,"fields":[{"name":"ashost","required":"直连形态必填",...},...],
+#    "example":{...},"connection_forms":{...}}
+
+# 2. 按 fields 清单向用户采集：简短系统名（小写，如 a4h）、ashost/sysnr/client、
+#    账号、密码。密码建议让用户提供 ${VAR} 环境变量引用——明文不落对话、
+#    不落日志，连接时才从环境变量插值。
+
+# 3. 提交：校验 → 真实试连 → 落盘 → 热加载（无需重启）
+curl -X POST http://127.0.0.1:3000/api/setup/system -H "Content-Type: application/json" \
+  -d '{"name":"a4h","ashost":"vhcala4h","sysnr":"00","client":"001",
+       "user":"DEVELOPER","passwd":"${SAP_A4H_PASSWD}"}'
+# → {"saved":true,"default":true,"file":"sap_systems.toml",
+#    "connection":{"tested":true,"sysid":"A4H","release":"753",...},"systems_count":1,...}
+
+# 4. 确认——网关此刻起完全可用
+curl http://127.0.0.1:3000/api/systems
+```
+
+- 请求体字段与 `sap_systems.toml` 的 `[systems.{name}]` 表一一对应（未知键 → 422 拦拼写错误）；负载均衡连接不用 ashost/sysnr，改传 `conn: {"MSHOST": "...", "R3NAME": "...", "GROUP": "..."}`。
+- 人类交接：桌面机器上未配置启动会自动在浏览器打开 `/setup` 引导页，页面提供一段复制即用的交接文字（描述的就是本流程，地址已填好）。用户把那段话粘给你时，直接按上面的步骤执行即可。
+- **落盘前先真实试连**——主机/账号/密码不对返回 `502 SETUP_CONNECT_FAILED`（或 `SETUP_CONNECT_TIMEOUT`），什么都不会写入。`test:false` 跳过试连（离线预配置场景，自担风险）。
+- 成功 = 写入 `sap_systems.toml` **并热加载**。首个系统无条件成为默认系统；之后可用同样方式追加系统（`default:true` 可切换默认）。若网关此前跑在环境变量配置上，该系统也会一并写入文件——重启后系统集合不变。
+- `409 SETUP_NAME_EXISTS` → 换个名字；`409 SYSTEM_SYSID_CONFLICT` → 两个后端共用 SYSID（见「多系统」节）；`403 SETUP_DISABLED` → 部署方设了 `SAP_SETUP=off`，请改手工编辑文件。
+
 ## 标准操作流程
 
 绝大多数任务遵循 **查注册表 → 搜索 → 查接口 → 查文档 → 看源码 → 调用** 六步：
@@ -94,6 +126,7 @@ curl http://127.0.0.1:3000/api/s/prd/ready                # 该系统的 readine
 - 未知系统名 → `404 SYSTEM_UNKNOWN`（错误里附可用清单）。**跨系统对比对象**：同一读取端点换两个作用域各调一次（如 `/api/functions/ZFOO/source` 分别在 a4h 与 prd 下），对结果做 diff。
 - 平坦交付端口 `/api/invokes/{alias}` **按条目记录的 system 路由**（别名是全局命名空间）；显式作用域与条目不符 → `409 SYSTEM_MISMATCH`。`GET /api/registry?system=prd` 按系统过滤。
 - MCP 工具接受可选 `system` 参数（缺省 = 默认系统）。
+- 系统也可以**运行期追加**：`POST /api/setup/system` 校验 → 试连 → 追加进 `sap_systems.toml` → 热加载（见「首次启动引导」节）。无需重启；移除系统仍需编辑文件后重启。
 - **同一系统不同 client**（同 ashost/sysnr、不同 `client`）完全支持：SAP 仓库对象跨 client、签名必然一致，各条目仍有独立的池 / ADT / 注册表命名空间。
 - 硬性限制：**不同后端**共用同一 SYSID（如经不同主机访问的克隆开发容器）会被隔离（`503 SYSTEM_SYSID_CONFLICT`）——SDK 描述符缓存按 SYSID 分区，跨后端的 SYSID 孪生会静默共享错误签名。
 

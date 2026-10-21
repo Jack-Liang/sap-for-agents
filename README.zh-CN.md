@@ -186,11 +186,16 @@ curl -X POST http://127.0.0.1:3000/api/rfc \
 
 | 变量 | 必填 | 默认 | 说明 |
 |---|:---:|---|---|
-| `SAP_ASHOST` | ✅ | — | SAP 应用服务器主机名/IP |
-| `SAP_SYSNR` | ✅ | — | 系统号，如 `00` |
-| `SAP_CLIENT` | ✅ | — | 集团号，如 `001` |
-| `SAP_USER` | ✅ | — | 登录账号 |
-| `SAP_PASSWD` | ✅ | — | 登录密码 |
+| `SAP_ASHOST` | ✅* | — | SAP 应用服务器主机名/IP |
+| `SAP_SYSNR` | ✅* | — | 系统号，如 `00` |
+| `SAP_CLIENT` | ✅* | — | 集团号，如 `001` |
+| `SAP_USER` | ✅* | — | 登录账号 |
+| `SAP_PASSWD` | ✅* | — | 登录密码 |
+
+> \* 五个连接变量**要么全有、要么全无**：全有 → 单系统（或 `sap_systems.toml` 存在时的全局默认）；**全无**且无 `sap_systems.toml` → 网关以**未配置模式**照常启动（业务端点返回 `503 SYSTEM_NOT_CONFIGURED`），可经[引导式配置](#引导式配置-v017) API 完成 配置。缺一部分仍然是启动错误。
+
+| 变量 | 必填 | 默认 | 说明 |
+|---|:---:|---|---|
 | `SAP_LANG` | ❌ | `EN` | 登录语言（也影响文档端点的默认语言） |
 | `SAP_LISTEN_ADDR` | ❌ | `127.0.0.1:3000` | HTTP 服务监听地址 |
 | `SAP_POOL_SIZE` | ❌ | `8` | SAP 连接池上限（并发调用数），≥1 |
@@ -204,8 +209,28 @@ curl -X POST http://127.0.0.1:3000/api/rfc \
 | `SAP_ROLE` | ❌ | `client` | 运行模式：`client`/`server`/`both`（server 模式见 [§9](#9-server-端模式被-sap-调用)） |
 | `SAP_SDK_DIR` | ❌ | `./nwrfcsdk` | SDK 根目录（Docker/CI/自定义路径用） |
 | `SAP_SYSTEMS_FILE` | ❌ | `./sap_systems.toml` | 多系统配置文件（v0.16）。不存在 → 由上面的 `SAP_*` 变量合成单系统（与旧版行为一致）；存在 → 系统集合完全由该文件定义（`.env` 的 `SAP_ASHOST` 一族被忽略，启动日志有提示）。详见下方[多系统](#多系统-v016) |
+| `SAP_SETUP` | ❌ | _(开启)_ | 引导式配置开关（v0.17）：`off`/`false`/`0`/`no` 禁用 `POST /api/setup/system`（Agent 引导配置的写入面返回 `403 SETUP_DISABLED`；公开的 `GET /api/setup` 状态查询保留）。锁定部署可关闭 |
+| `SAP_OPEN_BROWSER` | ❌ | _(开启)_ | 自动在默认浏览器打开引导页（v0.17）。**只在未配置模式**生效（双击下载的二进制 → 浏览器自动打开 `http://127.0.0.1:3000/setup`，页面提供可复制的 Agent 交接文字）；已配置的部署从不弹窗。`off` 关闭（服务器/无头环境） |
 
 > **生产部署提示**：不要把 `.env` 放进镜像层。用容器编排系统的密钥注入（K8s Secret / Docker Swarm secret）替代。
+
+### 引导式配置（v0.17）
+
+启动不再要求先有配置文件。无 `sap_systems.toml` 且无 `SAP_*` 连接变量时，网关以**未配置模式**启动——进程活着、端口监听着，业务端点统一返回 `503 SYSTEM_NOT_CONFIGURED`——随后由 Agent（或你本人）通过 HTTP 完成配置：
+
+```bash
+# 缺什么 + 该问用户哪些字段（公开端点）
+curl http://127.0.0.1:3000/api/setup
+
+# 写入一个系统：校验 → 真实试连 → 落盘 → 热加载，全程无需重启
+curl -X POST http://127.0.0.1:3000/api/setup/system -H "Content-Type: application/json" \
+  -d '{"name":"a4h","ashost":"vhcala4h","sysnr":"00","client":"001",
+       "user":"developer","passwd":"${SAP_A4H_PASSWD}"}'
+```
+
+写入天然防呆：连接参数校验通过**且真实 RFC 建连成功**之前，任何东西都不落盘（主机/密码错误 → `502 SETUP_CONNECT_FAILED`，文件原样未动）。成功后追加进 `sap_systems.toml`（已有条目保留）并立即热加载；首个系统自动成为默认系统，之后可随时同法追加。错误码：`409 SETUP_NAME_EXISTS` / `409 SYSTEM_SYSID_CONFLICT`、`403 SETUP_DISABLED`（部署方设了 `SAP_SETUP=off`）。完整的 Agent 引导流程见 [AGENTS.zh-CN.md](./AGENTS.zh-CN.md) →「首次启动引导」。
+
+**零点击上手**：在桌面机器上，解压预编译二进制后**双击运行**即是全部——网关以未配置模式启动并**自动在浏览器打开** `http://127.0.0.1:3000/setup`，页面上有一段为 AI 助手准备好的复制即用文字（网关地址已自动填入）。把它粘给 Claude Code / Cursor / Copilot CLI，回答几个问题，配置完成的瞬间页面自动变绿。`SAP_OPEN_BROWSER=off` 可关闭弹窗（服务器/无头环境）；已配置的部署从不自动打开。
 
 ### 多系统（v0.16）
 

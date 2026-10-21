@@ -203,6 +203,126 @@ const SPEC_JSON: &str = r##"{
         }
       }
     },
+    "/api/setup": {
+      "get": {
+        "tags": [
+          "ops"
+        ],
+        "summary": "Guided-setup status and field checklist (public)",
+        "description": "v0.17: first-run onboarding for agents. When the gateway starts with no sap_systems.toml and no SAP_* connection env vars, it still listens (unconfigured mode): business endpoints return 503 SYSTEM_NOT_CONFIGURED and this endpoint tells an agent how to proceed — whether a config is in place, where the config file lives, whether setup writes are allowed (SAP_SETUP=off disables), and a `fields` checklist (name/ashost/sysnr/client/user/passwd/...) to interview the user with. POST /api/setup/system then validates, optionally test-connects, persists sap_systems.toml and hot-loads the system without a restart.",
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "Setup status + interview field schema"
+          }
+        }
+      }
+    },
+    "/api/setup/system": {
+      "post": {
+        "tags": [
+          "ops"
+        ],
+        "summary": "Add an SAP system (guided setup: validate → test-connect → persist → hot-load)",
+        "description": "v0.17: agent-guided configuration write. Body fields mirror one [systems.{name}] table of sap_systems.toml (unknown keys are rejected). Flow: build_spec validation (same rules as startup parsing, incl. ${VAR} interpolation) → real test connection (RFC open + system info; skipped with `test:false`) → SYSID conflict check → persist to sap_systems.toml (existing entries preserved; env-synthesized default system persisted on first write) → hot-load into the running gateway. The first system always becomes the default. 400 SETUP_PARAM_INVALID / 409 SETUP_NAME_EXISTS or SYSTEM_SYSID_CONFLICT / 403 SETUP_DISABLED (SAP_SETUP=off) / 502 SETUP_CONNECT_FAILED (nothing persisted).",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "name"
+                ],
+                "properties": {
+                  "name": {
+                    "type": "string",
+                    "description": "System name (URL segment /api/s/{name}/...): 1-32 chars, lowercase/digits/-/_"
+                  },
+                  "ashost": {
+                    "type": "string",
+                    "description": "Application server host (direct form; or use conn.MSHOST for load balancing)"
+                  },
+                  "sysnr": {
+                    "type": "string",
+                    "description": "System number (two digits, e.g. 00) — required with ashost"
+                  },
+                  "client": {
+                    "type": "string",
+                    "description": "Logon client (three digits)"
+                  },
+                  "user": {
+                    "type": "string",
+                    "description": "SAP logon user (required)"
+                  },
+                  "passwd": {
+                    "type": "string",
+                    "description": "SAP password; supports ${VAR} env-var indirection (recommended)"
+                  },
+                  "lang": {
+                    "type": "string",
+                    "description": "Logon language (default EN)"
+                  },
+                  "default": {
+                    "type": "boolean",
+                    "description": "Make this the default system (the first system always becomes default)"
+                  },
+                  "test": {
+                    "type": "boolean",
+                    "description": "Test-connect before persisting (default true; false = offline pre-provisioning, unverified)"
+                  },
+                  "conn": {
+                    "type": "object",
+                    "additionalProperties": {
+                      "type": "string"
+                    },
+                    "description": "Free-form SDK connection params (upper-cased, passed through): MSHOST/R3NAME/GROUP for load-balanced connections"
+                  },
+                  "read_only": {
+                    "type": "boolean"
+                  },
+                  "pool_size": {
+                    "type": "integer"
+                  },
+                  "idle_validate_secs": {
+                    "type": "integer"
+                  },
+                  "request_timeout_secs": {
+                    "type": "integer"
+                  },
+                  "adt_base_url": {
+                    "type": "string"
+                  },
+                  "adt_user": {
+                    "type": "string"
+                  },
+                  "adt_passwd": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Saved + hot-loaded (connection block carries sysid/release when tested)"
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          },
+          "502": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
     "/api/rfc": {
       "post": {
         "tags": [
@@ -3069,7 +3189,7 @@ pub fn build_spec(base_url: &str, auth_enabled: bool) -> Value {
     spec
 }
 
-/// 给 spec 里全部 `/api/*` operation 打上 bearerAuth 标记（`/api/version` 公开例外）。
+/// 给 spec 里全部 `/api/*` operation 打上 bearerAuth 标记（`/api/version` 等公开例外）。
 /// build_spec 与动态合并（/api/openapi、注册表目录）共用，保证鉴权模式下
 /// 生成器产出的客户端会带 token。
 fn mark_api_security(spec: &mut Value) {
@@ -3078,9 +3198,13 @@ fn mark_api_security(spec: &mut Value) {
             if !path.starts_with("/api/") {
                 continue;
             }
-            // /api/version、/api/systems 刻意公开：Agent 需要在拿到 token 之前
-            // 知道 capabilities.auth（要不要 token）与有哪些系统
-            if path == "/api/version" || path == "/api/systems" {
+            // /api/version、/api/systems、/api/setup 刻意公开：Agent 需要在拿到
+            // token 之前知道 capabilities.auth（要不要 token）、有哪些系统、
+            // 以及未配置模式下如何引导配置
+            if path.as_str() == "/api/version"
+                || path.as_str() == "/api/systems"
+                || path.as_str() == "/api/setup"
+            {
                 continue;
             }
             if let Some(ops) = item.as_object_mut() {

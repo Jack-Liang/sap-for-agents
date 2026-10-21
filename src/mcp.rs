@@ -342,7 +342,12 @@ fn tool_system(
             ),
             key: "SYSTEM_UNKNOWN".into(),
         }),
-        None => Ok(state.default().clone()),
+        None => state.default().ok_or_else(|| RfcError {
+            code: -1,
+            status: 503,
+            message: "网关尚未配置任何 SAP 系统（未配置模式）。引导式配置见 GET /api/setup".into(),
+            key: "SYSTEM_NOT_CONFIGURED".into(),
+        }),
     }
 }
 
