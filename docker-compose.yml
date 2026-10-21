@@ -32,8 +32,11 @@ services:
 
     # 运行时挂载宿主机 SDK（镜像本身不含 SDK，避免版权问题）
     # SAP_SDK_HOST_PATH 在 .env 中配置
+    # 多系统（v0.16，可选）：宿主机放好 sap_systems.toml 后取消下行注释；
+    # 密码用 ${VAR} 插值引用 environment 里的密钥即可
     volumes:
       - ${SAP_SDK_HOST_PATH:-./nwrfcsdk}:/app/nwrfcsdk:ro
+      # - ./sap_systems.toml:/app/sap_systems.toml:ro
 
     ports:
       - "${SAP_HOST_PORT:-3000}:3000"

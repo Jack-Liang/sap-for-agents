@@ -29,6 +29,7 @@ curl -H "Authorization: Bearer <SAP_API_KEY>" http://127.0.0.1:3000/api/function
 
 | 目标 | 用哪个端点 |
 |------|-----------|
+| 新会话先**列系统清单**（多系统部署；单系统只返回一条——见下文「多系统」节） | `GET /api/systems`（公开） |
 | 新会话先**查注册表**：Agent 建过哪些接口的跨会话记忆（别名、意图、踩坑记录、调用示例） | `GET /api/registry` |
 | 想发布/完善某个接口的契约（intent / notes / example） | `PUT /api/registry/{alias}` |
 | 外部系统/前端想调用注册接口且**免学 SAP 方言**（扁平 JSON 进出） | `POST /api/invokes/{alias}` |
@@ -77,6 +78,23 @@ curl -H "Authorization: Bearer <SAP_API_KEY>" http://127.0.0.1:3000/api/function
 ```
 
 > 不要跳过第 2 步直接调用——SAP 参数名区分大小写且必须大写，类型（CHAR/INT/BCD...）决定如何传值。先查接口能避免 90% 的传参错误。
+
+## 多系统
+
+网关可以**同时连接多个 SAP 系统**（部署方通过 `sap_systems.toml` 配置）。所有 `/api/*` 业务端点不写前缀 = **默认系统**（行为与单系统完全一致）；每个端点都有**作用域形态**——在 `/api` 前缀的位置插入 `/api/s/{系统名}`：
+
+```bash
+curl http://127.0.0.1:3000/api/s/prd/rfc                  # POST → 在 prd 系统上调用
+curl http://127.0.0.1:3000/api/s/prd/functions/BAPI_USER_GETLIST
+curl http://127.0.0.1:3000/api/s/a4h/dumps/grouped
+curl http://127.0.0.1:3000/api/s/prd/ready                # 该系统的 readiness
+```
+
+- 会话第一步 `GET /api/systems`：列出各系统（`name`、是否 `default`、`read_only`、`adt`、`sysid`、`quarantined`）。单系统部署只返回一条，忽略作用域即可。
+- 未知系统名 → `404 SYSTEM_UNKNOWN`（错误里附可用清单）。**跨系统对比对象**：同一读取端点换两个作用域各调一次（如 `/api/functions/ZFOO/source` 分别在 a4h 与 prd 下），对结果做 diff。
+- 平坦交付端口 `/api/invokes/{alias}` **按条目记录的 system 路由**（别名是全局命名空间）；显式作用域与条目不符 → `409 SYSTEM_MISMATCH`。`GET /api/registry?system=prd` 按系统过滤。
+- MCP 工具接受可选 `system` 参数（缺省 = 默认系统）。
+- 硬性限制：两个系统的 **SYSID 相同**（如克隆的开发容器）会被隔离（`503 SYSTEM_SYSID_CONFLICT`）——SDK 描述符缓存按 SYSID 分区，同 SYSID 会静默共享错误签名。
 
 ## 端点速查（含可复制的示例）
 

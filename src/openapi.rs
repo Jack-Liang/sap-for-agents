@@ -188,6 +188,21 @@ const SPEC_JSON: &str = r##"{
         }
       }
     },
+    "/api/systems": {
+      "get": {
+        "tags": [
+          "ops"
+        ],
+        "summary": "List connected SAP systems (multi-system, public)",
+        "description": "v0.16: the gateway can connect to several SAP systems at once (sap_systems.toml). This endpoint lists them — name, whether default, read_only, adt enabled, sysid (once connected), quarantined. Every /api/* endpoint also has a scoped form: /api/s/{system}/... (e.g. POST /api/s/prd/rfc) targets that system; unprefixed paths hit the default. Single-system deployments list one entry.",
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "System inventory"
+          }
+        }
+      }
+    },
     "/api/rfc": {
       "post": {
         "tags": [
@@ -3063,9 +3078,9 @@ fn mark_api_security(spec: &mut Value) {
             if !path.starts_with("/api/") {
                 continue;
             }
-            // /api/version 刻意公开：Agent 需要在拿到 token 之前知道
-            // capabilities.auth（要不要 token）
-            if path == "/api/version" {
+            // /api/version、/api/systems 刻意公开：Agent 需要在拿到 token 之前
+            // 知道 capabilities.auth（要不要 token）与有哪些系统
+            if path == "/api/version" || path == "/api/systems" {
                 continue;
             }
             if let Some(ops) = item.as_object_mut() {

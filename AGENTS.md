@@ -29,6 +29,7 @@ curl -H "Authorization: Bearer <SAP_API_KEY>" http://127.0.0.1:3000/api/function
 
 | Goal | Endpoint |
 |------|-----------|
+| New session → **list connected systems** (multi-system deployments; single-system ones list one entry — see "Multiple systems" below) | `GET /api/systems` (public) |
 | New session → **check the registry first**: cross-session memory of agent-built APIs (alias, intent, pitfalls, example invocations) | `GET /api/registry` |
 | Want to publish/update one API's contract (intent / notes / example) | `PUT /api/registry/{alias}` |
 | External system/frontend wants to call a registered API **without the SAP dialect** (flat JSON in / flat JSON out) | `POST /api/invokes/{alias}` |
@@ -77,6 +78,23 @@ Most tasks follow six steps: **check registry → search → inspect interface �
 ```
 
 > Do not skip step 2 and invoke directly — SAP parameter names are case-sensitive and must be uppercase, and the type (CHAR/INT/BCD...) determines how to pass values. Inspecting the interface first avoids 90% of parameter mistakes.
+
+## Multiple systems
+
+The gateway can be deployed with **several SAP systems connected at once** (configured by the deployer via `sap_systems.toml`). All `/api/*` business endpoints work unchanged (they hit the **default** system), and every one of them also has a **scoped form** that targets a specific system — insert `/api/s/{system}` where the `/api` prefix sits:
+
+```bash
+curl http://127.0.0.1:3000/api/s/prd/rfc                  # POST → invoke on system "prd"
+curl http://127.0.0.1:3000/api/s/prd/functions/BAPI_USER_GETLIST
+curl http://127.0.0.1:3000/api/s/a4h/dumps/grouped
+curl http://127.0.0.1:3000/api/s/prd/ready                # that system's readiness
+```
+
+- Start a session with `GET /api/systems` — it lists each system (`name`, whether `default`, `read_only`, `adt`, `sysid`, `quarantined`). On a single-system deployment it returns one entry and you can ignore scoping entirely.
+- Unknown system name → `404 SYSTEM_UNKNOWN` (the error lists valid names). Compare objects across systems by calling the same read endpoint under two scopes (e.g. `/api/functions/ZFOO/source` on `a4h` vs `prd`) and diffing.
+- Flat delivery port `/api/invokes/{alias}` is **routed by the entry's recorded `system`** (aliases are global); an explicit scope that disagrees with the entry returns `409 SYSTEM_MISMATCH`. `GET /api/registry?system=prd` filters entries.
+- MCP tools accept an optional `system` argument (default = default system).
+- Hard limit: two configured systems with the **same SYSID** (e.g. cloned dev containers) are quarantined with `503 SYSTEM_SYSID_CONFLICT` — the SDK's descriptor cache is partitioned by SYSID, so identical SYSIDs would silently share wrong signatures.
 
 ## Endpoint quick reference (copyable examples)
 

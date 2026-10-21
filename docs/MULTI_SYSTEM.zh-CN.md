@@ -1,6 +1,12 @@
 # 方案：同时连接多个 SAP 系统（Multi-System）
 
-> 状态：设计稿（未实施）。目标版本 v0.16+。
+> 状态：**已实施**（v0.16，分支 `feat/multi-system`）。实施相对本设计稿的差异：
+> ① diff 便利端点按决策**未做**（对比由 Agent 调两次读取端点自行 diff）；
+> ② 注册表多系统化按**最小版**落地（`Entry.system` 字段 + 写入记录 + 平坦调用
+> 按条目路由 + `SYSTEM_MISMATCH`；目录/MCP 增强后置）；
+> ③ 请求超时也支持了每系统覆盖（`request_timeout_secs`）；
+> ④ OpenAPI 目录重建走启动期注入的全局 `SharedState`（`openapi::init_shared_state`）。
+> 使用文档见 README §多系统 与 `sap_systems.toml.example`。
 > 结论先行：**可行，且 SDK 层天然支持**——NWRFC SDK 的函数描述符缓存按 SYSID 分区，
 > 多系统只要 SYSID 不同就互不干扰。工程量集中在网关自身的"单系统假设"拆除：
 > 单一 `AppConfig.conn_params` → 单一 `SharedPool` → 全部 handler `State<SharedPool>`，

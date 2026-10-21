@@ -203,8 +203,38 @@ curl -X POST http://127.0.0.1:3000/api/rfc \
 | `SAP_UPDATE_CHECK` | ❌ | _(开启)_ | 新版本检查：启动时与每 24h 向 `api.github.com` 发一个匿名 GET 查询本仓库最新 Release（无遥测、不携带任何用户数据），结果展示在 `/api/version` 的 `latest` 块与首页页脚；设 `off`/`false`/`0`/`no` 可完全关闭（无外联） |
 | `SAP_ROLE` | ❌ | `client` | 运行模式：`client`/`server`/`both`（server 模式见 [§9](#9-server-端模式被-sap-调用)） |
 | `SAP_SDK_DIR` | ❌ | `./nwrfcsdk` | SDK 根目录（Docker/CI/自定义路径用） |
+| `SAP_SYSTEMS_FILE` | ❌ | `./sap_systems.toml` | 多系统配置文件（v0.16）。不存在 → 由上面的 `SAP_*` 变量合成单系统（与旧版行为一致）；存在 → 系统集合完全由该文件定义（`.env` 的 `SAP_ASHOST` 一族被忽略，启动日志有提示）。详见下方[多系统](#多系统-v016) |
 
 > **生产部署提示**：不要把 `.env` 放进镜像层。用容器编排系统的密钥注入（K8s Secret / Docker Swarm secret）替代。
+
+### 多系统（v0.16）
+
+一个网关进程可以**同时连接 N 个 SAP 系统**。在 `sap_systems.toml` 里定义（模板见 `sap_systems.toml.example`；路径由 `SAP_SYSTEMS_FILE` 指定）：
+
+```toml
+[systems.a4h]
+ashost = "vhcala4h"
+sysnr  = "00"
+client = "001"
+user   = "developer"
+passwd = "${SAP_A4H_PASSWD}"     # ${VAR} 环境变量插值——密钥留在 .env，本文件可入库
+default = true                    # 无前缀路径路由到此系统（必须恰好一个）
+
+[systems.prd]
+ashost = "sap-prd.example.com"
+sysnr  = "10"
+client = "100"
+user   = "rfc_gateway"
+passwd = "${SAP_PRD_PASSWD}"
+pool_size = 4                     # 每系统可选覆盖（缺省用 .env 全局值）
+read_only = true                  # 例如：生产系统只读、开发系统可写
+```
+
+**与 `.env` 的关系**——三层优先级：内置默认 ← `.env`（网关级开关：监听地址、API key、限流、runtime 档位…；以及池大小/超时/只读/ADT 的全局默认）← toml 每系统字段。连接参数二选一：toml 存在则系统集合完全由它定义；不存在则由 `SAP_*` 合成名为 `default` 的单系统（存量部署零改动）。
+
+**URL 形态**：无前缀路径仍路由到默认系统；每个 `/api/*` 端点都有作用域形态——`/api/s/{系统名}/rfc`、`/api/s/prd/functions/ZFOO`、`/api/s/prd/ready`。`GET /api/systems` 列出全部。注册表条目携带 `system` 字段，平坦端口 `/api/invokes/{alias}` 按条目路由。MCP 工具接受可选 `system` 参数。
+
+**硬性限制**：配置的各系统 **SYSID 必须不同**——SDK 描述符缓存按 SYSID 分区，两个同 SYSID 的系统（克隆的开发容器！）会静默用对方的签名编组数据。网关首连时登记 SYSID，冲突系统被隔离（`503 SYSTEM_SYSID_CONFLICT`）。
 
 ---
 

@@ -203,8 +203,38 @@ All configuration goes through environment variables, written to `.env` in the p
 | `SAP_UPDATE_CHECK` | ❌ | _(on)_ | New-release check: at startup and every 24h the gateway makes one anonymous GET to `api.github.com` for this repo's latest release (no telemetry, no user data). Result surfaces in `/api/version` → `latest` and the web UI footer. Set `off`/`false`/`0`/`no` to disable (fully offline) |
 | `SAP_ROLE` | ❌ | `client` | Run mode: `client`/`server`/`both` (server mode: see [§9](#9-server-mode-called-by-sap)) |
 | `SAP_SDK_DIR` | ❌ | `./nwrfcsdk` | SDK root directory (for Docker/CI/custom paths) |
+| `SAP_SYSTEMS_FILE` | ❌ | `./sap_systems.toml` | Multi-system config file (v0.16). Absent → single system synthesized from the `SAP_*` vars above (behavior identical to previous versions). Present → the set of systems is defined entirely by this file (the `SAP_ASHOST` family in `.env` is ignored; a startup log line notes this). See [Multiple systems](#multiple-systems-v016) below |
 
 > **Production deployment tip**: do not bake `.env` into the image layer. Use your orchestration system's secret injection (K8s Secret / Docker Swarm secret) instead.
+
+### Multiple systems (v0.16)
+
+One gateway process can connect to **N SAP systems at once**. Define them in `sap_systems.toml` (template: `sap_systems.toml.example`; path via `SAP_SYSTEMS_FILE`):
+
+```toml
+[systems.a4h]
+ashost = "vhcala4h"
+sysnr  = "00"
+client = "001"
+user   = "developer"
+passwd = "${SAP_A4H_PASSWD}"     # ${VAR} env interpolation — secrets stay in .env, this file can be committed
+default = true                    # unprefixed paths route here (exactly one)
+
+[systems.prd]
+ashost = "sap-prd.example.com"
+sysnr  = "10"
+client = "100"
+user   = "rfc_gateway"
+passwd = "${SAP_PRD_PASSWD}"
+pool_size = 4                     # optional per-system overrides (fall back to the .env globals)
+read_only = true                  # e.g. keep production read-only while dev stays writable
+```
+
+**Relationship to `.env`** — three layers: built-in defaults ← `.env` (gateway-global switches: listen address, API key, rate limit, runtime mode…; plus global defaults for pool size / timeouts / read-only / ADT) ← per-system fields in the toml. Connection params are either/or: with the toml present it fully defines the system set; without it the `SAP_*` vars synthesize a single system named `default` (zero change for existing deployments).
+
+**URLs**: unprefixed paths keep hitting the default system; every `/api/*` endpoint also has a scoped form — `/api/s/{system}/rfc`, `/api/s/prd/functions/ZFOO`, `/api/s/prd/ready`. `GET /api/systems` lists everything. Registry entries carry their `system`; the flat port `/api/invokes/{alias}` routes by entry. MCP tools take an optional `system` argument.
+
+**Hard limit**: configured systems must have **distinct SYSIDs** — the SDK's descriptor cache is partitioned by SYSID, so two systems sharing one (cloned dev containers!) would silently marshal with each other's signatures. The gateway registers SYSIDs on first connect and quarantines conflicts with `503 SYSTEM_SYSID_CONFLICT`.
 
 ---
 
