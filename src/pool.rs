@@ -124,6 +124,30 @@ impl RfcConnectionPool {
         })
     }
 
+    /// 惰性创建池：不建立首连，首个 `acquire` 时按需新建。
+    ///
+    /// 多系统场景下非默认系统用此构造——目标系统暂时不可达不应阻止网关
+    /// 启动监听；可达性交给启动探测任务与调用期错误上报。附带收益：
+    /// 构造不触 FFI，路由级单测可在无 SAP SDK 的 CI stub 环境下构造 app()。
+    pub fn lazy(
+        params: Vec<(&'static str, String)>,
+        max_size: usize,
+        idle_validate_after: std::time::Duration,
+    ) -> Self {
+        let max_size = max_size.max(1); // 至少 1
+        tracing::info!(max_size, "SAP 连接池已创建（惰性，首连按需）");
+        Self {
+            params,
+            max_size,
+            idle_validate_after,
+            inner: Mutex::new(PoolInner {
+                idle: vec![],
+                total: 0,
+            }),
+            cv: Condvar::new(),
+        }
+    }
+
     /// 用一个连接执行闭包。接口与旧单连接版完全一致，调用方无需改动。
     ///
     /// 首轮从池里借出（复用空闲或按需新建）；执行失败属通信类（连接已死）→

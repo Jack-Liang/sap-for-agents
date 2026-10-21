@@ -3,30 +3,47 @@
 //!
 //! 字段长度与类型自动发现：当请求中长度未指定时，通过 metadata 模块从 SAP
 //! 函数描述查询；输入按调用方给出的 ScalarValue 变体选对应 RfcSetXxx。
+//! 元数据缓存按系统实例化（v0.16）：`sys` 给出目标系统，其 `meta` 缓存
+//! 只对该系统的函数/类型生效——跨系统同名不同签名的隔离由此保证。
 
 use crate::api::{execute_invoke, InvokeRequest, InvokeResponse};
 use crate::connection::RfcConnection;
 use crate::error::RfcError;
+use crate::systems::SystemHandle;
 
-/// 通用执行入口。委托给 api::execute_invoke，并注入元数据解析函数。
+/// 通用执行入口（带系统句柄：元数据用该系统缓存）。
 pub fn execute_collect(
+    sys: &SystemHandle,
     conn: &RfcConnection,
     req: &InvokeRequest,
 ) -> Result<InvokeResponse, RfcError> {
-    execute_invoke(conn, req, resolve_meta)
+    execute_collect_with(&sys.meta, conn, req)
+}
+
+/// 通用执行入口（带元数据缓存实例）：discovery 等只拿得到缓存的内部通道用。
+pub fn execute_collect_with(
+    meta: &crate::metadata::MetadataCache,
+    conn: &RfcConnection,
+    req: &InvokeRequest,
+) -> Result<InvokeResponse, RfcError> {
+    execute_invoke(conn, req, |conn, req| resolve_meta(meta, conn, req))
 }
 
 /// 元数据解析回调：对 string_outputs 查标量参数元数据，对 table_outputs 查表字段元数据。
 /// 任何元数据查询失败都静默回退到 DEFAULT_CHAR_LEN（不阻断主流程），
 /// 因为 get_chars 本身已支持自适应重试。
-fn resolve_meta(conn: &RfcConnection, req: &InvokeRequest) -> crate::api::ResolvedMeta {
+fn resolve_meta(
+    meta: &crate::metadata::MetadataCache,
+    conn: &RfcConnection,
+    req: &InvokeRequest,
+) -> crate::api::ResolvedMeta {
     use std::collections::HashMap;
 
     // 标量输出：参数名 -> (字符长度, 类型)
     let mut scalars: HashMap<String, (usize, i32)> = HashMap::new();
     // string_outputs 和 auto_outputs 都需要元数据（类型+长度）
     for name in req.string_outputs.keys().chain(req.auto_outputs.iter()) {
-        let meta = crate::metadata::param_meta(conn, &req.func_name, name);
+        let meta = meta.param_meta(conn, &req.func_name, name);
         let entry = match meta {
             Some(m) => (m.char_length, m.type_),
             None => (crate::api::DEFAULT_CHAR_LEN, crate::ffi::RFCTYPE_CHAR),
@@ -37,7 +54,8 @@ fn resolve_meta(conn: &RfcConnection, req: &InvokeRequest) -> crate::api::Resolv
     // 表输出：表名 -> {字段名 -> (字符长度, 类型)}
     let mut tables: HashMap<String, HashMap<String, (usize, i32)>> = HashMap::new();
     for table_name in req.table_outputs.keys() {
-        let field_map = crate::metadata::table_field_metas(conn, &req.func_name, table_name)
+        let field_map = meta
+            .table_field_metas(conn, &req.func_name, table_name)
             .unwrap_or_default()
             .into_iter()
             .map(|(k, m)| (k, (m.char_length, m.type_)))
@@ -64,7 +82,8 @@ fn resolve_meta(conn: &RfcConnection, req: &InvokeRequest) -> crate::api::Resolv
         }
     }
     for struct_name in &need_struct_meta {
-        let field_map = crate::metadata::table_field_metas(conn, &req.func_name, struct_name)
+        let field_map = meta
+            .table_field_metas(conn, &req.func_name, struct_name)
             .unwrap_or_default()
             .into_iter()
             .map(|(k, m)| (k, (m.char_length, m.type_)))

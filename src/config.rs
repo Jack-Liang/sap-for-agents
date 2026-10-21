@@ -44,6 +44,10 @@ pub struct AppConfig {
     /// 启动时与每 24h 查 GitHub 最新 Release（仅一个匿名 GET，无遥测），
     /// 结果进 `/api/version` 的 latest 块与首页页脚。
     pub update_check: bool,
+    /// 多系统配置文件路径（`SAP_SYSTEMS_FILE`，默认 `./sap_systems.toml`）。
+    /// 文件不存在 → 从本配置的 SAP_* 环境变量合成单系统 `default`（存量路径）；
+    /// 存在 → 系统集合完全由该文件定义（见 systems.rs）。
+    pub systems_file: std::path::PathBuf,
 }
 
 fn required(key: &str) -> Result<String, String> {
@@ -125,6 +129,10 @@ pub fn load() -> Result<AppConfig, String> {
             )
         })
         .unwrap_or(true);
+    // 多系统配置文件（默认工作目录下的 sap_systems.toml；不存在则走环境变量合成）
+    let systems_file = std::path::PathBuf::from(
+        env::var("SAP_SYSTEMS_FILE").unwrap_or_else(|_| "sap_systems.toml".to_string()),
+    );
 
     // 键为 'static 字面量，值使用环境变量的 String（运行期存活）
     Ok(AppConfig {
@@ -149,6 +157,7 @@ pub fn load() -> Result<AppConfig, String> {
         registry_file,
         runtime_mode,
         update_check,
+        systems_file,
     })
 }
 
@@ -184,6 +193,7 @@ mod tests {
             "SAP_UPDATE_CHECK",
             "SAP_REGISTRY_FILE",
             "SAP_MODE",
+            "SAP_SYSTEMS_FILE",
         ] {
             unsafe {
                 std::env::remove_var(k);

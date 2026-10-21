@@ -24,7 +24,7 @@
 
 use crate::api::{FieldSpec, FunctionParam, InvokeRequest, InvokeResponse, ScalarValue};
 use crate::error::RfcError;
-use crate::server::SharedPool;
+use crate::server::SharedState;
 use axum::{Json, Router};
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
@@ -353,10 +353,16 @@ fn effective_cap(limit: Option<u32>, entry_max_rows: Option<u32>) -> usize {
         .clamp(1, MAX_TABLE_CAP) as usize
 }
 
-/// 平坦化调用 handler：查条目 → 拉接口元数据 → 派生契约 → 分类请求体 →
-/// 复用 /api/rfc 执行引擎 → 扁平化响应。
+/// 平坦化调用 handler：查条目 →（按条目 system 选系统）→ 拉接口元数据 →
+/// 派生契约 → 分类请求体 → 复用 /api/rfc 执行引擎 → 扁平化响应。
+///
+/// 系统路由以**条目记录的 system 为准**——别名是全局命名空间，消费方不需要
+/// 知道系统细节（这正是交付端口的意义）。请求若带显式作用域
+/// （/api/s/{sys}/invokes/{alias}）且与条目不符 → 409 SYSTEM_MISMATCH，
+/// 防止"以为在 PRD 调其实打到 DEV"。
 async fn flat_invoke_handler(
-    axum::extract::State(pool): axum::extract::State<SharedPool>,
+    axum::extract::State(state): axum::extract::State<SharedState>,
+    scoped: Option<axum::extract::Extension<crate::systems::Scope>>,
     axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
     axum::extract::Path(alias): axum::extract::Path<String>,
     axum::extract::Query(q): axum::extract::Query<InvokeQuery>,
@@ -376,6 +382,32 @@ async fn flat_invoke_handler(
             key: "REGISTRY_NOT_FOUND".into(),
         });
     }
+    // 条目 system 对应的系统句柄；旧条目 system="default" 在系统已改名时给出路标
+    let sys = state.resolve(&entry.system).ok_or_else(|| RfcError {
+        code: -1,
+        status: 409,
+        message: format!(
+            "条目 {alias} 记录的系统 '{}' 在当前部署中不存在（可用: {}）。\
+             多系统部署变更后请 PUT /api/registry/{alias} 更新条目的 system 字段",
+            entry.system,
+            state.names().join(", ")
+        ),
+        key: "SYSTEM_MISMATCH".into(),
+    })?;
+    if let Some(axum::extract::Extension(crate::systems::Scope(scoped_sys))) = &scoped {
+        if scoped_sys.name != entry.system {
+            return Err(RfcError {
+                code: -1,
+                status: 409,
+                message: format!(
+                    "作用域系统 '{}' 与条目 {alias} 的系统 '{}' 不符（平坦调用按条目路由，\
+                     请用 /api/invokes/{alias} 或 /api/s/{}/invokes/{alias}）",
+                    scoped_sys.name, entry.system, entry.system
+                ),
+                key: "SYSTEM_MISMATCH".into(),
+            });
+        }
+    }
     let Json(body) = body.map_err(|r| RfcError {
         code: -1,
         status: r.status().as_u16(),
@@ -386,9 +418,10 @@ async fn flat_invoke_handler(
     // 接口元数据（FII 实时通道）→ 契约；同时取 SDK 描述符视图的参数集
     //（漂移守卫用——SDK 缓存进程级，签名变更后它落在后面）
     let func = entry.func_name.clone();
-    let (view, sdk_param_set) = crate::server::run_blocking(Arc::clone(&pool), move |conn| {
-        let view = crate::server::collect_function_params(conn, &func)?;
-        let sdk = crate::metadata::get_metadata(conn, &func).ok().map(|m| {
+    let meta_sys = Arc::clone(&sys);
+    let (view, sdk_param_set) = crate::server::run_blocking(Arc::clone(&meta_sys), move |conn| {
+        let view = crate::server::collect_function_params(&meta_sys, conn, &func)?;
+        let sdk = meta_sys.meta.get_metadata(conn, &func).ok().map(|m| {
             m.scalars
                 .keys()
                 .cloned()
@@ -432,7 +465,7 @@ async fn flat_invoke_handler(
 
     // 复用 /api/rfc 的执行+指标+审计（函数名标签用真实 SAP 名）
     let resp = crate::server::run_invoke_and_log(
-        pool,
+        sys,
         addr.ip().to_string(),
         req,
         "invokes-alias",
@@ -454,9 +487,9 @@ async fn audit_handler() -> Result<Json<serde_json::Value>, RfcError> {
     ))
 }
 
-/// 交付端口子路由（挂 /api 鉴权层内）。handler 需要连接池 → 状态类型固定。
+/// 交付端口子路由（挂 /api 鉴权层内）。handler 需要多系统状态 → 状态类型固定。
 /// axum 0.8 语法：{*alias}。
-pub fn router() -> Router<SharedPool> {
+pub fn router() -> Router<SharedState> {
     Router::new()
         .route("/api/invokes/audit", axum::routing::get(audit_handler))
         .route(

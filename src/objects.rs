@@ -18,9 +18,7 @@
 //! - 消息的真实行号在 href 片段 `#start=行,列` 里，`line` 属性不可靠；
 //! - 锁冲突（EU510「他人正在编辑」）返回 ADT 异常文档而非锁结果。
 
-use crate::adt::{
-    adt_get_text_lines, adt_request_raw, encode_path_segment, establish_stateful, AdtRawResponse,
-};
+use crate::adt::{encode_path_segment, AdtEndpoint, AdtRawResponse};
 use std::collections::HashMap;
 
 use crate::api::{InvokeRequest, ScalarValue};
@@ -42,8 +40,8 @@ struct WriteSession {
 
 impl WriteSession {
     /// 建立专用 stateful 会话（GET + Fetch + stateful）。
-    async fn establish(base: &str) -> Result<Self, RfcError> {
-        let (token, cookies) = establish_stateful(base).await?;
+    async fn establish(adt: &AdtEndpoint, base: &str) -> Result<Self, RfcError> {
+        let (token, cookies) = adt.establish_stateful(base).await?;
         Ok(Self {
             token,
             pairs: cookies,
@@ -483,19 +481,24 @@ fn parse_lock_result(body: &str) -> Result<LockInfo, RfcError> {
 
 /// 取编辑锁（专用 stateful 会话内）。无 LOCK_HANDLE 才是真正不可写——
 /// NoModification 对本地对象是常态。
-async fn lock_object(base: &str, sess: &mut WriteSession) -> Result<LockInfo, RfcError> {
-    let resp = adt_request_raw(
-        axum::http::Method::POST,
-        base,
-        &[("_action", "LOCK"), ("accessMode", "MODIFY")],
-        None,
-        None,
-        "application/vnd.sap.as+xml;charset=UTF-8;dataname=com.sap.adt.lock.result",
-        STATEFUL,
-        sess.cookie_header().as_deref(),
-        Some(sess.token.as_str()),
-    )
-    .await?;
+async fn lock_object(
+    adt: &AdtEndpoint,
+    base: &str,
+    sess: &mut WriteSession,
+) -> Result<LockInfo, RfcError> {
+    let resp = adt
+        .request_raw(
+            axum::http::Method::POST,
+            base,
+            &[("_action", "LOCK"), ("accessMode", "MODIFY")],
+            None,
+            None,
+            "application/vnd.sap.as+xml;charset=UTF-8;dataname=com.sap.adt.lock.result",
+            STATEFUL,
+            sess.cookie_header().as_deref(),
+            Some(sess.token.as_str()),
+        )
+        .await?;
     sess.absorb(&resp);
     if resp.status != 200 {
         let body = String::from_utf8_lossy(&resp.body).to_string();
@@ -540,23 +543,25 @@ async fn lock_object(base: &str, sess: &mut WriteSession) -> Result<LockInfo, Rf
 
 /// 释放编辑锁（尽力而为：失败只记警告，不阻断后续激活）。
 async fn unlock_object(
+    adt: &AdtEndpoint,
     base: &str,
     lock_handle: &str,
     sess: &mut WriteSession,
 ) -> Result<(), String> {
-    let resp = adt_request_raw(
-        axum::http::Method::POST,
-        base,
-        &[("_action", "UNLOCK"), ("lockHandle", lock_handle)],
-        None,
-        None,
-        "*/*",
-        STATEFUL,
-        sess.cookie_header().as_deref(),
-        Some(sess.token.as_str()),
-    )
-    .await
-    .map_err(|e| e.message)?;
+    let resp = adt
+        .request_raw(
+            axum::http::Method::POST,
+            base,
+            &[("_action", "UNLOCK"), ("lockHandle", lock_handle)],
+            None,
+            None,
+            "*/*",
+            STATEFUL,
+            sess.cookie_header().as_deref(),
+            Some(sess.token.as_str()),
+        )
+        .await
+        .map_err(|e| e.message)?;
     sess.absorb(&resp);
     if (200..300).contains(&resp.status) {
         Ok(())
@@ -566,19 +571,20 @@ async fn unlock_object(
 }
 
 /// 结束 stateful 会话（服务器侧释放 ABAP 会话；尽力而为）。
-async fn drop_session(base: &str, sess: &WriteSession) {
-    let _ = adt_request_raw(
-        axum::http::Method::GET,
-        base,
-        &[],
-        None,
-        None,
-        "*/*",
-        &[("X-sap-adt-sessiontype", "stateless")],
-        sess.cookie_header().as_deref(),
-        None,
-    )
-    .await;
+async fn drop_session(adt: &AdtEndpoint, base: &str, sess: &WriteSession) {
+    let _ = adt
+        .request_raw(
+            axum::http::Method::GET,
+            base,
+            &[],
+            None,
+            None,
+            "*/*",
+            &[("X-sap-adt-sessiontype", "stateless")],
+            sess.cookie_header().as_deref(),
+            None,
+        )
+        .await;
 }
 
 // ========================================================================
@@ -724,7 +730,11 @@ fn xml_attr_escape(s: &str) -> String {
 }
 
 /// 激活对象（先解锁后激活是 SAP 要求，见模块注释）。
-async fn activate_object(base: &str, name: &str) -> Result<ActivationOutcome, RfcError> {
+async fn activate_object(
+    adt: &AdtEndpoint,
+    base: &str,
+    name: &str,
+) -> Result<ActivationOutcome, RfcError> {
     let body = format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
 <adtcore:objectReferences xmlns:adtcore=\"http://www.sap.com/adt/core\">\
@@ -733,18 +743,19 @@ async fn activate_object(base: &str, name: &str) -> Result<ActivationOutcome, Rf
         xml_attr_escape(&format!("/sap/bc/adt/{}", base)),
         xml_attr_escape(name)
     );
-    let resp = adt_request_raw(
-        axum::http::Method::POST,
-        "activation",
-        &[("method", "activate"), ("preauditRequested", "true")],
-        Some(body.as_bytes()),
-        Some("application/xml"),
-        "*/*",
-        &[], // 激活无会话要求（解锁后执行）
-        None,
-        None,
-    )
-    .await?;
+    let resp = adt
+        .request_raw(
+            axum::http::Method::POST,
+            "activation",
+            &[("method", "activate"), ("preauditRequested", "true")],
+            Some(body.as_bytes()),
+            Some("application/xml"),
+            "*/*",
+            &[], // 激活无会话要求（解锁后执行）
+            None,
+            None,
+        )
+        .await?;
     if !(200..300).contains(&resp.status) {
         return Err(RfcError {
             code: -1,
@@ -771,7 +782,11 @@ pub struct SyntaxIssue {
 }
 
 /// 对任意源码做语法检查（当前库内容不受影响）。走 ADT checkruns。
-pub async fn syntax_check(base: &str, source: &str) -> Result<Vec<SyntaxIssue>, RfcError> {
+pub async fn syntax_check(
+    adt: &AdtEndpoint,
+    base: &str,
+    source: &str,
+) -> Result<Vec<SyntaxIssue>, RfcError> {
     use base64::Engine;
     let encoded = base64::engine::general_purpose::STANDARD.encode(source);
     // checkObject 用对象 URL（不带 /source/main，防超长 URI）；
@@ -791,20 +806,21 @@ pub async fn syntax_check(base: &str, source: &str) -> Result<Vec<SyntaxIssue>, 
         xml_attr_escape(&format!("/sap/bc/adt/{}/source/main", base)),
         encoded
     );
-    let resp = adt_request_raw(
-        axum::http::Method::POST,
-        "checkruns",
-        &[("reporters", "abapCheckRun")],
-        Some(body.as_bytes()),
-        Some("application/*"),
-        // vsp 实测注记：S/4 对所有厂商 content type 答 406、ERP 全部 200，
-        // 唯一两边都接受的是 */*——这里不是偷懒而是可移植选择
-        "*/*",
-        &[], // 语法检查无状态
-        None,
-        None,
-    )
-    .await?;
+    let resp = adt
+        .request_raw(
+            axum::http::Method::POST,
+            "checkruns",
+            &[("reporters", "abapCheckRun")],
+            Some(body.as_bytes()),
+            Some("application/*"),
+            // vsp 实测注记：S/4 对所有厂商 content type 答 406、ERP 全部 200，
+            // 唯一两边都接受的是 */*——这里不是偷懒而是可移植选择
+            "*/*",
+            &[], // 语法检查无状态
+            None,
+            None,
+        )
+        .await?;
     if !(200..300).contains(&resp.status) {
         return Err(RfcError {
             code: -1,
@@ -978,23 +994,29 @@ fn devclass_or_tmp(spec: &CreateSpec) -> String {
 }
 
 /// ADT 创建单次 POST。返回 Err 时 message 已含 SAP 的说法。
-async fn create_post_adt(rel: &str, body: &str, transport: Option<&str>) -> Result<(), RfcError> {
+async fn create_post_adt(
+    adt: &AdtEndpoint,
+    rel: &str,
+    body: &str,
+    transport: Option<&str>,
+) -> Result<(), RfcError> {
     let mut query: Vec<(&str, &str)> = Vec::new();
     if let Some(t) = transport.filter(|t| !t.trim().is_empty()) {
         query.push(("corrNr", t));
     }
-    let resp = adt_request_raw(
-        axum::http::Method::POST,
-        rel,
-        &query,
-        Some(body.as_bytes()),
-        Some("application/*"),
-        "*/*",
-        &[], // 无额外头；CSRF 由网关自动处理
-        None,
-        None,
-    )
-    .await?;
+    let resp = adt
+        .request_raw(
+            axum::http::Method::POST,
+            rel,
+            &query,
+            Some(body.as_bytes()),
+            Some("application/*"),
+            "*/*",
+            &[], // 无额外头；CSRF 由网关自动处理
+            None,
+            None,
+        )
+        .await?;
     if (200..300).contains(&resp.status) {
         return Ok(());
     }
@@ -1024,6 +1046,7 @@ async fn create_post_adt(rel: &str, body: &str, transport: Option<&str>) -> Resu
 /// ADT 标准创建（Eclipse/vsp/abapfs 同款 objectcreation XML POST）。
 /// 适用于所有类型；Function 在组缺失时自动经 ADT 建组后重试一次。
 async fn create_object_adt(
+    adt: &AdtEndpoint,
     obj_type: ObjectType,
     name: &str,
     group: &str,
@@ -1050,7 +1073,7 @@ async fn create_object_adt(
         let mut last: Option<RfcError> = None;
         for swc in &candidates {
             let body = create_package_body(name, spec, swc, responsible);
-            match create_post_adt("packages", &body, transport).await {
+            match create_post_adt(adt, "packages", &body, transport).await {
                 Ok(()) => return Ok(()),
                 Err(e) if is_already_exists(&e.message) => return Err(e),
                 Err(e) => last = Some(e),
@@ -1070,7 +1093,7 @@ async fn create_object_adt(
     if obj_type == ObjectType::Function {
         let (rel, _, _) = obj_type.creation(group);
         let body = create_body_simple(obj_type, name, group, spec, responsible);
-        let first = create_post_adt(&rel, &body, transport).await;
+        let first = create_post_adt(adt, &rel, &body, transport).await;
         let group_missing = match &first {
             Err(e) => e.key == "ADT_ExceptionResourceNotFound" || e.message.contains("not exist"),
             Ok(()) => false,
@@ -1088,7 +1111,7 @@ async fn create_object_adt(
             let (grel, _, _) = ObjectType::FunctionGroup.creation("");
             let gbody =
                 create_body_simple(ObjectType::FunctionGroup, group, "", &gspec, responsible);
-            match create_post_adt(&grel, &gbody, transport).await {
+            match create_post_adt(adt, &grel, &gbody, transport).await {
                 // 建组成（或组其实已在——并发场景）即跳出；失败换下一个包候选
                 Ok(()) => break,
                 Err(ref e2) if is_already_exists(&e2.message) => break,
@@ -1096,7 +1119,7 @@ async fn create_object_adt(
             }
         }
         // 组就位（或建组失败——FM 重试自己会给准确错误）后重试一次
-        return create_post_adt(&rel, &body, transport).await;
+        return create_post_adt(adt, &rel, &body, transport).await;
     }
 
     let (rel, _, _) = obj_type.creation(group);
@@ -1107,7 +1130,7 @@ async fn create_object_adt(
         responsible
     };
     let body = create_body_simple(obj_type, name, group, spec, responsible);
-    create_post_adt(&rel, &body, transport).await
+    create_post_adt(adt, &rel, &body, transport).await
 }
 
 /// 去重的包候选列表（首项显式给出，后接 fallback）。
@@ -1127,7 +1150,7 @@ fn dedup_candidates(explicit: &str, fallbacks: &[&str]) -> Vec<String> {
 /// 创建对象（对外入口）：**ADT-first**，prog/func 在 ADT 不可用/失败时回退 RFC RPY 路径。
 /// prog/func 的 RFC 路径（实测可用、无 schema 猜谜）保留为兜底；其余类型只有 ADT 通道。
 pub async fn create_object(
-    pool: &std::sync::Arc<crate::pool::RfcConnectionPool>,
+    sys: &std::sync::Arc<crate::systems::SystemHandle>,
     obj_type: ObjectType,
     name: &str,
     group: &str,
@@ -1149,8 +1172,11 @@ pub async fn create_object(
             key: "CREATE_GROUP_REQUIRED".into(),
         });
     }
-    let responsible = crate::adt::adt_user();
-    let adt_result = create_object_adt(obj_type, name, group, spec, responsible.as_deref()).await;
+    // ADT 端点按系统：未启用时 prog/func 直接走 RFC 回退，其余类型报 503
+    let adt_result = match sys.adt.as_ref() {
+        Some(adt) => create_object_adt(adt, obj_type, name, group, spec, Some(adt.user())).await,
+        None => Err(crate::adt::adt_disabled()),
+    };
     match adt_result {
         Ok(()) => Ok(()),
         // 已存在：重试任何路径都无意义，直接给 409
@@ -1162,7 +1188,7 @@ pub async fn create_object(
         }),
         // prog/func：ADT 失败回退 RFC（老系统 ADT 服务缺失 / RPY 在该系统更宽容）
         Err(e) if matches!(obj_type, ObjectType::Program | ObjectType::Function) => {
-            match create_object_rfc(pool, obj_type, name, group, spec).await {
+            match create_object_rfc(sys, obj_type, name, group, spec).await {
                 Ok(()) => Ok(()),
                 Err(_) => Err(e), // RFC 也失败：ADT 的错误信息通常更标准，回抛 ADT 错误
             }
@@ -1174,7 +1200,7 @@ pub async fn create_object(
 /// RFC 通道创建（prog=RPY_PROGRAM_INSERT、func=RPY_FUNCTIONMODULE_INSERT + 自动建组）。
 /// 仅作为 ADT 通道的回退；逻辑与历史版本一致（含 ABAP Cloud Trial 的 TADIR 自检）。
 async fn create_object_rfc(
-    pool: &std::sync::Arc<crate::pool::RfcConnectionPool>,
+    sys: &std::sync::Arc<crate::systems::SystemHandle>,
     obj_type: ObjectType,
     name: &str,
     group: &str,
@@ -1186,7 +1212,8 @@ async fn create_object_rfc(
             let title = spec.description.clone();
             let devclass = devclass_or_tmp(spec);
             let transport = spec.transport.clone().unwrap_or_default();
-            crate::server::run_blocking(std::sync::Arc::clone(pool), move |conn| {
+            let exec_sys = std::sync::Arc::clone(sys);
+            crate::server::run_blocking(std::sync::Arc::clone(sys), move |conn| {
                 let req = crate::api::InvokeRequest {
                     func_name: "RPY_PROGRAM_INSERT".to_string(),
                     inputs: HashMap::from([
@@ -1233,7 +1260,7 @@ async fn create_object_rfc(
                     ]),
                     ..Default::default()
                 };
-                let _ = crate::executor::execute_collect(conn, &req)?;
+                let _ = crate::executor::execute_collect(&exec_sys, conn, &req)?;
                 // SOURCE 不在此写（实测 trial 上 INSERT 的 SOURCE 表不落盘）——
                 // 壳建好后由调用方走 PUT source/main 写入并激活
                 Ok::<(), RfcError>(())
@@ -1246,7 +1273,9 @@ async fn create_object_rfc(
             let short = spec.description.clone();
             let transport = spec.transport.clone().unwrap_or_default();
             let devclass = devclass_or_tmp(spec);
+            let exec_sys = std::sync::Arc::clone(sys);
             let fm_insert = |fname: String, fgroup: String, short: String, transport: String| {
+                let exec_sys = std::sync::Arc::clone(&exec_sys);
                 move |conn: &crate::connection::RfcConnection| -> Result<(), RfcError> {
                     let req = InvokeRequest {
                         func_name: "RPY_FUNCTIONMODULE_INSERT".to_string(),
@@ -1261,12 +1290,12 @@ async fn create_object_rfc(
                         ]),
                         ..Default::default()
                     };
-                    let _ = crate::executor::execute_collect(conn, &req)?;
+                    let _ = crate::executor::execute_collect(&exec_sys, conn, &req)?;
                     Ok(())
                 }
             };
             match crate::server::run_blocking(
-                std::sync::Arc::clone(pool),
+                std::sync::Arc::clone(sys),
                 fm_insert(
                     fname.clone(),
                     fgroup.clone(),
@@ -1280,6 +1309,7 @@ async fn create_object_rfc(
                 // 组不存在 → 自动建组（RS_FUNCTION_POOL_INSERT）后重试一次。
                 Err(e) if e.key.contains("INVALID_FUNCTION_POOL") || e.message.contains("652") => {
                     let pool_insert = |g: String, desc: String, dev: String, tr: String| {
+                        let exec_sys = std::sync::Arc::clone(&exec_sys);
                         move |conn: &crate::connection::RfcConnection| -> Result<(), RfcError> {
                             let req = InvokeRequest {
                                 func_name: "RS_FUNCTION_POOL_INSERT".to_string(),
@@ -1312,7 +1342,7 @@ async fn create_object_rfc(
                                 ]),
                                 ..Default::default()
                             };
-                            let _ = crate::executor::execute_collect(conn, &req)?;
+                            let _ = crate::executor::execute_collect(&exec_sys, conn, &req)?;
                             Ok(())
                         }
                     };
@@ -1325,7 +1355,7 @@ async fn create_object_rfc(
                     }
                     for dev in candidates {
                         match crate::server::run_blocking(
-                            std::sync::Arc::clone(pool),
+                            std::sync::Arc::clone(sys),
                             pool_insert(fgroup.clone(), short.clone(), dev, transport.clone()),
                         )
                         .await
@@ -1347,7 +1377,7 @@ async fn create_object_rfc(
                     }
                     let resp_group = fgroup.clone();
                     let r = crate::server::run_blocking(
-                        std::sync::Arc::clone(pool),
+                        std::sync::Arc::clone(sys),
                         fm_insert(fname, fgroup.clone(), short, transport),
                     )
                     .await;
@@ -1358,9 +1388,11 @@ async fn create_object_rfc(
                     // 给出可操作的错误而不是静默假成功。
                     if r.is_ok() {
                         let g_chk = fgroup.clone();
+                        let tadir_sys = std::sync::Arc::clone(sys);
                         let registered =
-                            crate::server::run_blocking(std::sync::Arc::clone(pool), move |conn| {
+                            crate::server::run_blocking(std::sync::Arc::clone(sys), move |conn| {
                                 let rows = crate::discovery::read_table(
+                                    &tadir_sys.meta,
                                     conn,
                                     "TADIR",
                                     &["OBJECT".to_string(), "OBJ_NAME".to_string()],
@@ -1417,7 +1449,7 @@ pub struct WriteOpts<'a> {
 }
 
 pub async fn write_object_maybe_create(
-    pool: &std::sync::Arc<crate::pool::RfcConnectionPool>,
+    sys: &std::sync::Arc<crate::systems::SystemHandle>,
     obj_type: ObjectType,
     name: &str,
     group: &str,
@@ -1432,6 +1464,7 @@ pub async fn write_object_maybe_create(
         doc,
     } = *opts;
     match write_object_source(
+        sys,
         obj_type,
         name,
         group,
@@ -1444,7 +1477,7 @@ pub async fn write_object_maybe_create(
     .await
     {
         Ok(o) => {
-            drain_pool_after_write(pool, obj_type);
+            drain_pool_after_write(sys, obj_type);
             Ok(o)
         }
         Err(e) if create_desc.is_some() && is_object_not_exist(&e) => {
@@ -1454,8 +1487,9 @@ pub async fn write_object_maybe_create(
                 transport: transport.map(str::to_string),
                 software_component: None,
             };
-            create_object(pool, obj_type, name, group, &spec).await?;
+            create_object(sys, obj_type, name, group, &spec).await?;
             let out = write_object_source(
+                sys,
                 obj_type,
                 name,
                 group,
@@ -1466,7 +1500,7 @@ pub async fn write_object_maybe_create(
                 doc,
             )
             .await?;
-            drain_pool_after_write(pool, obj_type);
+            drain_pool_after_write(sys, obj_type);
             Ok(out)
         }
         Err(e) => Err(e),
@@ -1476,7 +1510,7 @@ pub async fn write_object_maybe_create(
 /// 唯一匹配查找替换（可选对象不存在时先建壳）：POST replace 语义的共享入口。
 /// 返回写入 outcome（外加 replaced 标记在 `replaced` 字段）。
 pub async fn replace_object_maybe_create(
-    pool: &std::sync::Arc<crate::pool::RfcConnectionPool>,
+    sys: &std::sync::Arc<crate::systems::SystemHandle>,
     obj_type: ObjectType,
     name: &str,
     group: &str,
@@ -1491,7 +1525,8 @@ pub async fn replace_object_maybe_create(
         rfc_enabled,
         doc,
     } = *opts;
-    let current = match read_current_source(obj_type, name, group).await {
+    let adt = sys.adt.as_ref().ok_or_else(crate::adt::adt_disabled)?;
+    let current = match read_current_source(adt, obj_type, name, group).await {
         Ok(c) => c,
         Err(e) if create_desc.is_some() && is_object_not_exist(&e) => {
             let spec = CreateSpec {
@@ -1500,7 +1535,7 @@ pub async fn replace_object_maybe_create(
                 transport: transport.map(str::to_string),
                 software_component: None,
             };
-            create_object(pool, obj_type, name, group, &spec).await?;
+            create_object(sys, obj_type, name, group, &spec).await?;
             String::new()
         }
         Err(e) => return Err(e),
@@ -1520,6 +1555,7 @@ pub async fn replace_object_maybe_create(
         });
     }
     let outcome = write_object_source(
+        sys,
         obj_type,
         name,
         group,
@@ -1530,7 +1566,7 @@ pub async fn replace_object_maybe_create(
         doc,
     )
     .await?;
-    drain_pool_after_write(pool, obj_type);
+    drain_pool_after_write(sys, obj_type);
     let mut v = serde_json::to_value(&outcome).unwrap_or_default();
     v["replaced"] = serde_json::json!(true);
     Ok(v)
@@ -1547,11 +1583,11 @@ pub fn is_object_not_exist(err: &RfcError) -> bool {
 /// （FUNC_CACHE 的清理在 write_object_source/delete_object 内部已做。）
 /// 对其他类型是无害空操作。
 pub fn drain_pool_after_write(
-    pool: &std::sync::Arc<crate::pool::RfcConnectionPool>,
+    sys: &std::sync::Arc<crate::systems::SystemHandle>,
     obj_type: ObjectType,
 ) {
     if matches!(obj_type, ObjectType::Function | ObjectType::FunctionGroup) {
-        pool.drain_idle();
+        sys.pool.drain_idle();
     }
 }
 
@@ -1569,6 +1605,7 @@ pub fn drain_pool_after_write(
 /// - PUT 失败会尽力解锁后返回错误，避免泄漏孤儿锁。
 #[allow(clippy::too_many_arguments)]
 pub async fn write_object_source(
+    sys: &std::sync::Arc<crate::systems::SystemHandle>,
     obj_type: ObjectType,
     name: &str,
     group: &str,
@@ -1578,6 +1615,7 @@ pub async fn write_object_source(
     rfc_enabled: bool,
     doc: Option<&str>,
 ) -> Result<WriteOutcome, RfcError> {
+    let adt = sys.adt.as_ref().ok_or_else(crate::adt::adt_disabled)?;
     if !obj_type.has_source() {
         return Err(RfcError {
             code: -1,
@@ -1590,9 +1628,9 @@ pub async fn write_object_source(
     // 成功后清 TYPE_CACHE——结构定义变更要立即反映到字段展开
     //（/api/ddic/type 与结构/表参数的字段清单）。
     if obj_type.is_blue_ddic() {
-        let outcome = write_ddic_source(obj_type, name, source, transport, activate).await;
+        let outcome = write_ddic_source(adt, obj_type, name, source, transport, activate).await;
         if outcome.is_ok() {
-            let cleared = crate::metadata::invalidate_type(name.trim());
+            let cleared = sys.meta.invalidate_type(name.trim());
             if cleared {
                 tracing::debug!(r#type = %name.trim(), "写后清除 TYPE_CACHE 条目");
             }
@@ -1614,10 +1652,10 @@ pub async fn write_object_source(
 
     // ⓪ 建立专用 stateful 会话：锁的签发、token 的签发必须同源，
     //    否则柄是死的（无状态签发）或请求被拒（跨会话 token）
-    let mut sess = WriteSession::establish(&base).await?;
+    let mut sess = WriteSession::establish(adt, &base).await?;
 
     // ① 锁
-    let lock = lock_object(&base, &mut sess).await?;
+    let lock = lock_object(adt, &base, &mut sess).await?;
     let transport_used = transport
         .map(str::to_string)
         .filter(|t| !t.trim().is_empty())
@@ -1636,26 +1674,27 @@ pub async fn write_object_source(
         .iter()
         .map(|(k, v)| (k.as_str(), v.as_str()))
         .collect();
-    let put_resp = match adt_request_raw(
-        axum::http::Method::PUT,
-        &source_rel,
-        &put_query_ref,
-        Some(source.as_bytes()),
-        Some("text/plain; charset=utf-8"),
-        "*/*",
-        STATEFUL,
-        sess.cookie_header().as_deref(),
-        Some(sess.token.as_str()),
-    )
-    .await
+    let put_resp = match adt
+        .request_raw(
+            axum::http::Method::PUT,
+            &source_rel,
+            &put_query_ref,
+            Some(source.as_bytes()),
+            Some("text/plain; charset=utf-8"),
+            "*/*",
+            STATEFUL,
+            sess.cookie_header().as_deref(),
+            Some(sess.token.as_str()),
+        )
+        .await
     {
         Ok(r) => r,
         Err(e) => {
             // 尽力解锁；解锁失败只记警告
-            if let Err(w) = unlock_object(&base, &lock.lock_handle, &mut sess).await {
+            if let Err(w) = unlock_object(adt, &base, &lock.lock_handle, &mut sess).await {
                 warnings.push(w);
             }
-            drop_session(&base, &sess).await;
+            drop_session(adt, &base, &sess).await;
             return Err(RfcError {
                 code: -1,
                 status: 502,
@@ -1666,10 +1705,10 @@ pub async fn write_object_source(
     };
     sess.absorb(&put_resp);
     if !(200..300).contains(&put_resp.status) {
-        if let Err(w) = unlock_object(&base, &lock.lock_handle, &mut sess).await {
+        if let Err(w) = unlock_object(adt, &base, &lock.lock_handle, &mut sess).await {
             warnings.push(w);
         }
-        drop_session(&base, &sess).await;
+        drop_session(adt, &base, &sess).await;
         let body = String::from_utf8_lossy(&put_resp.body);
         let (status, key) = if put_resp.status == 409 {
             (409u16, "OBJECT_LOCKED".to_string())
@@ -1695,6 +1734,7 @@ pub async fn write_object_source(
     let mut rfc_result: Option<bool> = None;
     if rfc_enabled && obj_type == ObjectType::Function {
         match fm_set_rfc_enabled(
+            adt,
             &base,
             &group_or_name(obj_type, name, group),
             &mut sess,
@@ -1712,15 +1752,15 @@ pub async fn write_object_source(
     }
 
     // ③ 先解锁再激活（SAP 要求：不解锁时对象自身 ENQUEUE 以 403 拒绝激活）
-    if let Err(w) = unlock_object(&base, &lock.lock_handle, &mut sess).await {
+    if let Err(w) = unlock_object(adt, &base, &lock.lock_handle, &mut sess).await {
         warnings.push(w);
     }
-    drop_session(&base, &sess).await;
+    drop_session(adt, &base, &sess).await;
 
     // ④ 激活（逻辑结果，不升为传输错误）
     let name_upper = name.trim().to_uppercase();
     let activated = if activate {
-        Some(activate_object(&base, &name_upper).await?)
+        Some(activate_object(adt, &base, &name_upper).await?)
     } else {
         None
     };
@@ -1730,7 +1770,7 @@ pub async fn write_object_source(
     //    仍按连接缓存（池排干由调用方 drain_pool_after_write 处理）、SDK 描述符
     //    缓存进程级不可失效（删库重建的 FM 新参数要重启网关才可见，见 AGENTS.md）。
     if obj_type == ObjectType::Function {
-        let cleared = crate::metadata::invalidate_function(name.trim());
+        let cleared = sys.meta.invalidate_function(name.trim());
         if cleared {
             tracing::debug!(func = %name.trim(), "写后清除 FUNC_CACHE 条目");
         }
@@ -1743,6 +1783,7 @@ pub async fn write_object_source(
     if obj_type == ObjectType::Function && rfc_result == Some(true) {
         let doc = doc.filter(|d| !d.trim().is_empty());
         match crate::registry::auto_register_func(
+            &sys.name,
             &name_upper,
             (!group.trim().is_empty()).then(|| group.trim()),
             doc,
@@ -1781,6 +1822,7 @@ pub async fn write_object_source(
 /// 409/ADT_ExceptionResourceNotFound，与锁编排路径同形态——
 /// `create:true` 的建壳重试因此对表/结构同样生效。
 async fn write_ddic_source(
+    adt: &AdtEndpoint,
     obj_type: ObjectType,
     name: &str,
     source: &str,
@@ -1791,18 +1833,19 @@ async fn write_ddic_source(
     let source_rel = obj_type.source_rel(name, "");
 
     // ① GET 现源拿 etag（裸 text/plain，与 PUT 的 Content-Type 同串）
-    let get_resp = adt_request_raw(
-        axum::http::Method::GET,
-        &source_rel,
-        &[],
-        None,
-        None,
-        "text/plain",
-        &[],
-        None,
-        None,
-    )
-    .await?;
+    let get_resp = adt
+        .request_raw(
+            axum::http::Method::GET,
+            &source_rel,
+            &[],
+            None,
+            None,
+            "text/plain",
+            &[],
+            None,
+            None,
+        )
+        .await?;
     if !(200..300).contains(&get_resp.status) {
         let body = String::from_utf8_lossy(&get_resp.body).to_string();
         if body.contains("exc:exception") {
@@ -1836,18 +1879,19 @@ async fn write_ddic_source(
     if let Some(t) = transport_used.as_deref() {
         query.push(("corrNr", t));
     }
-    let put_resp = adt_request_raw(
-        axum::http::Method::PUT,
-        &source_rel,
-        &query,
-        Some(source.as_bytes()),
-        Some("text/plain"),
-        "*/*",
-        &[("If-Match", etag.as_str())],
-        None,
-        None,
-    )
-    .await?;
+    let put_resp = adt
+        .request_raw(
+            axum::http::Method::PUT,
+            &source_rel,
+            &query,
+            Some(source.as_bytes()),
+            Some("text/plain"),
+            "*/*",
+            &[("If-Match", etag.as_str())],
+            None,
+            None,
+        )
+        .await?;
     if !(200..300).contains(&put_resp.status) {
         let body = String::from_utf8_lossy(&put_resp.body).to_string();
         let (status, key) = if put_resp.status == 412 {
@@ -1872,7 +1916,7 @@ async fn write_ddic_source(
     // ③ 激活（与锁编排同一通道；逻辑结果，不升为传输错误）
     let name_upper = name.trim().to_uppercase();
     let activated = if activate {
-        Some(activate_object(&base, &name_upper).await?)
+        Some(activate_object(adt, &base, &name_upper).await?)
     } else {
         None
     };
@@ -1901,6 +1945,7 @@ fn group_or_name(_obj_type: ObjectType, _name: &str, group: &str) -> String {
 /// 与源码 PUT 同锁执行：GET 元数据（带出描述/组件引用）→ PUT 整文档。
 /// 元数据 PUT 是**整文档替换**——不带 description 会把对象描述清空（vsp 实证坑）。
 async fn fm_set_rfc_enabled(
+    adt: &AdtEndpoint,
     fm_base_rel: &str,
     group: &str,
     sess: &mut WriteSession,
@@ -1908,19 +1953,20 @@ async fn fm_set_rfc_enabled(
     transport: Option<&str>,
 ) -> Result<(), String> {
     // 读当前元数据（v3 契约；stateful 会话内）
-    let get_resp = adt_request_raw(
-        axum::http::Method::GET,
-        fm_base_rel,
-        &[],
-        None,
-        None,
-        "application/vnd.sap.adt.functions.fmodules.v3+xml",
-        STATEFUL,
-        sess.cookie_header().as_deref(),
-        Some(sess.token.as_str()),
-    )
-    .await
-    .map_err(|e| e.message)?;
+    let get_resp = adt
+        .request_raw(
+            axum::http::Method::GET,
+            fm_base_rel,
+            &[],
+            None,
+            None,
+            "application/vnd.sap.adt.functions.fmodules.v3+xml",
+            STATEFUL,
+            sess.cookie_header().as_deref(),
+            Some(sess.token.as_str()),
+        )
+        .await
+        .map_err(|e| e.message)?;
     sess.absorb(&get_resp);
     if get_resp.status != 200 {
         return Err(format!("元数据读取返回 {}", get_resp.status));
@@ -1986,19 +2032,20 @@ fmodule:processingType=\"rfc\"{extra}>\
     if let Some(t) = transport.filter(|t| !t.trim().is_empty()) {
         query.push(("corrNr", t));
     }
-    let put_resp = adt_request_raw(
-        axum::http::Method::PUT,
-        fm_base_rel,
-        &query,
-        Some(body.as_bytes()),
-        Some("application/vnd.sap.adt.functions.fmodules.v3+xml"),
-        "*/*",
-        STATEFUL,
-        sess.cookie_header().as_deref(),
-        Some(sess.token.as_str()),
-    )
-    .await
-    .map_err(|e| e.message)?;
+    let put_resp = adt
+        .request_raw(
+            axum::http::Method::PUT,
+            fm_base_rel,
+            &query,
+            Some(body.as_bytes()),
+            Some("application/vnd.sap.adt.functions.fmodules.v3+xml"),
+            "*/*",
+            STATEFUL,
+            sess.cookie_header().as_deref(),
+            Some(sess.token.as_str()),
+        )
+        .await
+        .map_err(|e| e.message)?;
     sess.absorb(&put_resp);
     if (200..300).contains(&put_resp.status) {
         Ok(())
@@ -2032,11 +2079,13 @@ pub struct DeleteOutcome {
 /// 删除对象：锁 → DELETE → 弃会话。删除成功即消耗锁柄（vsp 实证：不再 UNLOCK）；
 /// DELETE 失败则尽力解锁，避免孤儿锁。
 pub async fn delete_object(
+    sys: &std::sync::Arc<crate::systems::SystemHandle>,
     obj_type: ObjectType,
     name: &str,
     group: &str,
     transport: Option<&str>,
 ) -> Result<DeleteOutcome, RfcError> {
+    let adt = sys.adt.as_ref().ok_or_else(crate::adt::adt_disabled)?;
     let base = obj_type.base_rel(name, group);
     let mut warnings = Vec::new();
     // 表/结构（blue 对象）删除不需要编辑锁：无状态 DELETE 即可（真机实证 200）
@@ -2048,24 +2097,25 @@ pub async fn delete_object(
             Some(t) => vec![("corrNr", t)],
             None => vec![],
         };
-        let resp = adt_request_raw(
-            axum::http::Method::DELETE,
-            &base,
-            &query,
-            None,
-            None,
-            "*/*",
-            &[],
-            None,
-            None,
-        )
-        .await
-        .map_err(|e| RfcError {
-            code: -1,
-            status: 502,
-            message: format!("删除失败: {}", e.message),
-            key: "ADT_DELETE_FAILED".into(),
-        })?;
+        let resp = adt
+            .request_raw(
+                axum::http::Method::DELETE,
+                &base,
+                &query,
+                None,
+                None,
+                "*/*",
+                &[],
+                None,
+                None,
+            )
+            .await
+            .map_err(|e| RfcError {
+                code: -1,
+                status: 502,
+                message: format!("删除失败: {}", e.message),
+                key: "ADT_DELETE_FAILED".into(),
+            })?;
         if !(200..300).contains(&resp.status) {
             let body = String::from_utf8_lossy(&resp.body).to_string();
             if body.contains("exc:exception") {
@@ -2083,7 +2133,7 @@ pub async fn delete_object(
             });
         }
         // 删除成功后清 TYPE_CACHE（结构定义没了，字段缓存不能留幽灵条目）
-        let cleared = crate::metadata::invalidate_type(name.trim());
+        let cleared = sys.meta.invalidate_type(name.trim());
         if cleared {
             tracing::debug!(r#type = %name.trim(), "删除后清除 TYPE_CACHE 条目");
         }
@@ -2096,8 +2146,8 @@ pub async fn delete_object(
             warnings,
         });
     }
-    let mut sess = WriteSession::establish(&base).await?;
-    let lock = lock_object(&base, &mut sess).await?;
+    let mut sess = WriteSession::establish(adt, &base).await?;
+    let lock = lock_object(adt, &base, &mut sess).await?;
     let transport_used = transport
         .map(str::to_string)
         .filter(|t| !t.trim().is_empty())
@@ -2110,25 +2160,26 @@ pub async fn delete_object(
     if let Some(t) = transport_used.as_deref() {
         query.push(("corrNr", t));
     }
-    let resp = match adt_request_raw(
-        axum::http::Method::DELETE,
-        &base,
-        &query,
-        None,
-        None,
-        "*/*",
-        STATEFUL,
-        sess.cookie_header().as_deref(),
-        Some(sess.token.as_str()),
-    )
-    .await
+    let resp = match adt
+        .request_raw(
+            axum::http::Method::DELETE,
+            &base,
+            &query,
+            None,
+            None,
+            "*/*",
+            STATEFUL,
+            sess.cookie_header().as_deref(),
+            Some(sess.token.as_str()),
+        )
+        .await
     {
         Ok(r) => r,
         Err(e) => {
-            if let Err(w) = unlock_object(&base, &lock.lock_handle, &mut sess).await {
+            if let Err(w) = unlock_object(adt, &base, &lock.lock_handle, &mut sess).await {
                 warnings.push(w);
             }
-            drop_session(&base, &sess).await;
+            drop_session(adt, &base, &sess).await;
             return Err(RfcError {
                 code: -1,
                 status: 502,
@@ -2140,10 +2191,10 @@ pub async fn delete_object(
     sess.absorb(&resp);
     if !(200..300).contains(&resp.status) {
         // 删除失败：释放锁（对象还在，锁不该留）
-        if let Err(w) = unlock_object(&base, &lock.lock_handle, &mut sess).await {
+        if let Err(w) = unlock_object(adt, &base, &lock.lock_handle, &mut sess).await {
             warnings.push(w);
         }
-        drop_session(&base, &sess).await;
+        drop_session(adt, &base, &sess).await;
         let body = String::from_utf8_lossy(&resp.body);
         if body.contains("exc:exception") {
             return Err(adt_exception_error(&body, "删除对象失败"));
@@ -2160,17 +2211,17 @@ pub async fn delete_object(
         });
     }
     // 成功：DELETE 已消耗锁柄，直接结束会话
-    drop_session(&base, &sess).await;
+    drop_session(adt, &base, &sess).await;
     // 写后失效：函数删除即清 FUNC_CACHE（防幽灵元数据）
     if obj_type == ObjectType::Function {
-        let cleared = crate::metadata::invalidate_function(name.trim());
+        let cleared = sys.meta.invalidate_function(name.trim());
         if cleared {
             tracing::debug!(func = %name.trim(), "删除后清除 FUNC_CACHE 条目");
         }
     }
     // 注册表钩子：函数删除成功 → 墓碑化（保留条目留档；失败只记警告）
     if obj_type == ObjectType::Function {
-        if let Err(e) = crate::registry::tombstone_func(name.trim()) {
+        if let Err(e) = crate::registry::tombstone_func(name.trim(), &sys.name) {
             warnings.push(format!("注册表墓碑化失败（不影响删除）: {}", e.message));
         }
     }
@@ -2507,12 +2558,13 @@ fn restored_crlf(s: &str) -> String {
 
 /// 读对象当前源码（ADT 通道，写路径的权威状态）。
 pub async fn read_current_source(
+    adt: &AdtEndpoint,
     obj_type: ObjectType,
     name: &str,
     group: &str,
 ) -> Result<String, RfcError> {
     let rel = obj_type.source_rel(name, group);
-    let lines = adt_get_text_lines(&rel).await?;
+    let lines = adt.get_text_lines(&rel).await?;
     Ok(lines.join("\n"))
 }
 

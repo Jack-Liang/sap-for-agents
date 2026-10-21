@@ -3459,12 +3459,25 @@ struct RegistryOpsCache {
 static REGISTRY_OPS: tokio::sync::RwLock<Option<RegistryOpsCache>> =
     tokio::sync::RwLock::const_new(None);
 
+/// 启动期注入的多系统注册表（main 组装后调用一次）。
+/// 目录重建按条目 system 从这里取连接；未注入（测试/异常路径）时目录为空。
+static SHARED_STATE: std::sync::OnceLock<crate::server::SharedState> = std::sync::OnceLock::new();
+
+/// 启动期注入多系统注册表（main 调一次）。
+pub fn init_shared_state(state: crate::server::SharedState) {
+    let _ = SHARED_STATE.set(state);
+}
+
+fn shared_state() -> Option<crate::server::SharedState> {
+    SHARED_STATE.get().cloned()
+}
+
 /// 缓存 TTL：签名漂移跟随的上限（正常变更走 generation 立即失效）。
 const REGISTRY_OPS_TTL: CacheTtl = CacheTtl::from_secs(600);
 
 /// 重建全部 published 条目的 operation（借连接池逐个拉接口元数据）。
 /// 单条目失败 → 占位 operation（缺口可见，不吞错，不拖垮整个目录）。
-async fn rebuild_registry_ops(pool: &crate::server::SharedPool) -> Vec<(String, Value)> {
+async fn rebuild_registry_ops(state: &crate::server::SharedState) -> Vec<(String, Value)> {
     let entries = match crate::registry::published_entries() {
         Ok(e) => e,
         Err(e) => {
@@ -3474,9 +3487,28 @@ async fn rebuild_registry_ops(pool: &crate::server::SharedPool) -> Vec<(String, 
     };
     let mut ops = Vec::with_capacity(entries.len());
     for entry in entries {
+        // 条目按其 system 字段路由到对应系统（v0.16 多系统）
+        let Some(sys) = state.resolve(&entry.system) else {
+            let path = format!("/api/invokes/{}", entry.alias);
+            let placeholder = json!({
+                "post": {
+                    "tags": ["registry"],
+                    "operationId": format!("invoke_{}", entry.alias.replace('/', "_")),
+                    "summary": format!("{} (unknown system)", entry.intent),
+                    "description": format!(
+                        "Entry {} references system '{}' which is not configured in this                          gateway deployment. Update the entry (PUT /api/registry/{}) or                          add the system to sap_systems.toml.",
+                        entry.alias, entry.system, entry.alias
+                    ),
+                    "responses": { "200": { "description": "Flat result" } }
+                }
+            });
+            ops.push((path, placeholder));
+            continue;
+        };
         let func = entry.func_name.clone();
-        let r = crate::server::run_blocking(Arc::clone(pool), move |conn| {
-            crate::server::collect_function_params(conn, &func)
+        let iface_sys = Arc::clone(&sys);
+        let r = crate::server::run_blocking(Arc::clone(&sys), move |conn| {
+            crate::server::collect_function_params(&iface_sys, conn, &func)
         })
         .await;
         let op = match r {
@@ -3506,14 +3538,17 @@ async fn rebuild_registry_ops(pool: &crate::server::SharedPool) -> Vec<(String, 
 
 /// 取注册表 operation（缓存优先：代际一致且未过 TTL 直接复用）。
 /// 重建失败（如 SAP 不可达）时退回旧缓存——公开规范永远可用，最多旧一点。
-pub async fn registry_ops(pool: &crate::server::SharedPool) -> Arc<Vec<(String, Value)>> {
+pub async fn registry_ops() -> Arc<Vec<(String, Value)>> {
     let gen = crate::registry::generation();
     if let Some(cached) = REGISTRY_OPS.read().await.as_ref() {
         if cached.generation == gen && cached.built_at.elapsed() < REGISTRY_OPS_TTL {
             return Arc::clone(&cached.ops);
         }
     }
-    let ops = Arc::new(rebuild_registry_ops(pool).await);
+    let ops = Arc::new(match shared_state() {
+        Some(state) => rebuild_registry_ops(&state).await,
+        None => Vec::new(),
+    });
     *REGISTRY_OPS.write().await = Some(RegistryOpsCache {
         generation: gen,
         built_at: std::time::Instant::now(),
@@ -3534,7 +3569,7 @@ async fn registry_ops_cached() -> Option<Arc<Vec<(String, Value)>>> {
 
 /// 后台 watcher（main spawn）：代际变化、缓存为空或 TTL 到期时重建。
 /// 让公开的 /openapi.json 永远命中缓存，不被 SAP 的健康状况绑架。
-pub async fn registry_ops_watcher(pool: crate::server::SharedPool) {
+pub async fn registry_ops_watcher() {
     loop {
         tokio::time::sleep(CacheTtl::from_secs(2)).await;
         let gen = crate::registry::generation();
@@ -3543,7 +3578,10 @@ pub async fn registry_ops_watcher(pool: crate::server::SharedPool) {
             Some(c) => c.generation != gen || c.built_at.elapsed() >= REGISTRY_OPS_TTL,
         };
         if need {
-            let ops = rebuild_registry_ops(&pool).await;
+            let ops = match shared_state() {
+                Some(state) => rebuild_registry_ops(&state).await,
+                None => Vec::new(),
+            };
             tracing::info!(count = ops.len(), generation = gen, "注册表服务目录已重建");
             *REGISTRY_OPS.write().await = Some(RegistryOpsCache {
                 generation: gen,
@@ -3778,6 +3816,7 @@ mod tests {
         let entry = Entry {
             alias: "z_calc".into(),
             func_name: "Z_CALC".into(),
+            system: "default".into(),
             group: Some("ZMATH".into()),
             intent: "calculator for frontend".into(),
             notes: "integers only".into(),

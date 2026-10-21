@@ -32,6 +32,8 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 toml = "1.1"
 # ST22 结构化读取：解析 ADT runtime dumps 的 Atom feed（/api/dumps/**）
 quick-xml = "0.42"
+# 多系统作用域路由：/api/s/{system}/** 的 URI 改写服务（tower Service 手写实现）
+tower = { version = "0.5", features = ["util"] }
 
 [profile.release]
 lto = true
@@ -42,7 +44,5 @@ opt-level = "z"
 strip = true
 
 [dev-dependencies]
-# axum 路由级集成测试（oneshot）
-tower = { version = "0.5", features = ["util"] }
-# 读取响应 body 到 bytes
+# 读取响应 body 到 bytes（路由级 oneshot 测试用；tower 已是正式依赖）
 http-body-util = "0.1"

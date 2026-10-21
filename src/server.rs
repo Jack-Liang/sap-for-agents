@@ -1,6 +1,9 @@
 //! axum HTTP 服务：路由、handler、共享状态。
 //!
-//! 共享状态是 `Arc<RfcConnectionPool>`：多连接池 + 自动重连。
+//! 共享状态是 `Arc<SystemRegistry>`（v0.16 多系统）：每系统一个
+//! [`crate::systems::SystemHandle`]（连接池 + ADT 端点 + 元数据缓存）。
+//! 无前缀路径路由到默认系统；`/api/s/{system}/...` 由 [`ScopeService`]
+//! 改写后命中同一套路由（见 [`app`]）。
 //! handler 内通过 `tokio::task::spawn_blocking` 把 FFI 执行丢到阻塞线程池，
 //! 不同请求可拿到不同连接并行执行 SAP 调用；同时让非 Send 的裸指针类型
 //! 只存在于阻塞闭包内，不跨 await 点，保证 future 干净 Send。
@@ -13,7 +16,7 @@ use crate::api::{
 use crate::connection::{get_field_infos, RfcConnection};
 use crate::error::RfcError;
 use crate::executor::execute_collect;
-use crate::pool::RfcConnectionPool;
+use crate::systems::{Sap, Scope, SystemHandle, SystemRegistry};
 use axum::response::IntoResponse;
 use axum::{routing::post, Json, Router};
 use governor::{clock::DefaultClock, state::keyed::DefaultKeyedStateStore, Quota, RateLimiter};
@@ -24,24 +27,8 @@ use std::num::NonZeroU32;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-/// 全局共享状态：连接池（内部含连接 + 重连参数）
-pub type SharedPool = Arc<RfcConnectionPool>;
-
-/// 全局请求超时（启动期由 [`init_request_timeout`] 写入，默认 60s）。
-static REQUEST_TIMEOUT: OnceLock<Duration> = OnceLock::new();
-
-/// 启动期设置全局请求超时（main 调一次）。
-pub fn init_request_timeout(d: Duration) {
-    let _ = REQUEST_TIMEOUT.set(d);
-}
-
-/// 当前全局请求超时；未初始化时回退 60s。
-fn request_timeout() -> Duration {
-    REQUEST_TIMEOUT
-        .get()
-        .copied()
-        .unwrap_or_else(|| Duration::from_secs(60))
-}
+/// 全局共享状态：多系统注册表（每系统含连接池 + ADT 端点 + 元数据缓存）
+pub type SharedState = Arc<SystemRegistry>;
 
 /// Prometheus 指标记录器句柄（启动期由 [`init_metrics`] 写入）。
 static METRICS_HANDLE: OnceLock<PrometheusHandle> = OnceLock::new();
@@ -177,16 +164,24 @@ fn is_read_only_blocked(method: &axum::http::Method, path: &str) -> bool {
 
 /// 只读守卫中间件：拦截写端点（403 READ_ONLY），其余照常放行。
 /// 挂在鉴权层之内——未授权的写请求先拿到 401，语义正确。
+/// 只读开关**按系统**解析：作用域请求（/api/s/{sys}）用该系统的配置，
+/// 无前缀请求用默认系统（两者都在 build_registry 时融合了全局 SAP_READ_ONLY）。
 async fn read_only_guard(
+    axum::extract::State(state): axum::extract::State<SharedState>,
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Result<axum::response::Response, RfcError> {
-    if read_only_enabled() && is_read_only_blocked(req.method(), req.uri().path()) {
+    let read_only = req
+        .extensions()
+        .get::<Scope>()
+        .map(|s| s.0.read_only)
+        .unwrap_or_else(|| state.default().read_only);
+    if read_only && is_read_only_blocked(req.method(), req.uri().path()) {
         return Err(RfcError {
             code: -1,
             status: 403,
             message: format!(
-                "只读模式已启用（SAP_READ_ONLY），写端点被禁用: {} {}",
+                "只读模式已启用（该系统 read_only），写端点被禁用: {} {}",
                 req.method(),
                 req.uri().path()
             ),
@@ -206,14 +201,18 @@ fn timeout_error(timeout: Duration) -> RfcError {
     }
 }
 
-/// 用指定超时在阻塞线程池内执行 SAP 调用。
+/// 用指定超时在阻塞线程池内执行 SAP 调用（目标系统由 `sys` 给出）。
 ///
 /// `spawn_blocking` + `with_connection`（含自动重连）+ `tokio::time::timeout` 收敛到一处。
 /// 超时返回 504。注意：超时后 `spawn_blocking` 线程无法取消，FFI 会跑到 SAP 响应才归还
 /// 连接（NWRFC 固有限制，靠协议层超时兜底）。FFI 与连接池内部状态都被限制在阻塞闭包中，
 /// 绝不跨 await 点，保证 future 干净 Send。
+///
+/// 附带 SYSID 登记：调用成功且该系统尚未登记过 SYSID 时，从连接属性读取并登记
+/// （本地调用无 RFC 往返）。与其他系统冲突 → 隔离该系统（SDK 描述符缓存按 SYSID
+/// 分区，同 SYSID 静默共享错误签名是硬伤，必须挡住）。
 pub(crate) async fn run_blocking_with_timeout<F, R>(
-    pool: SharedPool,
+    sys: Arc<SystemHandle>,
     timeout: Duration,
     f: F,
 ) -> Result<R, RfcError>
@@ -221,8 +220,37 @@ where
     F: FnMut(&RfcConnection) -> Result<R, RfcError> + Send + 'static,
     R: Send + 'static,
 {
-    let pool = Arc::clone(&pool);
-    let join = tokio::task::spawn_blocking(move || pool.with_connection(f));
+    sys.check_available()?;
+    let pool = Arc::clone(&sys.pool);
+    let hook_sys = Arc::clone(&sys);
+    let mut f = f;
+    let join = tokio::task::spawn_blocking(move || {
+        pool.with_connection(|conn| {
+            let r = f(conn);
+            if r.is_ok() && hook_sys.sysid().is_none() {
+                match conn.system_info() {
+                    Ok(info) => {
+                        if let Err(owner) = hook_sys.record_sysid(&info.sysid) {
+                            tracing::error!(
+                                system = %hook_sys.name,
+                                conflict_with = %owner,
+                                sysid = %info.sysid,
+                                "SYSID 冲突，系统已隔离（SDK 描述符缓存按 SYSID 分区）"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::debug!(
+                            system = %hook_sys.name,
+                            msg = %e.message,
+                            "连接属性读取失败，SYSID 登记推迟到下次调用"
+                        );
+                    }
+                }
+            }
+            r
+        })
+    });
     match tokio::time::timeout(timeout, join).await {
         Ok(inner) => inner.map_err(|e| RfcError {
             code: -1,
@@ -242,13 +270,14 @@ where
     }
 }
 
-/// 用全局默认超时执行（元数据查询等无需 per-request 超时的端点用这个）。
-pub(crate) async fn run_blocking<F, R>(pool: SharedPool, f: F) -> Result<R, RfcError>
+/// 用该系统默认超时执行（元数据查询等无需 per-request 超时的端点用这个）。
+pub(crate) async fn run_blocking<F, R>(sys: Arc<SystemHandle>, f: F) -> Result<R, RfcError>
 where
     F: FnMut(&RfcConnection) -> Result<R, RfcError> + Send + 'static,
     R: Send + 'static,
 {
-    run_blocking_with_timeout(pool, request_timeout(), f).await
+    let timeout = sys.request_timeout;
+    run_blocking_with_timeout(sys, timeout, f).await
 }
 
 /// 仅静态路由（不依赖 SAP 连接池）：首页 / Agent 文档 / 健康检查。
@@ -267,8 +296,14 @@ pub fn static_app<S: Clone + Send + Sync + 'static>() -> Router<S> {
         .route("/health", axum::routing::get(health_handler))
 }
 
-/// 构建带共享连接池的 Router（静态路由 + SAP 业务路由）
-pub fn app(pool: SharedPool) -> Router {
+/// 构建带多系统状态的 Router：静态路由 + SAP 业务路由 + 作用域改写层。
+///
+/// 内层（`inner`）是 v0.15 的完整路由面（含鉴权/限流/只读/runtime 守卫），
+/// 状态为 [`SharedState`]；外层是空 Router + [`ScopeService`] 兜底——
+/// `/api/s/{system}/rest` 在此被改写为 `/api/{rest}`（`ready` 特判映射到
+/// `/ready`）并塞入 [`Scope`]，随后由内层按无前缀路径正常匹配。
+/// 这样守卫/鉴权/限流对两种形态零重复，新路由也自动获得作用域形态。
+pub fn app(state: SharedState) -> Router {
     // 受认证保护的 /api 业务路由：设置 SAP_API_KEY 后要求 Bearer token
     let api = Router::new()
         .route("/api/rfc", post(invoke_handler))
@@ -319,26 +354,171 @@ pub fn app(pool: SharedPool) -> Router {
                 .delete(object_delete_handler),
         )
         // ADT REST 通用代理（dump 正文、类/程序源码等，任何方法透传）
-        .route(
-            "/api/adt/{*path}",
-            axum::routing::any(crate::adt::adt_proxy),
-        )
-        .layer(axum::middleware::from_fn(read_only_guard))
+        .route("/api/adt/{*path}", axum::routing::any(adt_proxy_handler))
         .layer(axum::middleware::from_fn(runtime_mode_guard))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            read_only_guard,
+        ))
         .layer(axum::middleware::from_fn(crate::auth::require_api_key))
         .layer(axum::middleware::from_fn(rate_limit_middleware));
 
-    // 探针与公开页免鉴权：编排系统探针不便带 token，且无业务数据泄露
-    static_app()
+    // 探针、公开页、系统清单与版本自描述免鉴权
+    let inner: Router = static_app()
         .route("/ready", axum::routing::get(ready_handler))
         // /api/version 同样公开：Agent 拿不到 token 前也需要知道"要不要 token"
         // （capabilities.auth）。挂在公开侧使其不受 require_api_key 拦截。
         .route("/api/version", axum::routing::get(version_handler))
+        // 多系统清单（v0.16）：Agent 会话第一步——有哪些系统、谁是默认、健康度
+        .route("/api/systems", axum::routing::get(systems_handler))
         .route("/metrics", axum::routing::get(metrics_handler))
         .merge(api)
         .fallback(fallback_handler)
         .layer(axum::middleware::from_fn(unify_method_not_allowed))
-        .with_state(pool)
+        .with_state(state.clone());
+
+    // 外层空 Router：所有请求进 ScopeService（作用域前缀改写/未知系统 404）
+    Router::new().fallback_service(ScopeService {
+        inner,
+        registry: state,
+    })
+}
+
+/// `/api/s/{system}/**` 作用域改写服务（外层兜底，pre-routing）。
+///
+/// - `/api/s/{sys}/ready` → `/ready`（每系统 readiness）；
+/// - `/api/s/{sys}/{rest}` → `/api/{rest}`（业务面作用域形态）；
+/// - 未知系统名 → 404 `SYSTEM_UNKNOWN`（附可用清单）短路返回；
+/// - 其余路径原样放行（存量无前缀形态）。
+///
+/// 手写 tower Service 而非 `MapRequestLayer`：未知系统需要**短路响应**，
+/// MapRequest 只能变换请求。克隆 Router 进闭包是 axum 官方推荐的包装模式
+/// （路由表内部全是 Arc，克隆廉价）。
+#[derive(Clone)]
+pub struct ScopeService {
+    inner: Router,
+    registry: SharedState,
+}
+
+/// 解析作用域前缀：返回 (系统名, 重写后的目标路径)。
+/// `/api/s/` 后必须有 `系统名/目标` 两段；单独 `/api/s/{sys}` 不视为作用域。
+fn scoped_target(path: &str) -> Option<(String, String)> {
+    let rest = path.strip_prefix("/api/s/")?;
+    let (sys, tail) = rest.split_once('/')?;
+    if sys.is_empty() || tail.is_empty() {
+        return None;
+    }
+    // ready 是唯一挂在公开侧的作用域目标（探针免鉴权）
+    let target = if tail == "ready" {
+        "/ready".to_string()
+    } else {
+        format!("/api/{tail}")
+    };
+    Some((sys.to_string(), target))
+}
+
+impl tower::Service<axum::extract::Request> for ScopeService {
+    type Response = axum::response::Response;
+    type Error = std::convert::Infallible;
+    type Future = std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send>,
+    >;
+
+    fn poll_ready(
+        &mut self,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        // Router 内部无背压力语义（clone 进闭包后自行消费）
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, mut req: axum::extract::Request) -> Self::Future {
+        if let Some((sys_name, target)) = scoped_target(req.uri().path()) {
+            match self.registry.resolve(&sys_name) {
+                None => {
+                    let names = self.registry.names().join(", ");
+                    let err = RfcError {
+                        code: -1,
+                        status: 404,
+                        message: format!(
+                            "未知系统 '{}'（可用系统: {}）。作用域前缀形态: /api/s/{{系统名}}/...",
+                            sys_name, names
+                        ),
+                        key: "SYSTEM_UNKNOWN".into(),
+                    };
+                    return Box::pin(std::future::ready(Ok(err.into_response())));
+                }
+                Some(sys) => {
+                    req.extensions_mut().insert(Scope(sys));
+                    // 重写 URI（保留 query）
+                    let mut parts = req.uri().clone().into_parts();
+                    let pq = parts.path_and_query.take();
+                    let new_pq = match pq.as_ref().and_then(|p| p.query()) {
+                        Some(q) => format!("{target}?{q}"),
+                        None => target,
+                    };
+                    match new_pq.parse::<axum::http::uri::PathAndQuery>() {
+                        Ok(pq) => {
+                            parts.path_and_query = Some(pq);
+                            if let Ok(uri) = axum::http::Uri::from_parts(parts) {
+                                *req.uri_mut() = uri;
+                            }
+                        }
+                        Err(e) => {
+                            let err = RfcError {
+                                code: -1,
+                                status: 400,
+                                message: format!("作用域路径非法: {}", e),
+                                key: "SCOPE_PATH_INVALID".into(),
+                            };
+                            return Box::pin(std::future::ready(Ok(err.into_response())));
+                        }
+                    }
+                }
+            }
+        }
+        let mut inner = self.inner.clone();
+        Box::pin(async move { inner.call(req).await })
+    }
+}
+
+/// `GET /api/systems` —— 多系统清单（公开免鉴权）：Agent 会话第一步。
+/// name / 是否默认 / read_only / ADT 启用 / 已登记的 SYSID / 隔离状态。
+async fn systems_handler(
+    axum::extract::State(state): axum::extract::State<SharedState>,
+) -> Json<serde_json::Value> {
+    let systems: Vec<serde_json::Value> = state
+        .list()
+        .iter()
+        .map(|s| {
+            serde_json::json!({
+                "name": s.name,
+                "default": Arc::ptr_eq(s, state.default()),
+                "read_only": s.read_only,
+                "adt": s.adt.is_some(),
+                "sysid": s.sysid(),
+                "quarantined": s.is_quarantined(),
+            })
+        })
+        .collect();
+    Json(serde_json::json!({
+        "count": systems.len(),
+        "default": state.default().name,
+        "systems": systems,
+        "note": "作用域前缀形态：/api/s/{系统名}/...（如 /api/s/prd/rfc）；无前缀 = 默认系统",
+    }))
+}
+
+/// `ANY /api/adt/{*path}` 的 handler 包装：解析系统 → 委托该系统 ADT 端点透传。
+async fn adt_proxy_handler(
+    sap: Sap,
+    method: axum::http::Method,
+    uri: axum::http::Uri,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<axum::response::Response, RfcError> {
+    let adt = sap.adt.as_ref().ok_or_else(crate::adt::adt_disabled)?;
+    adt.proxy(method, uri, headers, body).await
 }
 
 /// GET /docs —— Redoc 交互式文档（公开页，渲染 /openapi.json）。
@@ -419,7 +599,7 @@ async fn unify_method_not_allowed(
 /// 启动 HTTP 服务（阻塞当前异步任务直到服务器结束）。
 /// `shutdown` 是一个 future，完成时触发优雅停机。
 pub async fn run(
-    pool: SharedPool,
+    state: SharedState,
     listen_addr: &str,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> Result<(), std::io::Error> {
@@ -450,7 +630,7 @@ pub async fn run(
     tracing::info!("           GET /api/functions/:name/doc | GET /api/ddic/type/:name | GET /api/ddic/field/:t/:f");
     axum::serve(
         listener,
-        app(pool).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        app(state).into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
     .with_graceful_shutdown(shutdown)
     .await
@@ -473,9 +653,9 @@ async fn health_handler() -> Json<serde_json::Value> {
 /// `null` + `sap_error` 带原因，端点仍 200——SAP 宕机时恰恰最需要这份自描述。
 /// 详见 `version` 模块。
 async fn version_handler(
-    axum::extract::State(pool): axum::extract::State<SharedPool>,
+    axum::extract::State(state): axum::extract::State<SharedState>,
 ) -> Json<serde_json::Value> {
-    Json(crate::version::gateway_info(&pool).await)
+    Json(crate::version::gateway_info(&state).await)
 }
 
 /// `GET /ready` —— readiness 探针：借连接池调 `RFC_PING` 验证 SAP 可达（带 5s 超时）。
@@ -486,12 +666,11 @@ async fn version_handler(
 ///
 /// 超时后 `spawn_blocking` 内的 ping 仍会跑完（无法取消），但 ping 本身很快；
 /// 最坏占用一个连接几秒，探针频率（默认 10s）下可接受。
-async fn ready_handler(
-    axum::extract::State(pool): axum::extract::State<SharedPool>,
-) -> (axum::http::StatusCode, Json<serde_json::Value>) {
+async fn ready_handler(sap: Sap) -> (axum::http::StatusCode, Json<serde_json::Value>) {
     const READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-    let ping = tokio::time::timeout(READY_TIMEOUT, run_blocking(pool, |conn| conn.ping())).await;
+    let ping =
+        tokio::time::timeout(READY_TIMEOUT, run_blocking(sap.arc(), |conn| conn.ping())).await;
 
     match ping {
         Ok(Ok(())) => (
@@ -660,7 +839,7 @@ fn mask_value(key: &str, value: &ScalarValue) -> String {
 /// 流程：反序列化请求 → spawn_blocking 内通过连接池执行（含自动重连）→ 返回 JSON 结果。
 /// FFI 与连接池内部状态都被限制在阻塞闭包中，绝不跨 await 点。
 async fn invoke_handler(
-    axum::extract::State(pool): axum::extract::State<SharedPool>,
+    sap: Sap,
     axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
     req: Result<Json<InvokeRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Json<InvokeResponse>, RfcError> {
@@ -672,7 +851,7 @@ async fn invoke_handler(
         message: r.body_text(),
         key: "JSON_INVALID".into(),
     })?;
-    run_invoke_and_log(pool, caller_ip, req, "rfc", None).await
+    run_invoke_and_log(sap.arc(), caller_ip, req, "rfc", None).await
 }
 
 /// POST /api/functions/{name}/invoke —— 类型化调用（函数名来自路径，请求体免填 func_name）。
@@ -681,7 +860,7 @@ async fn invoke_handler(
 /// 语义一致，仅 `func_name` 由路径注入（body 里同名键被忽略）。动态 OpenAPI 规范
 /// （`GET /api/openapi?functions=...`）为每个函数生成的 operation 即指向本端点。
 async fn function_invoke_handler(
-    axum::extract::State(pool): axum::extract::State<SharedPool>,
+    sap: Sap,
     axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
     axum::extract::Path(name): axum::extract::Path<String>,
     body: Result<Json<serde_json::Value>, axum::extract::rejection::JsonRejection>,
@@ -710,7 +889,7 @@ async fn function_invoke_handler(
         message: format!("请求体与 /api/rfc 契约不符: {e}"),
         key: "JSON_INVALID".into(),
     })?;
-    run_invoke_and_log(pool, caller_ip, req, "functions-invoke", None).await
+    run_invoke_and_log(sap.arc(), caller_ip, req, "functions-invoke", None).await
 }
 
 // ========================================================================
@@ -768,8 +947,10 @@ pub(crate) fn audit_snapshot() -> Vec<AuditRecord> {
 
 /// /api/rfc 与 /api/functions/{name}/invoke 的共享执行段：
 /// 超时控制 → 连接池执行 → 指标采样 → 审计日志 + 审计环形缓冲。
+/// 目标系统由 `sys` 给出（作用域或默认系统）。
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_invoke_and_log(
-    pool: SharedPool,
+    sys: Arc<SystemHandle>,
     caller_ip: String,
     req: InvokeRequest,
     via: &'static str,
@@ -778,25 +959,30 @@ pub(crate) async fn run_invoke_and_log(
     let started = std::time::Instant::now();
     let func_name = req.func_name.clone();
     let params = summarize_params(&req);
-    let pool_stats = pool.stats(); // 采样当前池状态（pool 即将 move 进闭包）
+    let system_name = sys.name.clone();
+    let pool_stats = sys.pool.stats(); // 采样当前池状态（pool 即将 move 进闭包）
 
-    // per-request 超时：调用方可对慢接口自主放宽；不传/传 0 → 用全局默认。
+    // per-request 超时：调用方可对慢接口自主放宽；不传/传 0 → 用该系统默认。
     // clamp 到 [1, MAX_TIMEOUT_SECS]，防止恶意传天文数字超时长期占用连接/阻塞线程。
     const MAX_TIMEOUT_SECS: u64 = 1800; // 30 分钟上限
     let timeout = req
         .timeout_secs
         .filter(|&s| s >= 1)
         .map(|s| Duration::from_secs(s.min(MAX_TIMEOUT_SECS)))
-        .unwrap_or_else(request_timeout);
-    // 通过 with_connection 执行：遇通信类错误自动丢弃并新建连接重试
-    let result =
-        run_blocking_with_timeout(pool, timeout, move |conn| execute_collect(conn, &req)).await;
+        .unwrap_or(sys.request_timeout);
+    // 通过 with_connection 执行：遇通信类错误自动丢弃并新建连接重试。
+    // 元数据解析（resolve_meta）用该系统自己的缓存实例。
+    let exec_sys = Arc::clone(&sys);
+    let result = run_blocking_with_timeout(sys, timeout, move |conn| {
+        execute_collect(&exec_sys, conn, &req)
+    })
+    .await;
     let elapsed_ms = started.elapsed().as_millis() as u64;
 
-    // 指标：池状态 gauge（每次调用采样）+ 调用计数/耗时（按 函数×结果 分维）
-    gauge!("pool_idle").set(pool_stats.idle as f64);
-    gauge!("pool_total").set(pool_stats.total as f64);
-    gauge!("pool_max").set(pool_stats.max as f64);
+    // 指标：池状态 gauge（每次调用采样，按系统分维）+ 调用计数/耗时（按 函数×结果 分维）
+    gauge!("pool_idle", "system" => system_name.clone()).set(pool_stats.idle as f64);
+    gauge!("pool_total", "system" => system_name.clone()).set(pool_stats.total as f64);
+    gauge!("pool_max", "system" => system_name.clone()).set(pool_stats.max as f64);
 
     // 审计日志 + 指标：成功 info / 失败 warn（失败 = 告警信号）
     let audit_via = via;
@@ -887,7 +1073,7 @@ pub(crate) struct DynamicSpecQuery {
 const DYNAMIC_SPEC_MAX_FUNCTIONS: usize = 50;
 
 async fn openapi_dynamic_handler(
-    axum::extract::State(pool): axum::extract::State<SharedPool>,
+    sap: Sap,
     axum::extract::Query(q): axum::extract::Query<DynamicSpecQuery>,
     req: axum::extract::Request,
 ) -> Result<Json<serde_json::Value>, RfcError> {
@@ -904,7 +1090,9 @@ async fn openapi_dynamic_handler(
     //（契约按需派生 + 代际/TTL 缓存，见 openapi::registry_ops）
     let given = q.functions.as_deref().map(str::trim).unwrap_or("");
     if given.is_empty() {
-        let ops = crate::openapi::registry_ops(&pool).await;
+        // 注册表目录模式按条目 system 各自取接口（openapi 模块持有启动期注入的
+        // 多系统注册表；目录由后台 watcher 预热维护）
+        let ops = crate::openapi::registry_ops().await;
         let mut spec = crate::openapi::build_spec(&format!("http://{host}"), auth_enabled);
         if let Some(paths) = spec["paths"].as_object_mut() {
             for (path, op) in ops.iter() {
@@ -950,21 +1138,23 @@ async fn openapi_dynamic_handler(
     }
 
     // (函数名, Ok<(path, operation)> | Err(错误消息))：单函数失败不拖垮整个规范
-    let results: Vec<(String, (String, serde_json::Value))> = run_blocking(pool, move |conn| {
-        let ops: Vec<(String, (String, serde_json::Value))> = names
-            .iter()
-            .map(|n| {
-                let r = collect_function_params(conn, n);
-                let op = match r {
-                    Ok(view) => crate::openapi::function_operation(n, &view.params),
-                    Err(e) => crate::openapi::function_operation_failed(n, &e.message),
-                };
-                (n.clone(), op)
-            })
-            .collect();
-        Ok(ops)
-    })
-    .await?;
+    let spec_sys = sap.arc();
+    let results: Vec<(String, (String, serde_json::Value))> =
+        run_blocking(Arc::clone(&spec_sys), move |conn| {
+            let ops: Vec<(String, (String, serde_json::Value))> = names
+                .iter()
+                .map(|n| {
+                    let r = collect_function_params(&spec_sys, conn, n);
+                    let op = match r {
+                        Ok(view) => crate::openapi::function_operation(n, &view.params),
+                        Err(e) => crate::openapi::function_operation_failed(n, &e.message),
+                    };
+                    (n.clone(), op)
+                })
+                .collect();
+            Ok(ops)
+        })
+        .await?;
 
     let mut spec = crate::openapi::build_spec(&format!("http://{host}"), crate::auth::is_enabled());
     if let Some(paths) = spec["paths"].as_object_mut() {
@@ -1026,27 +1216,27 @@ fn param_info_to_field_def(p: &crate::connection::ParamInfo) -> Result<FieldDef,
 /// 原始斜杠（/api/functions//SDF/X）与 %2F 编码两种 URL 形式均能命中。
 /// 小写 /doc、/source 不会出现在合法函数名中（SAP 函数名为大写），按尾部识别是安全的。
 async fn function_route_dispatcher(
-    axum::extract::State(pool): axum::extract::State<SharedPool>,
+    sap: Sap,
     axum::extract::Path(name): axum::extract::Path<String>,
     axum::extract::Query(q): axum::extract::Query<LangQuery>,
 ) -> axum::response::Response {
-    use axum::extract::{Path, Query, State};
+    use axum::extract::{Path, Query};
     if let Some(base) = name.strip_suffix("/doc").filter(|b| !b.is_empty()) {
-        return function_doc_handler(State(pool), Path(base.to_string()), Query(q))
+        return function_doc_handler(sap, Path(base.to_string()), Query(q))
             .await
             .into_response();
     }
     if let Some(base) = name.strip_suffix("/source").filter(|b| !b.is_empty()) {
-        return function_source_handler(State(pool), Path(base.to_string()), q.prologue.clone())
+        return function_source_handler(sap, Path(base.to_string()), q.prologue.clone())
             .await
             .into_response();
     }
     if let Some(base) = name.strip_suffix("/where-used").filter(|b| !b.is_empty()) {
-        return function_where_used_handler(State(pool), Path(base.to_string()), Query(q))
+        return function_where_used_handler(sap, Path(base.to_string()), Query(q))
             .await
             .into_response();
     }
-    function_interface_handler(State(pool), Path(name))
+    function_interface_handler(sap, Path(name))
         .await
         .into_response()
 }
@@ -1056,15 +1246,16 @@ async fn function_route_dispatcher(
 /// 基于 REPOSITORY_ENVIRONMENT_SET_RFC；结果依赖 SAP 端使用索引（WBCROSSGT）。
 /// 索引未建立的系统（ABAP Cloud Trial 等）返回空列表并附 note 说明——不是错误。
 async fn function_where_used_handler(
-    axum::extract::State(pool): axum::extract::State<SharedPool>,
+    sap: Sap,
     axum::extract::Path(name): axum::extract::Path<String>,
     axum::extract::Query(q): axum::extract::Query<LangQuery>,
 ) -> Result<Json<serde_json::Value>, RfcError> {
     crate::api::validate_func_name(&name)?;
     let max = q.max.unwrap_or(200).min(2000);
     let resp_name = name.clone();
-    let usages = run_blocking(pool, move |conn| {
-        crate::discovery::read_where_used(conn, &name, max)
+    let wu_sys = sap.arc();
+    let usages = run_blocking(Arc::clone(&wu_sys), move |conn| {
+        crate::discovery::read_where_used(&wu_sys.meta, conn, &name, max)
     })
     .await?;
     let mut body = serde_json::json!({
@@ -1082,12 +1273,16 @@ async fn function_where_used_handler(
 
 /// ① GET /api/functions/:name —— 查函数完整接口（参数/类型/方向/嵌套字段）
 async fn function_interface_handler(
-    axum::extract::State(pool): axum::extract::State<SharedPool>,
+    sap: Sap,
     axum::extract::Path(name): axum::extract::Path<String>,
 ) -> Result<Json<FunctionInterface>, RfcError> {
     crate::api::validate_func_name(&name)?;
     let req_name = name.clone();
-    let result = run_blocking(pool, move |conn| collect_function_params(conn, &name)).await?;
+    let iface_sys = sap.arc();
+    let result = run_blocking(Arc::clone(&iface_sys), move |conn| {
+        collect_function_params(&iface_sys, conn, &name)
+    })
+    .await?;
     Ok(Json(FunctionInterface {
         name: req_name,
         params: result.params,
@@ -1111,17 +1306,18 @@ pub(crate) struct InterfaceView {
 /// 优先 FII 实时读，再与 SDK 描述符视图**合并**：SDK 认识（同名同方向）的
 /// 参数保留其精确类型/长度/嵌套字段，SDK 不认识的（签名刚变更、描述符缓存
 /// 未跟上）做尽力映射。FII 失败（除「函数不存在」外）降级为纯 SDK 通道，
-/// 即 v0.14 及之前的行为。
+/// 即 v0.14 及之前的行为。DDIC 解析用 `sys` 自己的元数据缓存（按系统隔离）。
 pub(crate) fn collect_function_params(
+    sys: &SystemHandle,
     conn: &crate::connection::RfcConnection,
     name: &str,
 ) -> Result<InterfaceView, RfcError> {
-    match crate::discovery::read_function_interface_rfc(conn, name) {
+    match crate::discovery::read_function_interface_rfc(&sys.meta, conn, name) {
         Ok((raw, docu)) => {
             // SDK 视图拿不到（如非远程函数的描述符、通讯故障）就全走尽力映射
             let sdk = conn.get_param_infos(name).ok();
             let params = merge_interface(sdk.as_deref(), &raw, &docu, &|t| {
-                crate::metadata::get_type_fields(conn, t).ok()
+                sys.meta.get_type_fields(conn, t).ok()
             });
             Ok(InterfaceView { params, via: "fii" })
         }
@@ -1305,7 +1501,7 @@ pub(crate) struct SearchRequest {
 }
 /// ② POST /api/functions/search —— 搜索函数模块
 async fn search_functions_handler(
-    axum::extract::State(pool): axum::extract::State<SharedPool>,
+    sap: Sap,
     req: Result<Json<SearchRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Json<SearchResponse>, RfcError> {
     let Json(req) = req.map_err(|r| RfcError {
@@ -1325,8 +1521,9 @@ async fn search_functions_handler(
     }
     let max = req.max_results.unwrap_or(50).min(500);
     let pattern = req.pattern.clone();
-    let functions = run_blocking(pool, move |conn| {
-        crate::discovery::search_functions(conn, &req.pattern, &req.group, max)
+    let src_sys = sap.arc();
+    let functions = run_blocking(Arc::clone(&src_sys), move |conn| {
+        crate::discovery::search_functions(&src_sys.meta, conn, &req.pattern, &req.group, max)
     })
     .await?;
     let count = functions.len();
@@ -1347,12 +1544,13 @@ async fn search_functions_handler(
 
 /// ③ GET /api/ddic/type/:name —— 查 DDIC 结构/表的字段定义
 async fn ddic_type_handler(
-    axum::extract::State(pool): axum::extract::State<SharedPool>,
+    sap: Sap,
     axum::extract::Path(name): axum::extract::Path<String>,
 ) -> Result<Json<DdicTypeResponse>, RfcError> {
     let req_name = name.clone();
-    let result = run_blocking(pool, move |conn| {
-        crate::metadata::get_type_fields(conn, &name)
+    let meta_sys = sap.arc();
+    let result = run_blocking(Arc::clone(&meta_sys), move |conn| {
+        meta_sys.meta.get_type_fields(conn, &name)
     })
     .await?;
     let fields = result.iter().map(FieldDef::from_type_field).collect();
@@ -1376,14 +1574,15 @@ struct LangQuery {
 }
 /// ④ GET /api/ddic/field/:table/:field —— 查字段的语义元数据（数据元素/域/固定值）
 async fn ddic_field_handler(
-    axum::extract::State(pool): axum::extract::State<SharedPool>,
+    sap: Sap,
     axum::extract::Path((table, field)): axum::extract::Path<(String, String)>,
     axum::extract::Query(q): axum::extract::Query<LangQuery>,
 ) -> Result<Json<FieldSemanticsResponse>, RfcError> {
     let lang = q.lang.unwrap_or_else(default_lang);
     let req_table = table.clone();
-    let sem = run_blocking(pool, move |conn| {
-        crate::discovery::read_ddic_field_info(conn, &table, &field, &lang)
+    let df_sys = sap.arc();
+    let sem = run_blocking(Arc::clone(&df_sys), move |conn| {
+        crate::discovery::read_ddic_field_info(&df_sys.meta, conn, &table, &field, &lang)
     })
     .await?;
     Ok(Json(FieldSemanticsResponse {
@@ -1415,7 +1614,7 @@ async fn ddic_field_handler(
 /// `/sap/bc/adt/functions/groups/{组}/fmodules/{名}/source/main`。
 /// 响应的 `source_via` 字段标明来源（`rfc` / `adt`）。
 async fn function_source_handler(
-    axum::extract::State(pool): axum::extract::State<SharedPool>,
+    sap: Sap,
     axum::extract::Path(name): axum::extract::Path<String>,
     prologue: Option<String>,
 ) -> Result<Json<serde_json::Value>, RfcError> {
@@ -1423,8 +1622,9 @@ async fn function_source_handler(
     let want_prologue = matches!(prologue.as_deref(), Some("true") | Some("1"));
 
     let lookup = name.clone();
-    let (lines, via) = match run_blocking(Arc::clone(&pool), move |conn| {
-        crate::discovery::read_function_source(conn, &lookup)
+    let fs_sys = sap.arc();
+    let (lines, via) = match run_blocking(Arc::clone(&fs_sys), move |conn| {
+        crate::discovery::read_function_source(&fs_sys.meta, conn, &lookup)
     })
     .await
     {
@@ -1436,8 +1636,9 @@ async fn function_source_handler(
             // 组名反解失败或 ADT 也读不到 → 保留原 RFC 错误（信息量更大）
             let group = {
                 let lookup = name.clone();
-                match run_blocking(Arc::clone(&pool), move |conn| {
-                    crate::discovery::resolve_function_group(conn, &lookup)
+                let grp_sys = sap.arc();
+                match run_blocking(Arc::clone(&grp_sys), move |conn| {
+                    crate::discovery::resolve_function_group(&grp_sys.meta, conn, &lookup)
                 })
                 .await
                 {
@@ -1455,7 +1656,8 @@ async fn function_source_handler(
                 group = %group,
                 "RPY 读函数源码失败，降级 ADT 通道"
             );
-            match crate::adt::read_fm_source(&group, &name).await {
+            let adt = sap.adt.as_ref().ok_or_else(crate::adt::adt_disabled)?;
+            match adt.read_fm_source(&group, &name).await {
                 Ok(lines) => (lines, "adt"),
                 Err(e) => {
                     tracing::warn!(key = %e.key, "ADT 降级读也失败，返回原 RFC 错误");
@@ -1469,7 +1671,7 @@ async fn function_source_handler(
     let prologue_json = if want_prologue {
         let deps = crate::discovery::scan_called_functions(&lines, &name, 30);
         let deps_found = deps.len();
-        let p = run_blocking(Arc::clone(&pool), move |conn| {
+        let p = run_blocking(sap.arc(), move |conn| {
             Ok(crate::discovery::build_function_prologue(conn, &deps))
         })
         .await?;
@@ -1500,13 +1702,14 @@ async fn function_source_handler(
 /// 与函数源码同理：RFC 失败（非 NOT_FOUND）自动降级 ADT
 /// `/sap/bc/adt/programs/programs/{名}/source/main`，`source_via` 标明来源。
 async fn program_source_handler(
-    axum::extract::State(pool): axum::extract::State<SharedPool>,
+    sap: Sap,
     axum::extract::Path(name): axum::extract::Path<String>,
 ) -> Result<Json<serde_json::Value>, RfcError> {
     crate::api::validate_func_name(&name)?;
     let lookup = name.clone();
-    let (lines, via) = match run_blocking(Arc::clone(&pool), move |conn| {
-        crate::discovery::read_program_source(conn, &lookup)
+    let ps_sys = sap.arc();
+    let (lines, via) = match run_blocking(Arc::clone(&ps_sys), move |conn| {
+        crate::discovery::read_program_source(&ps_sys.meta, conn, &lookup)
     })
     .await
     {
@@ -1521,7 +1724,8 @@ async fn program_source_handler(
                 msg = %rfc_err.message,
                 "RPY 读程序源码失败，降级 ADT 通道"
             );
-            match crate::adt::read_program_source(&name).await {
+            let adt = sap.adt.as_ref().ok_or_else(crate::adt::adt_disabled)?;
+            match adt.read_program_source(&name).await {
                 Ok(lines) => (lines, "adt"),
                 Err(e) => {
                     tracing::warn!(key = %e.key, "ADT 降级读也失败，返回原 RFC 错误");
@@ -1559,7 +1763,7 @@ struct TableReadRequest {
 
 /// ⑧ `POST /api/table/read` —— 读 SAP 透明表数据（封装 RFC_READ_TABLE，用 ET_DATA 避免截断）
 async fn table_read_handler(
-    axum::extract::State(pool): axum::extract::State<SharedPool>,
+    sap: Sap,
     req: Result<Json<TableReadRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Json<serde_json::Value>, RfcError> {
     let Json(req) = req.map_err(|r| RfcError {
@@ -1591,8 +1795,10 @@ async fn table_read_handler(
         .and_then(|s| s.chars().next())
         .unwrap_or('\u{1}');
     let (table, fields) = (req.table.clone(), req.fields.clone());
-    let rows = run_blocking(pool, move |conn| {
+    let tr_sys = sap.arc();
+    let rows = run_blocking(Arc::clone(&tr_sys), move |conn| {
         crate::discovery::read_table(
+            &tr_sys.meta,
             conn,
             &req.table,
             &req.fields,
@@ -1645,8 +1851,10 @@ fn validate_dump_stamp(s: &str) -> Result<(), RfcError> {
 /// ⑨ `GET /api/dumps` —— 短转储列表（ADT Atom feed 解析为结构化条目，newest-first）。
 /// 每条含 error_type / program / user / at / message / key，key 可接 `/api/dumps/{key}/detail`。
 async fn dumps_list_handler(
+    sap: Sap,
     axum::extract::Query(q): axum::extract::Query<DumpsQuery>,
 ) -> Result<Json<serde_json::Value>, RfcError> {
+    let adt = sap.adt.as_ref().ok_or_else(crate::adt::adt_disabled)?;
     let limit = q.limit.unwrap_or(100).clamp(1, 1000);
     if let Some(v) = q.from.as_deref() {
         validate_dump_stamp(v)?;
@@ -1654,7 +1862,7 @@ async fn dumps_list_handler(
     if let Some(v) = q.to.as_deref() {
         validate_dump_stamp(v)?;
     }
-    let mut dumps = crate::dumps::fetch_feed(q.from.as_deref(), q.to.as_deref()).await?;
+    let mut dumps = crate::dumps::fetch_feed(adt, q.from.as_deref(), q.to.as_deref()).await?;
     dumps.truncate(limit);
     Ok(Json(
         serde_json::json!({"count": dumps.len(), "dumps": dumps}),
@@ -1664,8 +1872,10 @@ async fn dumps_list_handler(
 /// ⑩ `GET /api/dumps/grouped` —— 按 (错误类型, 终止程序) 聚合，
 /// 回答「什么在反复失败」。组按条数降序，`latest_key` 可直接接详情端点。
 async fn dumps_grouped_handler(
+    sap: Sap,
     axum::extract::Query(q): axum::extract::Query<DumpsQuery>,
 ) -> Result<Json<serde_json::Value>, RfcError> {
+    let adt = sap.adt.as_ref().ok_or_else(crate::adt::adt_disabled)?;
     let limit = q.limit.unwrap_or(100).clamp(1, 1000);
     if let Some(v) = q.from.as_deref() {
         validate_dump_stamp(v)?;
@@ -1673,7 +1883,7 @@ async fn dumps_grouped_handler(
     if let Some(v) = q.to.as_deref() {
         validate_dump_stamp(v)?;
     }
-    let mut dumps = crate::dumps::fetch_feed(q.from.as_deref(), q.to.as_deref()).await?;
+    let mut dumps = crate::dumps::fetch_feed(adt, q.from.as_deref(), q.to.as_deref()).await?;
     dumps.truncate(limit);
     let groups = crate::dumps::group_dumps(&dumps);
     Ok(Json(
@@ -1685,10 +1895,12 @@ async fn dumps_grouped_handler(
 /// key 取列表返回的 `key` 字段；原始 `%20` 编码或解码形态均可。
 /// 路由是通配捕获（key 本身可含 `/`），此处剥掉文档形态的尾部 `/detail`。
 async fn dump_detail_handler(
+    sap: Sap,
     axum::extract::Path(key): axum::extract::Path<String>,
 ) -> Result<Json<crate::dumps::DumpDetail>, RfcError> {
+    let adt = sap.adt.as_ref().ok_or_else(crate::adt::adt_disabled)?;
     let key = key.strip_suffix("/detail").unwrap_or(&key);
-    let detail = crate::dumps::fetch_detail(key).await?;
+    let detail = crate::dumps::fetch_detail(adt, key).await?;
     Ok(Json(detail))
 }
 
@@ -1768,7 +1980,7 @@ pub(crate) fn validate_object_name(name: &str) -> Result<(), RfcError> {
 
 /// 函数对象的组名解析：显式给出优先，否则经 RFC_FUNCTION_SEARCH 反解。
 pub(crate) async fn resolve_group_if_needed(
-    pool: &SharedPool,
+    sys: &Arc<SystemHandle>,
     obj_type: crate::objects::ObjectType,
     name: &str,
     group_hint: Option<String>,
@@ -1781,8 +1993,9 @@ pub(crate) async fn resolve_group_if_needed(
         return Ok(g.trim().to_uppercase());
     }
     let lookup = name.to_string();
-    run_blocking(Arc::clone(pool), move |conn| {
-        crate::discovery::resolve_function_group(conn, &lookup)
+    let rg_sys = Arc::clone(sys);
+    run_blocking(Arc::clone(sys), move |conn| {
+        crate::discovery::resolve_function_group(&rg_sys.meta, conn, &lookup)
     })
     .await
 }
@@ -1827,7 +2040,7 @@ fn default_true() -> bool {
 /// 网关内编排「锁 → PUT → 解锁 → 激活」，lockHandle 不出请求；
 /// 激活失败是逻辑结果（HTTP 200 + activation.messages），不是传输错误。
 async fn object_write_handler(
-    axum::extract::State(pool): axum::extract::State<SharedPool>,
+    sap: Sap,
     axum::extract::Path(path): axum::extract::Path<String>,
     req: Result<Json<ObjectWriteBody>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Json<serde_json::Value>, RfcError> {
@@ -1855,9 +2068,11 @@ async fn object_write_handler(
             key: "SOURCE_EMPTY".into(),
         });
     }
-    let group = resolve_group_if_needed(&pool, obj_type, &name, body.group.clone()).await?;
+    let sys = sap.arc();
+    let group = resolve_group_if_needed(&sys, obj_type, &name, body.group.clone()).await?;
     let rfc = body.rfc_enabled.unwrap_or(false);
     let outcome = match crate::objects::write_object_source(
+        &sys,
         obj_type,
         &name,
         &group,
@@ -1878,8 +2093,9 @@ async fn object_write_handler(
                 transport: body.transport.clone(),
                 software_component: None,
             };
-            crate::objects::create_object(&pool, obj_type, &name, &group, &spec).await?;
+            crate::objects::create_object(&sys, obj_type, &name, &group, &spec).await?;
             crate::objects::write_object_source(
+                &sys,
                 obj_type,
                 &name,
                 &group,
@@ -1893,14 +2109,14 @@ async fn object_write_handler(
         }
         Err(e) => return Err(e),
     };
-    crate::objects::drain_pool_after_write(&pool, obj_type);
+    crate::objects::drain_pool_after_write(&sys, obj_type);
     Ok(Json(serde_json::to_value(outcome).unwrap_or_default()))
 }
 
 /// GET /api/objects/{type}/{name}/source —— 读对象源码（ADT 通道，原文大小写）。
 /// 新类型（intf/incl/cds/fugr）的读取入口；prog/func 也可用（等价既有端点）。
 async fn object_get_handler(
-    axum::extract::State(pool): axum::extract::State<SharedPool>,
+    sap: Sap,
     axum::extract::Path(path): axum::extract::Path<String>,
 ) -> Result<Json<serde_json::Value>, RfcError> {
     let (obj_type, name, action) = split_object_path(&path)?;
@@ -1921,8 +2137,10 @@ async fn object_get_handler(
             key: "NO_SOURCE_RESOURCE".into(),
         });
     }
-    let group = resolve_group_if_needed(&pool, obj_type, &name, None).await?;
-    let source = crate::objects::read_current_source(obj_type, &name, &group).await?;
+    let sys = sap.arc();
+    let group = resolve_group_if_needed(&sys, obj_type, &name, None).await?;
+    let adt = sap.adt.as_ref().ok_or_else(crate::adt::adt_disabled)?;
+    let source = crate::objects::read_current_source(adt, obj_type, &name, &group).await?;
     Ok(Json(serde_json::json!({
         "type": obj_type.api_name(),
         "name": name.trim().to_uppercase(),
@@ -1937,16 +2155,18 @@ async fn object_get_handler(
 /// DELETE /api/objects/{type}/{name}[?group=&transport=] —— 删除对象。
 /// 锁 → DELETE → 弃会话（删除消耗锁柄）；函数组删除连带其函数模块。
 async fn object_delete_handler(
-    axum::extract::State(pool): axum::extract::State<SharedPool>,
+    sap: Sap,
     axum::extract::Path(path): axum::extract::Path<String>,
     axum::extract::Query(q): axum::extract::Query<ObjectDeleteQuery>,
 ) -> Result<Json<serde_json::Value>, RfcError> {
     let (obj_type, name, _action) = split_object_path_opts(&path, true)?;
     validate_object_name(&name)?;
-    let group = resolve_group_if_needed(&pool, obj_type, &name, q.group).await?;
+    let sys = sap.arc();
+    let group = resolve_group_if_needed(&sys, obj_type, &name, q.group).await?;
     let outcome =
-        crate::objects::delete_object(obj_type, &name, &group, q.transport.as_deref()).await?;
-    crate::objects::drain_pool_after_write(&pool, obj_type);
+        crate::objects::delete_object(&sys, obj_type, &name, &group, q.transport.as_deref())
+            .await?;
+    crate::objects::drain_pool_after_write(&sys, obj_type);
     Ok(Json(serde_json::to_value(outcome).unwrap_or_default()))
 }
 
@@ -1961,7 +2181,7 @@ struct ObjectDeleteQuery {
 
 /// POST /api/objects/{type}/{name}/replace 与 /syntax 的分发。
 async fn object_post_handler(
-    axum::extract::State(pool): axum::extract::State<SharedPool>,
+    sap: Sap,
     axum::extract::Path(path): axum::extract::Path<String>,
     req: Result<Json<serde_json::Value>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Json<serde_json::Value>, RfcError> {
@@ -1977,7 +2197,8 @@ async fn object_post_handler(
         .get("group")
         .and_then(|v| v.as_str())
         .map(str::to_string);
-    let group = resolve_group_if_needed(&pool, obj_type, &name, group_hint).await?;
+    let sys = sap.arc();
+    let group = resolve_group_if_needed(&sys, obj_type, &name, group_hint).await?;
 
     match action {
         // ⑬ AI 编辑形态：唯一匹配查找替换后走写入编排
@@ -1988,7 +2209,10 @@ async fn object_post_handler(
                 message: format!("请求体字段非法（old_string/new_string 必填）: {}", e),
                 key: "JSON_INVALID".into(),
             })?;
-            let current = match crate::objects::read_current_source(obj_type, &name, &group).await {
+            let adt = sap.adt.as_ref().ok_or_else(crate::adt::adt_disabled)?;
+            let current = match crate::objects::read_current_source(adt, obj_type, &name, &group)
+                .await
+            {
                 Ok(c) => c,
                 Err(e)
                     if body.create.unwrap_or(false) && crate::objects::is_object_not_exist(&e) =>
@@ -2000,7 +2224,7 @@ async fn object_post_handler(
                         transport: body.transport.clone(),
                         software_component: None,
                     };
-                    crate::objects::create_object(&pool, obj_type, &name, &group, &spec).await?;
+                    crate::objects::create_object(&sys, obj_type, &name, &group, &spec).await?;
                     String::new()
                 }
                 Err(e) => return Err(e),
@@ -2022,6 +2246,7 @@ async fn object_post_handler(
                 });
             }
             let outcome = crate::objects::write_object_source(
+                &sys,
                 obj_type,
                 &name,
                 &group,
@@ -2032,7 +2257,7 @@ async fn object_post_handler(
                 body.doc.as_deref(),
             )
             .await?;
-            crate::objects::drain_pool_after_write(&pool, obj_type);
+            crate::objects::drain_pool_after_write(&sys, obj_type);
             let mut v = serde_json::to_value(&outcome).unwrap_or_default();
             v["replaced"] = serde_json::json!(true);
             Ok(Json(v))
@@ -2068,7 +2293,7 @@ async fn object_post_handler(
                 transport: transport.clone(),
                 software_component,
             };
-            crate::objects::create_object(&pool, obj_type, &name, &group, &spec).await?;
+            crate::objects::create_object(&sys, obj_type, &name, &group, &spec).await?;
             // 可选首版源码：有则直接走写入编排（一步到位）
             let first_source = raw.get("source").and_then(|v| v.as_str());
             let rfc = raw
@@ -2083,6 +2308,7 @@ async fn object_post_handler(
             });
             if let Some(src) = first_source.filter(|s| !s.trim().is_empty()) {
                 let outcome = crate::objects::write_object_source(
+                    &sys,
                     obj_type,
                     &name,
                     &group,
@@ -2093,7 +2319,7 @@ async fn object_post_handler(
                     doc.as_deref(),
                 )
                 .await?;
-                crate::objects::drain_pool_after_write(&pool, obj_type);
+                crate::objects::drain_pool_after_write(&sys, obj_type);
                 v["write"] = serde_json::to_value(outcome).unwrap_or_default();
             }
             Ok(Json(v))
@@ -2124,8 +2350,9 @@ async fn object_post_handler(
             } else {
                 source
             };
+            let adt = sap.adt.as_ref().ok_or_else(crate::adt::adt_disabled)?;
             let base = obj_type.base_rel(&name, &group);
-            let issues = crate::objects::syntax_check(&base, source).await?;
+            let issues = crate::objects::syntax_check(adt, &base, source).await?;
             Ok(Json(serde_json::json!({
                 "type": "syntax",
                 "name": name,
@@ -2169,13 +2396,14 @@ struct ObjectReplaceBody {
 
 /// ⑤ GET /api/functions/:name/doc —— 查函数文档（短文本 + SE37 长文本 + 参数说明）
 async fn function_doc_handler(
-    axum::extract::State(pool): axum::extract::State<SharedPool>,
+    sap: Sap,
     axum::extract::Path(name): axum::extract::Path<String>,
     axum::extract::Query(q): axum::extract::Query<LangQuery>,
 ) -> Result<Json<FunctionDocResponse>, RfcError> {
     crate::api::validate_func_name(&name)?;
     let lang = q.lang.unwrap_or_else(default_lang);
-    let result = run_blocking(pool, move |conn| {
+    let doc_sys = sap.arc();
+    let result = run_blocking(Arc::clone(&doc_sys), move |conn| {
         // 先取参数描述（parameterText 作为参数文档），同时取短文本
         let param_infos = conn.get_param_infos(&name)?;
         let parameter_docs: Vec<ParamDoc> = param_infos
@@ -2190,7 +2418,8 @@ async fn function_doc_handler(
         // 不用首个参数描述冒充函数说明；留空，由 long_text / parameter_docs 提供信息。
         let short_text = String::new();
         // 读 SE37 长文档（失败降级为空 + warning）
-        let doc = crate::discovery::read_function_doc(conn, &name, &lang, &short_text)?;
+        let doc =
+            crate::discovery::read_function_doc(&doc_sys.meta, conn, &name, &lang, &short_text)?;
         Ok(FunctionDocResponse {
             name: name.clone(),
             short_text: doc.short_text,
@@ -2680,5 +2909,190 @@ mod tests {
         assert_eq!(resp.status(), axum::http::StatusCode::OK);
         let body = body_string(resp.into_body()).await;
         assert!(body.contains("http://127.0.0.1:3000"));
+    }
+
+    // ====================================================================
+    // v0.16 多系统：作用域路由（全 lazy 池，不触 FFI）
+    // ====================================================================
+
+    use crate::systems::{SystemRegistry, SystemSpec};
+
+    /// 双系统测试注册表：a4h（默认）+ prd，全 lazy 池（无 SAP SDK 可构造）。
+    fn test_state() -> SharedState {
+        let cfg = crate::config::AppConfig {
+            conn_params: vec![],
+            listen_addr: "127.0.0.1:3000".into(),
+            pool_size: 1,
+            pool_idle_validate: Duration::from_secs(30),
+            api_key: None,
+            request_timeout: Duration::from_secs(5),
+            rate_limit_rps: None,
+            adt_base_url: None,
+            adt_user: String::new(),
+            adt_passwd: String::new(),
+            read_only: false,
+            registry_file: "test-registry.json".into(),
+            runtime_mode: false,
+            update_check: false,
+            systems_file: "no-such.toml".into(),
+        };
+        let direct = || {
+            vec![
+                ("ASHOST", "h".to_string()),
+                ("SYSNR", "00".to_string()),
+                ("CLIENT", "001".to_string()),
+                ("USER", "u".to_string()),
+                ("PASSWD", "p".to_string()),
+            ]
+        };
+        let specs = vec![
+            SystemSpec {
+                name: "a4h".into(),
+                is_default: true,
+                conn_params: direct(),
+                pool_size: None,
+                idle_validate: None,
+                request_timeout: None,
+                adt_base_url: Some(String::new()),
+                adt_user: None,
+                adt_passwd: None,
+                read_only: None,
+            },
+            SystemSpec {
+                name: "prd".into(),
+                is_default: false,
+                conn_params: direct(),
+                pool_size: None,
+                idle_validate: None,
+                request_timeout: None,
+                adt_base_url: Some(String::new()),
+                adt_user: None,
+                adt_passwd: None,
+                read_only: Some(true),
+            },
+        ];
+        let reg: SystemRegistry = crate::systems::build_registry_all_lazy(specs, &cfg).unwrap();
+        Arc::new(reg)
+    }
+
+    #[tokio::test]
+    async fn systems_endpoint_lists_all_systems() {
+        let resp = app(test_state())
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/systems")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let body = body_string(resp.into_body()).await;
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["count"], 2);
+        assert_eq!(v["default"], "a4h");
+        let prd = &v["systems"].as_array().unwrap()[1];
+        assert_eq!(prd["name"], "prd");
+        assert_eq!(prd["default"], false);
+        assert_eq!(prd["read_only"], true);
+        assert_eq!(prd["adt"], false, "adt_base_url 显式空串 = 禁用");
+    }
+
+    #[tokio::test]
+    async fn scope_unknown_system_returns_404_with_key() {
+        let resp = app(test_state())
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/s/nope/rfc")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::NOT_FOUND);
+        let body = body_string(resp.into_body()).await;
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["error"]["key"], "SYSTEM_UNKNOWN");
+        // 错误信息附可用系统清单（出路可见）
+        assert!(v["error"]["message"].as_str().unwrap().contains("a4h"));
+        assert!(v["error"]["message"].as_str().unwrap().contains("prd"));
+    }
+
+    #[tokio::test]
+    async fn scope_prefix_rewrites_to_unprefixed_route() {
+        // /api/s/{sys}/version → /api/version（公开、纯本地、零 SAP 依赖）
+        let resp = app(test_state())
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/s/prd/version")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::OK,
+            "作用域前缀应改写命中 /api/version"
+        );
+        let body = body_string(resp.into_body()).await;
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["name"], "sap-for-agents");
+        // 多系统全景块
+        assert!(v["systems"]["prd"].is_object(), "systems 块含 prd");
+        assert_eq!(v["systems"]["prd"]["read_only"], true);
+    }
+
+    #[tokio::test]
+    async fn scope_ready_maps_to_public_ready_route() {
+        // POST /ready 未注册（只挂 GET）→ 405。证明 /api/s/{sys}/ready 被改写到
+        // /ready（若未改写会是 404 fallback），且不触发 SAP ping（快而确定）。
+        let resp = app(test_state())
+            .oneshot(
+                axum::http::Request::builder()
+                    .method(axum::http::Method::POST)
+                    .uri("/api/s/a4h/ready")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    #[tokio::test]
+    async fn scope_query_string_survives_rewrite() {
+        // query 应原样保留：/api/s/a4h/agents-demo?q=x → /agents-demo?q=x
+        // 用一个不存在的端点验证改写后路径带 query（404 fallback 而非 panic）
+        let resp = app(test_state())
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/s/a4h/nonexistent?flag=1")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // 改写为 /api/nonexistent?flag=1 → 鉴权层放行（无 key）→ fallback 404 JSON
+        assert_eq!(resp.status(), axum::http::StatusCode::NOT_FOUND);
+        let body = body_string(resp.into_body()).await;
+        assert!(body.contains("error"), "fallback 应返回 JSON 404: {body}");
+    }
+
+    #[tokio::test]
+    async fn unprefixed_health_still_works() {
+        // 兼容承诺：无前缀路径不经作用域逻辑，行为与 v0.15 一致
+        let resp = app(test_state())
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/health")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let body = body_string(resp.into_body()).await;
+        assert!(body.contains("\"status\":\"ok\""));
     }
 }

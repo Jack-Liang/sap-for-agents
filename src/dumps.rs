@@ -776,7 +776,11 @@ fn parse_frame_name(row: &str) -> Option<String> {
 
 /// 读转储 feed（ADT 原样返回， newest-first）。`from`/`to` 为
 /// `yyyyMMddHHmmss`（UTC）时透传给 ADT，让其在服务端翻页，比事后过滤便宜。
-pub async fn fetch_feed(from: Option<&str>, to: Option<&str>) -> Result<Vec<DumpEntry>, RfcError> {
+pub async fn fetch_feed(
+    adt: &crate::adt::AdtEndpoint,
+    from: Option<&str>,
+    to: Option<&str>,
+) -> Result<Vec<DumpEntry>, RfcError> {
     let mut rel = String::from("runtime/dumps");
     let mut sep = '?';
     for (k, v) in [("from", from), ("to", to)] {
@@ -788,7 +792,7 @@ pub async fn fetch_feed(from: Option<&str>, to: Option<&str>) -> Result<Vec<Dump
             sep = '&';
         }
     }
-    let (status, _ct, body) = crate::adt::adt_get_raw(&rel, "*/*").await?;
+    let (status, _ct, body) = adt.get_raw(&rel, "*/*").await?;
     if status != 200 {
         return Err(RfcError {
             code: -1,
@@ -806,7 +810,10 @@ pub async fn fetch_feed(from: Option<&str>, to: Option<&str>) -> Result<Vec<Dump
 /// key 取自列表端点返回的 `key` 字段（feed entry 的 rel=self 链接派生）。
 /// ADT 404 时区分两种情况返回同一个语义：dump 不存在，或当前 release
 /// 只有 feed 没有详情资源（如 7.50）。
-pub async fn fetch_detail(key: &str) -> Result<DumpDetail, RfcError> {
+pub async fn fetch_detail(
+    adt: &crate::adt::AdtEndpoint,
+    key: &str,
+) -> Result<DumpDetail, RfcError> {
     let key = key.trim();
     if key.is_empty() || key.contains("..") {
         return Err(RfcError {
@@ -821,7 +828,7 @@ pub async fn fetch_detail(key: &str) -> Result<DumpDetail, RfcError> {
         "runtime/dump/{}/formatted?sap-language=EN",
         encode_path_segment(key)
     );
-    let (status, _ct, body) = crate::adt::adt_get_raw(&rel, "*/*").await?;
+    let (status, _ct, body) = adt.get_raw(&rel, "*/*").await?;
     match status {
         200 => {
             let text = String::from_utf8_lossy(&body);
