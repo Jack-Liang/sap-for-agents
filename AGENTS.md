@@ -94,7 +94,8 @@ curl http://127.0.0.1:3000/api/s/prd/ready                # that system's readin
 - Unknown system name → `404 SYSTEM_UNKNOWN` (the error lists valid names). Compare objects across systems by calling the same read endpoint under two scopes (e.g. `/api/functions/ZFOO/source` on `a4h` vs `prd`) and diffing.
 - Flat delivery port `/api/invokes/{alias}` is **routed by the entry's recorded `system`** (aliases are global); an explicit scope that disagrees with the entry returns `409 SYSTEM_MISMATCH`. `GET /api/registry?system=prd` filters entries.
 - MCP tools accept an optional `system` argument (default = default system).
-- Hard limit: two configured systems with the **same SYSID** (e.g. cloned dev containers) are quarantined with `503 SYSTEM_SYSID_CONFLICT` — the SDK's descriptor cache is partitioned by SYSID, so identical SYSIDs would silently share wrong signatures.
+- Several entries pointing at the **same system with different clients** (same ashost/sysnr, different `client`) are fully supported: repository objects are cross-client in SAP, so signatures are identical and each entry still gets its own pool / ADT / registry namespace.
+- Hard limit: two **different backends** sharing one SYSID (e.g. cloned dev containers reached via different hosts) are quarantined with `503 SYSTEM_SYSID_CONFLICT` — the SDK's descriptor cache is partitioned by SYSID, so cross-backend SYSID twins would silently share wrong signatures.
 
 ## Endpoint quick reference (copyable examples)
 

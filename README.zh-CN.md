@@ -234,7 +234,9 @@ read_only = true                  # 例如：生产系统只读、开发系统�
 
 **URL 形态**：无前缀路径仍路由到默认系统；每个 `/api/*` 端点都有作用域形态——`/api/s/{系统名}/rfc`、`/api/s/prd/functions/ZFOO`、`/api/s/prd/ready`。`GET /api/systems` 列出全部。注册表条目携带 `system` 字段，平坦端口 `/api/invokes/{alias}` 按条目路由。MCP 工具接受可选 `system` 参数。
 
-**硬性限制**：配置的各系统 **SYSID 必须不同**——SDK 描述符缓存按 SYSID 分区，两个同 SYSID 的系统（克隆的开发容器！）会静默用对方的签名编组数据。网关首连时登记 SYSID，冲突系统被隔离（`503 SYSTEM_SYSID_CONFLICT`）。
+**同一系统的多个 client 没问题**：多条目同 `ashost`/`sysnr`、不同 `client` 完全支持（SAP 仓库对象跨 client、签名必然一致；各条目仍有独立的池 / ADT / 注册表命名空间）。
+
+**硬性限制**：**不同后端**不得共用同一 SYSID——SDK 描述符缓存按 SYSID 分区，两台主机应答同一个 SID（克隆的开发容器！）会静默用对方的签名编组数据。网关首连时登记 SYSID，跨后端冲突系统被隔离（`503 SYSTEM_SYSID_CONFLICT`；同后端条目豁免）。
 
 ---
 

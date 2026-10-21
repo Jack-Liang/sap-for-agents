@@ -309,10 +309,40 @@ pub fn load_specs(cfg: &AppConfig) -> Result<Vec<SystemSpec>, String> {
 // ========================================================================
 // 运行态
 
-/// 进程级 SYSID 登记表：SYSID -> 持有它的系统名。
-/// SDK 描述符缓存按 SYSID 分区且进程级，同 SYSID 的两个系统会静默共享
-/// 错误描述符——这是 SDK 层的硬约束，网关侧必须挡住。
-static REGISTERED_SYSIDS: Mutex<Option<HashMap<String, String>>> = Mutex::new(None);
+/// 进程级 SYSID 登记表：SYSID -> (后端标识, 首个登记的系统名)。
+/// SDK 描述符缓存按 SYSID 分区且进程级，**不同后端**共用一个 SYSID
+/// （克隆的开发容器）会静默共享错误描述符——这是 SDK 层的硬约束，网关侧
+/// 必须挡住。**同一后端**（同一物理系统的不同 client）则相反：SAP 仓库
+/// 对象跨 client，两个 client 里同名函数签名必然一致，共享描述符缓存恰好
+/// 正确——放行。
+static REGISTERED_SYSIDS: Mutex<Option<HashMap<String, (String, String)>>> = Mutex::new(None);
+
+/// 连接目标（"后端"）标识，用于 SYSID 查重的同后端豁免：
+/// 直连形态 = `ASHOST + SYSNR`；负载均衡形态 = `MSHOST + R3NAME`；
+/// 其余形态保守退化用全部连接参数（剔除账号/密码/语言/**client**）。
+/// 主机名大小写不敏感、去首尾空白；同一物理系统的别名/IP 形态会被视为
+/// 不同后端（保守隔离，宁可误拦不放过——克隆系统签名漂移是静默错数据）。
+fn backend_key(params: &[(&'static str, String)]) -> String {
+    let get = |k: &str| {
+        params
+            .iter()
+            .find(|(pk, _)| *pk == k)
+            .map(|(_, v)| v.trim().to_lowercase())
+    };
+    if let (Some(host), Some(sysnr)) = (get("ASHOST"), get("SYSNR")) {
+        format!("direct://{}/{}", host, sysnr)
+    } else if let Some(mshost) = get("MSHOST") {
+        format!("lb://{}/{}", mshost, get("R3NAME").unwrap_or_default())
+    } else {
+        let mut parts: Vec<String> = params
+            .iter()
+            .filter(|(k, _)| !matches!(*k, "USER" | "PASSWD" | "LANG" | "CLIENT"))
+            .map(|(k, v)| format!("{}={}", k, v.trim().to_lowercase()))
+            .collect();
+        parts.sort();
+        parts.join("&")
+    }
+}
 
 /// 单系统运行句柄：连接池 + ADT 端点 + 元数据缓存 + 状态标记。
 pub struct SystemHandle {
@@ -328,9 +358,11 @@ pub struct SystemHandle {
     pub read_only: bool,
     /// 该系统单请求超时
     pub request_timeout: Duration,
+    /// 连接目标标识（SYSID 查重的同后端豁免用，见 [`backend_key`]）
+    backend: String,
     /// 首连成功后登记的 SYSID（连接属性读取，本地无 RFC 往返）
     sysid: OnceLock<String>,
-    /// SYSID 与其他系统冲突 → 隔离（请求 503 SYSTEM_SYSID_CONFLICT）
+    /// SYSID 与其他**后端**冲突 → 隔离（请求 503 SYSTEM_SYSID_CONFLICT）
     quarantined: AtomicBool,
     /// `/api/version` 的懒加载系统信息缓存（生命周期内不变，失败不缓存）
     pub sap_info: tokio::sync::RwLock<Option<Arc<crate::connection::RemoteSystemInfo>>>,
@@ -354,9 +386,9 @@ impl SystemHandle {
                 code: -1,
                 status: 503,
                 message: format!(
-                    "系统 {} 已被隔离：其 SYSID 与其他已连接系统冲突（SDK 描述符缓存按 \
-                     SYSID 分区，同 SYSID 会静默共享错误签名）。请修改其中一个系统的 \
-                     SID 或从 sap_systems.toml 移除其一后重启网关",
+                    "系统 {} 已被隔离：其 SYSID 与另一**不同后端**的系统冲突（SDK 描述符缓存按 \
+                     SYSID 分区，跨后端同 SYSID 会静默共享错误签名；同系统的其他 client 不受影响）。\
+                     请修改其中一个系统的 SID 或从 sap_systems.toml 移除其一后重启网关",
                     self.name
                 ),
                 key: "SYSTEM_SYSID_CONFLICT".into(),
@@ -366,7 +398,10 @@ impl SystemHandle {
         }
     }
 
-    /// 登记该系统的 SYSID。与其他系统冲突时隔离自己并返回冲突方名字。
+    /// 登记该系统的 SYSID。与**不同后端**的同 SYSID 系统冲突（克隆系统，
+    /// 签名可能漂移——共享 SDK 描述符缓存是静默错数据）时隔离自己并返回
+    /// 冲突方名字；与**同一后端**的同 SYSID 条目（同一物理系统的不同
+    /// client，仓库对象跨 client、签名必然一致）放行共享。
     /// 幂等：已登记时同值直接通过（连接重建后属性不变）。
     pub fn record_sysid(&self, sysid: &str) -> Result<(), String> {
         if let Some(own) = self.sysid.get() {
@@ -381,13 +416,24 @@ impl SystemHandle {
         }
         let mut guard = REGISTERED_SYSIDS.lock().unwrap_or_else(|e| e.into_inner());
         let map = guard.get_or_insert_with(HashMap::new);
-        if let Some(owner) = map.get(sysid) {
-            if owner != &self.name {
+        if let Some((backend, owner)) = map.get(sysid) {
+            if backend != &self.backend {
+                // 不同后端同 SYSID：真冲突（SDK 缓存按 SYSID 分区，签名
+                // 可能不同——静默共享比报错危险得多）
                 self.quarantined.store(true, Ordering::SeqCst);
                 return Err(owner.clone());
             }
+            // 同后端同 SYSID：同一物理系统的不同 client，签名一致，
+            // 共享描述符缓存语义正确——放行（登记表保留首个登记方即可）
+            tracing::debug!(
+                system = %self.name,
+                sysid = %sysid,
+                first_owner = %owner,
+                "同后端多 client 共享 SYSID（同一物理系统，仓库对象跨 client）"
+            );
+        } else {
+            map.insert(sysid.to_string(), (self.backend.clone(), self.name.clone()));
         }
-        map.insert(sysid.to_string(), self.name.clone());
         let _ = self.sysid.set(sysid.to_string());
         Ok(())
     }
@@ -523,6 +569,7 @@ fn build_registry_inner(
             meta: crate::metadata::MetadataCache::new(),
             read_only,
             request_timeout,
+            backend: backend_key(&spec.conn_params),
             sysid: OnceLock::new(),
             quarantined: AtomicBool::new(false),
             sap_info: tokio::sync::RwLock::new(None),
@@ -846,40 +893,106 @@ ashost = "h"
         assert_eq!(interpolate("plain", "ctx").unwrap(), "plain");
     }
 
-    #[test]
-    fn record_sysid_conflict_quarantines() {
-        // lazy 池不触 FFI，可直接构造运行态句柄
-        let cfg = test_cfg(direct_params());
-        let mk = |name: &str| SystemHandle {
+    /// 构造测试句柄（lazy 池不触 FFI）。host 决定后端标识。
+    fn mk_handle(name: &str, host: &str) -> SystemHandle {
+        let params = vec![
+            ("ASHOST", host.to_string()),
+            ("SYSNR", "00".to_string()),
+            ("CLIENT", "001".to_string()),
+            ("USER", "u".to_string()),
+            ("PASSWD", "p".to_string()),
+        ];
+        SystemHandle {
             name: name.into(),
             pool: Arc::new(RfcConnectionPool::lazy(
-                direct_params(),
+                params.clone(),
                 2,
                 Duration::from_secs(30),
             )),
             adt: None,
             meta: crate::metadata::MetadataCache::new(),
             read_only: false,
-            request_timeout: cfg.request_timeout,
+            request_timeout: Duration::from_secs(5),
+            backend: backend_key(&params),
             sysid: OnceLock::new(),
             quarantined: AtomicBool::new(false),
             sap_info: tokio::sync::RwLock::new(None),
-        };
-        let a = mk("a");
-        let b = mk("b");
-        assert!(a.record_sysid("A4H").is_ok());
-        // 同系统幂等
-        assert!(a.record_sysid("A4H").is_ok());
-        // 不同系统同 SYSID → b 被隔离，错误里给出冲突方
-        let err = b.record_sysid("A4H").unwrap_err();
+        }
+    }
+
+    #[test]
+    fn record_sysid_same_backend_different_clients_allowed() {
+        // 同一物理系统的不同 client 条目（同 ASHOST/SYSNR，CLIENT 不同）读出
+        // 同一个 SYSID——仓库对象跨 client、签名必然一致，共享 SDK 描述符
+        // 缓存恰好正确，必须放行（登记表是进程级全局，各测试用独立 SYSID
+        // 值避免串扰）
+        let a = mk_handle("dev001", "vhcala4h");
+        let b = mk_handle("dev200", "vhcala4h");
+        assert!(a.record_sysid("TS1").is_ok());
+        // 同后端同 SYSID → 豁免，不隔离
+        assert!(b.record_sysid("TS1").is_ok());
+        assert!(!b.is_quarantined());
+        assert!(b.check_available().is_ok());
+        // 幂等：同句柄重复登记同值直接通过
+        assert!(a.record_sysid("TS1").is_ok());
+        assert!(b.record_sysid("TS1").is_ok());
+    }
+
+    #[test]
+    fn record_sysid_cross_backend_conflict_quarantines() {
+        // 不同后端共用 SYSID（克隆的开发容器）→ 真冲突：隔离并给出冲突方
+        let a = mk_handle("a", "host-a");
+        let b = mk_handle("b", "host-b");
+        assert!(a.record_sysid("TS2").is_ok());
+        let err = b.record_sysid("TS2").unwrap_err();
         assert_eq!(err, "a");
         assert!(b.is_quarantined());
         assert!(b.check_available().is_err());
         assert!(a.check_available().is_ok());
-        // 不同 SYSID 正常
-        let c = mk("c");
-        assert!(c.record_sysid("PRD").is_ok());
+        // 不同 SYSID 正常登记
+        let c = mk_handle("c", "host-c");
+        assert!(c.record_sysid("TS3").is_ok());
         assert!(!c.is_quarantined());
+    }
+
+    #[test]
+    fn backend_key_matches_and_differs_correctly() {
+        let mk_params = |host: &str, sysnr: &str, client: &str| {
+            vec![
+                ("ASHOST", host.to_string()),
+                ("SYSNR", sysnr.to_string()),
+                ("CLIENT", client.to_string()),
+                ("USER", "u".to_string()),
+                ("PASSWD", "p".to_string()),
+            ]
+        };
+        // 同系统不同 client：同键
+        assert_eq!(
+            backend_key(&mk_params("vhcala4h", "00", "001")),
+            backend_key(&mk_params("vhcala4h", "00", "002"))
+        );
+        // 大小写/空白不影响
+        assert_eq!(
+            backend_key(&mk_params("  VHCALA4H ", "00", "001")),
+            backend_key(&mk_params("vhcala4h", "00", "001"))
+        );
+        // 不同系统号/主机：不同键
+        assert_ne!(
+            backend_key(&mk_params("vhcala4h", "00", "001")),
+            backend_key(&mk_params("vhcala4h", "01", "001"))
+        );
+        assert_ne!(
+            backend_key(&mk_params("host-a", "00", "001")),
+            backend_key(&mk_params("host-b", "00", "001"))
+        );
+        // 负载均衡形态：MSHOST+R3NAME
+        let lb = vec![
+            ("MSHOST", "msg.example.com".to_string()),
+            ("R3NAME", "PRD".to_string()),
+            ("USER", "u".to_string()),
+            ("PASSWD", "p".to_string()),
+        ];
+        assert_eq!(backend_key(&lb), "lb://msg.example.com/prd");
     }
 
     #[test]

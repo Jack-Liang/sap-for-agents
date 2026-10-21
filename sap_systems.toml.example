@@ -18,10 +18,14 @@
 #   /api/s/{系统名}/ready = 该系统 readiness
 #   GET /api/systems      = 系统清单（Agent 会话第一步）
 #
+# ── client 说明 ────────────────────────────────────────────────────────
+# 同一系统不同 client = 多条目（同 ashost/sysnr、不同 client），完全支持：
+# SAP 仓库对象跨 client、签名必然一致，各条目仍有独立池/ADT/注册表命名空间。
+
 # ── 硬性限制 ──────────────────────────────────────────────────────────
-# 两个系统的 SYSID 不能相同（SDK 描述符缓存按 SYSID 分区，同 SYSID 会静默
-# 共享错误签名）。克隆的开发容器常同 SID——冲突系统会被隔离（503
-# SYSTEM_SYSID_CONFLICT），改 SID 或只连其一。
+# 不同后端不得共用同一 SYSID（SDK 描述符缓存按 SYSID 分区，跨后端同 SYSID
+# 会静默共享错误签名）。克隆的开发容器经不同主机访问时常同 SID——冲突系统
+# 会被隔离（503 SYSTEM_SYSID_CONFLICT），改 SID 或只连其一；同后端条目豁免。
 
 [systems.a4h]
 # 连接参数（快捷字段；或用下方 [systems.a4h.conn] 透传任意 SDK 参数）

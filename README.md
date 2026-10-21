@@ -234,7 +234,9 @@ read_only = true                  # e.g. keep production read-only while dev sta
 
 **URLs**: unprefixed paths keep hitting the default system; every `/api/*` endpoint also has a scoped form — `/api/s/{system}/rfc`, `/api/s/prd/functions/ZFOO`, `/api/s/prd/ready`. `GET /api/systems` lists everything. Registry entries carry their `system`; the flat port `/api/invokes/{alias}` routes by entry. MCP tools take an optional `system` argument.
 
-**Hard limit**: configured systems must have **distinct SYSIDs** — the SDK's descriptor cache is partitioned by SYSID, so two systems sharing one (cloned dev containers!) would silently marshal with each other's signatures. The gateway registers SYSIDs on first connect and quarantines conflicts with `503 SYSTEM_SYSID_CONFLICT`.
+**Multiple clients of one system are fine**: several entries with the same `ashost`/`sysnr` but different `client` are fully supported (repository objects are cross-client in SAP, so signatures are identical; each entry keeps its own pool / ADT / registry namespace).
+
+**Hard limit**: **different backends** must not share a SYSID — the SDK's descriptor cache is partitioned by SYSID, so two hosts answering to the same SID (cloned dev containers!) would silently marshal with each other's signatures. The gateway registers SYSIDs on first connect and quarantines cross-backend conflicts with `503 SYSTEM_SYSID_CONFLICT` (same-backend entries are exempt).
 
 ---
 

@@ -94,7 +94,8 @@ curl http://127.0.0.1:3000/api/s/prd/ready                # 该系统的 readine
 - 未知系统名 → `404 SYSTEM_UNKNOWN`（错误里附可用清单）。**跨系统对比对象**：同一读取端点换两个作用域各调一次（如 `/api/functions/ZFOO/source` 分别在 a4h 与 prd 下），对结果做 diff。
 - 平坦交付端口 `/api/invokes/{alias}` **按条目记录的 system 路由**（别名是全局命名空间）；显式作用域与条目不符 → `409 SYSTEM_MISMATCH`。`GET /api/registry?system=prd` 按系统过滤。
 - MCP 工具接受可选 `system` 参数（缺省 = 默认系统）。
-- 硬性限制：两个系统的 **SYSID 相同**（如克隆的开发容器）会被隔离（`503 SYSTEM_SYSID_CONFLICT`）——SDK 描述符缓存按 SYSID 分区，同 SYSID 会静默共享错误签名。
+- **同一系统不同 client**（同 ashost/sysnr、不同 `client`）完全支持：SAP 仓库对象跨 client、签名必然一致，各条目仍有独立的池 / ADT / 注册表命名空间。
+- 硬性限制：**不同后端**共用同一 SYSID（如经不同主机访问的克隆开发容器）会被隔离（`503 SYSTEM_SYSID_CONFLICT`）——SDK 描述符缓存按 SYSID 分区，跨后端的 SYSID 孪生会静默共享错误签名。
 
 ## 端点速查（含可复制的示例）
 
