@@ -2342,7 +2342,7 @@ pub fn normalize_function_source(source: &str) -> String {
     if comment_lines.iter().any(|l| {
         let t = l.trim_start().trim_start_matches("*\"").trim();
         // 块里出现段关键字才视为参数注释块（排除纯分隔线/标题）
-        t.split_whitespace().next().map(&is_sig_kw).unwrap_or(false)
+        t.split_whitespace().next().map(is_sig_kw).unwrap_or(false)
     }) {
         for l in &comment_lines {
             let t = l.trim_start().trim_start_matches("*\"").trim();
