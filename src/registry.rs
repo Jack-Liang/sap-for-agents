@@ -65,6 +65,10 @@ pub struct Entry {
     pub alias: String,
     /// SAP 函数模块名（大写，rfc_enabled）
     pub func_name: String,
+    /// 条目所属系统名（v0.16 多系统；平坦调用按此路由到对应连接池）。
+    /// 旧文件缺省 "default"（env 合成单系统的名字，无损读入）。
+    #[serde(default = "default_system_name")]
+    pub system: String,
     /// 函数组（可空；信息性，便于溯源）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
@@ -149,11 +153,15 @@ impl Store {
     }
 
     /// 列表（按 alias 排序）。`q` 对 alias/func_name/intent 做大小写不敏感子串过滤；
-    /// 默认排除墓碑，`include_deleted=true` 时包含。
-    fn list(&self, q: Option<&str>, include_deleted: bool) -> Vec<&Entry> {
+    /// `system` 按系统名精确过滤；默认排除墓碑，`include_deleted=true` 时包含。
+    fn list(&self, q: Option<&str>, system: Option<&str>, include_deleted: bool) -> Vec<&Entry> {
         self.entries
             .values()
             .filter(|e| include_deleted || e.status != EntryStatus::Deleted)
+            .filter(|e| match system {
+                Some(s) => e.system == s,
+                None => true,
+            })
             .filter(|e| match q {
                 Some(q) => {
                     let ql = q.to_lowercase();
@@ -173,6 +181,12 @@ impl Store {
         let entry = Entry {
             alias: alias.to_string(),
             func_name: body.func_name.trim().to_uppercase(),
+            // system：body 显式给出 > 沿用现有条目 > "default"（env 合成系统名）
+            system: body
+                .system
+                .clone()
+                .or_else(|| existing.map(|e| e.system.clone()))
+                .unwrap_or_else(default_system_name),
             group: body
                 .group
                 .as_deref()
@@ -194,13 +208,16 @@ impl Store {
         Ok((entry, created))
     }
 
-    /// 自动登记（写钩子调用）：按函数名幂等 upsert。
-    /// - 已有该函数的条目 → 保留 intent/notes/example（绝不清空 Agent 写的心血），
-    ///   刷新 group 与 updated_at；墓碑则复活为 draft；doc 非空时更新（文档随代码走）；
-    /// - 没有 → 以小写函数名为 alias 建 draft；alias 被其他函数占用时追加 -2/-3…。
+    /// 自动登记（写钩子调用）：按 (函数名, 系统) 幂等 upsert——同名函数在
+    /// 不同系统上是不同条目（各自的路由与文档）。
+    /// - 已有该 (函数, 系统) 的条目 → 保留 intent/notes/example（绝不清空
+    ///   Agent 写的心血），刷新 group 与 updated_at；墓碑则复活为 draft；
+    ///   doc 非空时更新（文档随代码走）；
+    /// - 没有 → 以小写函数名为 alias 建 draft；alias 被占用时追加 -2/-3…。
     fn ensure_draft_for_func(
         &mut self,
         func_name: &str,
+        system: &str,
         group: Option<&str>,
         doc: Option<&str>,
         now: &str,
@@ -218,7 +235,7 @@ impl Store {
         if let Some(e) = self
             .entries
             .values_mut()
-            .find(|e| e.func_name == func_upper)
+            .find(|e| e.func_name == func_upper && e.system == system)
         {
             // 复活/刷新：只动状态类字段（doc 非空才覆盖——文档随代码走）
             e.status = EntryStatus::Draft;
@@ -234,6 +251,7 @@ impl Store {
         let entry = Entry {
             alias: alias.clone(),
             func_name: func_upper,
+            system: system.to_string(),
             group: group_upper,
             intent: String::new(),
             notes: String::new(),
@@ -264,12 +282,13 @@ impl Store {
         format!("{base}-x{}", now_unix())
     }
 
-    /// 墓碑化某个函数的全部条目（对象删除钩子）。返回被墓碑化的条数。
-    fn tombstone_for_func(&mut self, func_name: &str, now: &str) -> usize {
+    /// 墓碑化某个函数在指定系统上的全部条目（对象删除钩子）。
+    /// 返回被墓碑化的条数。
+    fn tombstone_for_func(&mut self, func_name: &str, system: &str, now: &str) -> usize {
         let func_upper = func_name.trim().to_uppercase();
         let mut n = 0;
         for e in self.entries.values_mut() {
-            if e.func_name == func_upper && e.status != EntryStatus::Deleted {
+            if e.func_name == func_upper && e.system == system && e.status != EntryStatus::Deleted {
                 e.status = EntryStatus::Deleted;
                 e.updated_at = now.to_string();
                 n += 1;
@@ -496,34 +515,39 @@ fn persist(store: &Store) -> Result<(), RfcError> {
 /// 返回 alias。失败返回 Err（调用方降级为警告，绝不影响 SAP 写入结果）。
 pub fn auto_register_func(
     func_name: &str,
+    system: &str,
     group: Option<&str>,
     doc: Option<&str>,
 ) -> Result<String, RfcError> {
     let now = now_iso8601();
     let mut result = String::new();
     with_store(|store| {
-        result = store.ensure_draft_for_func(func_name, group, doc, &now);
+        result = store.ensure_draft_for_func(func_name, system, group, doc, &now);
         persist(store)
     })?;
     Ok(result)
 }
 
-/// 删除钩子：函数对象删除成功后墓碑化。失败返回 Err（调用方降级为警告）。
-pub fn tombstone_func(func_name: &str) -> Result<usize, RfcError> {
+/// 删除钩子：函数对象删除成功后墓碑化（按系统）。失败返回 Err（调用方降级为警告）。
+pub fn tombstone_func(func_name: &str, system: &str) -> Result<usize, RfcError> {
     let now = now_iso8601();
     let mut count = 0;
     with_store(|store| {
-        count = store.tombstone_for_func(func_name, &now);
+        count = store.tombstone_for_func(func_name, system, &now);
         persist(store)
     })?;
     Ok(count)
 }
 
-/// 列表（GET /api/registry）。
-pub fn list_entries(q: Option<&str>, include_deleted: bool) -> Result<Vec<Entry>, RfcError> {
+/// 列表（GET /api/registry）。`system` 按系统名精确过滤。
+pub fn list_entries(
+    q: Option<&str>,
+    system: Option<&str>,
+    include_deleted: bool,
+) -> Result<Vec<Entry>, RfcError> {
     with_store(|store| {
         Ok(store
-            .list(q, include_deleted)
+            .list(q, system, include_deleted)
             .into_iter()
             .cloned()
             .collect())
@@ -616,6 +640,9 @@ pub fn delete_entry(alias: &str, purge: bool) -> Result<bool, RfcError> {
 pub struct PutBody {
     /// SAP 函数模块名（必填；SAP 参数命名规则）
     pub func_name: String,
+    /// 条目所属系统名（可选；缺省沿用现有条目或 "default"）
+    #[serde(default)]
+    pub system: Option<String>,
     #[serde(default)]
     pub intent: String,
     #[serde(default)]
@@ -637,6 +664,11 @@ pub struct PutBody {
 
 fn default_status() -> EntryStatus {
     EntryStatus::Draft
+}
+
+/// Entry.system 的 serde 缺省值（旧 registry.json 无损读入）。
+fn default_system_name() -> String {
+    "default".to_string()
 }
 
 /// `status`/`intent` 等枚举字段反序列化失败时给出可读错误（而非 serde 天书）。
@@ -674,6 +706,9 @@ struct ListQuery {
     /// 子串过滤（alias/func_name/intent，大小写不敏感）
     #[serde(default)]
     q: Option<String>,
+    /// 按系统名精确过滤（多系统部署用）
+    #[serde(default)]
+    system: Option<String>,
     /// true = 连墓碑一起列出
     #[serde(default)]
     include_deleted: Option<bool>,
@@ -682,7 +717,11 @@ struct ListQuery {
 async fn registry_list_handler(
     axum::extract::Query(q): axum::extract::Query<ListQuery>,
 ) -> Result<Json<serde_json::Value>, RfcError> {
-    let entries = list_entries(q.q.as_deref(), q.include_deleted.unwrap_or(false))?;
+    let entries = list_entries(
+        q.q.as_deref(),
+        q.system.as_deref(),
+        q.include_deleted.unwrap_or(false),
+    )?;
     let count = entries.len();
     Ok(Json(serde_json::json!({
         "count": count,
@@ -822,6 +861,7 @@ mod tests {
         Entry {
             alias: alias.into(),
             func_name: func.into(),
+            system: "default".into(),
             group: None,
             intent: String::new(),
             notes: String::new(),
@@ -861,7 +901,7 @@ mod tests {
     #[test]
     fn ensure_draft_new_uses_lowercase_func_as_alias() {
         let mut s = Store::default();
-        let alias = s.ensure_draft_for_func("Z_CALC", Some("ZMATH"), None, "t1");
+        let alias = s.ensure_draft_for_func("Z_CALC", "default", Some("ZMATH"), None, "t1");
         assert_eq!(alias, "z_calc");
         assert_eq!(s.get("z_calc").unwrap().func_name, "Z_CALC");
         assert_eq!(s.get("z_calc").unwrap().group.as_deref(), Some("ZMATH"));
@@ -879,7 +919,7 @@ mod tests {
             e.status = EntryStatus::Published;
         }
         // doc=None：保留已有文档（手工完善的文档不被空写入冲掉）
-        let alias = s.ensure_draft_for_func("Z_CALC", None, None, "t2");
+        let alias = s.ensure_draft_for_func("Z_CALC", "default", None, None, "t2");
         assert_eq!(alias, "z_calc");
         let e = s.get("z_calc").unwrap();
         assert_eq!(e.intent, "客户列表查询", "重登记不清空 intent");
@@ -887,10 +927,16 @@ mod tests {
         assert_eq!(e.doc, "完整文档 v1", "doc=None 保留已有文档");
         assert_eq!(e.updated_at, "t2");
         // doc 非空：文档随代码更新
-        s.ensure_draft_for_func("Z_CALC", None, Some("完整文档 v2（随代码）"), "t3");
+        s.ensure_draft_for_func(
+            "Z_CALC",
+            "default",
+            None,
+            Some("完整文档 v2（随代码）"),
+            "t3",
+        );
         assert_eq!(s.get("z_calc").unwrap().doc, "完整文档 v2（随代码）");
         // doc 空白串视同未提供
-        s.ensure_draft_for_func("Z_CALC", None, Some("   "), "t4");
+        s.ensure_draft_for_func("Z_CALC", "default", None, Some("   "), "t4");
         assert_eq!(
             s.get("z_calc").unwrap().doc,
             "完整文档 v2（随代码）",
@@ -903,7 +949,7 @@ mod tests {
         let mut s = store_with(draft("z_calc", "Z_CALC"));
         s.tombstone("z_calc", "t0");
         assert_eq!(s.get("z_calc").unwrap().status, EntryStatus::Deleted);
-        let alias = s.ensure_draft_for_func("Z_CALC", None, None, "t1");
+        let alias = s.ensure_draft_for_func("Z_CALC", "default", None, None, "t1");
         assert_eq!(alias, "z_calc");
         assert_eq!(s.get("z_calc").unwrap().status, EntryStatus::Draft);
     }
@@ -912,7 +958,7 @@ mod tests {
     fn ensure_draft_alias_collision_suffixes() {
         // z_calc 已被另一个函数占用 → 新函数取 z_calc-2
         let mut s = store_with(draft("z_calc", "Z_SOMETHING_ELSE"));
-        let alias = s.ensure_draft_for_func("Z_CALC", None, None, "t1");
+        let alias = s.ensure_draft_for_func("Z_CALC", "default", None, None, "t1");
         assert_eq!(alias, "z_calc-2");
         assert_eq!(s.get("z_calc-2").unwrap().func_name, "Z_CALC");
     }
@@ -921,11 +967,11 @@ mod tests {
     fn tombstone_for_func_matches_all_aliases_and_is_noop_when_absent() {
         let mut s = store_with(draft("z_calc", "Z_CALC"));
         s.entries.insert("calc2".into(), draft("calc2", "Z_CALC"));
-        assert_eq!(s.tombstone_for_func("z_calc", "t1"), 2);
+        assert_eq!(s.tombstone_for_func("z_calc", "default", "t1"), 2);
         assert_eq!(s.get("z_calc").unwrap().status, EntryStatus::Deleted);
         assert_eq!(s.get("calc2").unwrap().status, EntryStatus::Deleted);
         // 不存在的函数：无操作不报错
-        assert_eq!(s.tombstone_for_func("Z_NOPE", "t2"), 0);
+        assert_eq!(s.tombstone_for_func("Z_NOPE", "default", "t2"), 0);
     }
 
     #[test]
@@ -939,12 +985,12 @@ mod tests {
         s.entries.insert("old".into(), draft("old", "Z_OLD"));
         s.tombstone("old", "t1");
         // 默认隐藏墓碑
-        assert_eq!(s.list(None, false).len(), 1);
+        assert_eq!(s.list(None, None, false).len(), 1);
         // include_deleted 全量
-        assert_eq!(s.list(None, true).len(), 2);
+        assert_eq!(s.list(None, None, true).len(), 2);
         // q 命中 intent（大小写不敏感）
-        assert_eq!(s.list(Some("CUSTOMER"), false).len(), 1);
-        assert_eq!(s.list(Some("nomatch"), false).len(), 0);
+        assert_eq!(s.list(Some("CUSTOMER"), None, false).len(), 1);
+        assert_eq!(s.list(Some("nomatch"), None, false).len(), 0);
     }
 
     #[test]
@@ -952,6 +998,7 @@ mod tests {
         let mut s = store_with(draft("z_calc", "Z_CALC"));
         let body = PutBody {
             func_name: "z_calc".into(),
+            system: None,
             intent: "intent v2".into(),
             notes: String::new(),
             doc: String::new(),
@@ -969,6 +1016,7 @@ mod tests {
         // 全量替换：未带的 example=null 即清空
         let body2 = PutBody {
             func_name: "z_calc".into(),
+            system: None,
             intent: String::new(),
             notes: String::new(),
             doc: String::new(),

@@ -19,10 +19,11 @@ mod registry;
 mod server;
 mod server_config;
 mod server_rfc;
+mod setup;
 mod string_utils;
+mod systems;
 mod version;
 
-use crate::pool::RfcConnectionPool;
 use std::sync::Arc;
 
 #[tokio::main]
@@ -103,26 +104,58 @@ async fn run_client() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(255);
     }
 
-    // 版本自描述（/api/version）：客户端号来自本地配置，零 RFC 成本
-    // （须在 conn_params move 进连接池之前取出）
-    let sap_client = cfg
-        .conn_params
-        .iter()
-        .find(|(k, _)| *k == "CLIENT")
-        .map(|(_, v)| v.clone())
-        .unwrap_or_default();
-    version::init_sap_client(sap_client);
+    // 多系统组装（v0.16）：无 sap_systems.toml 时从环境变量合成单系统 default
+    //（行为与旧版逐字节一致）；默认系统急切建首连（fail-fast 保留），其余惰性。
+    // v0.17：连接配置全缺 → 未配置模式（空注册表照样监听，setup API 引导配置）。
+    let specs = match systems::load_specs(&cfg) {
+        Ok(s) => s,
+        Err(e) => {
+            print_config_guide(&e, false);
+            return Err(e.into());
+        }
+    };
+    let n_systems = specs.len();
 
-    let pool =
-        RfcConnectionPool::with_max_size(cfg.conn_params, cfg.pool_size, cfg.pool_idle_validate)?;
-    tracing::info!(pool_size = cfg.pool_size, "SAP 系统连接成功（多连接池）");
+    // 版本自描述（/api/version）：客户端号来自本地配置，零 RFC 成本。
+    // 取**默认系统**的 CLIENT（env 合成或 toml 声明皆准）；未配置模式跳过
+    // （setup 首个系统热加载时补写，见 setup.rs）。须在 specs move 前取出。
+    if let Some(client) = specs.iter().find(|s| s.is_default).and_then(|s| {
+        s.conn_params
+            .iter()
+            .find(|(k, _)| *k == "CLIENT")
+            .map(|(_, v)| v.clone())
+    }) {
+        version::init_sap_client(client);
+    }
+
+    let registry = match systems::build_registry(specs, &cfg) {
+        Ok(r) => r,
+        Err(e) => {
+            print_config_guide(&e, false);
+            return Err(e.into());
+        }
+    };
+    let state: server::SharedState = Arc::new(registry);
+    match state.default() {
+        Some(d) => tracing::info!(
+            systems = n_systems,
+            default = %d.name,
+            "SAP 系统注册表已组装（多连接池）"
+        ),
+        None => tracing::warn!(
+            systems = 0,
+            "未配置模式启动：无任何 SAP 系统。网关照常监听，业务端点返回 503 \
+             SYSTEM_NOT_CONFIGURED；Agent 引导配置：GET /api/setup → 采集 → \
+             POST /api/setup/system（试连通过即落盘热加载，无需重启）"
+        ),
+    }
+
     // 认证：未设 SAP_API_KEY → None（免鉴权）；设置后 /api/* 要求 Bearer token
     let auth_enabled = cfg.api_key.is_some();
     auth::init(cfg.api_key);
     tracing::info!(auth_enabled, "API 认证配置");
-    // 全局请求超时（/api/rfc 还支持 per-request timeout_secs 覆盖）
-    server::init_request_timeout(cfg.request_timeout);
-    // 只读模式（SAP_READ_ONLY）：拦截网关写端点（objects 写 / ADT 写方法）
+    // 只读模式（SAP_READ_ONLY）：capabilities 自描述的进程级视角
+    //（真实拦截按系统：sap_systems.toml 的 read_only 覆盖，见 read_only_guard）
     server::init_read_only(cfg.read_only);
     if cfg.read_only {
         tracing::warn!("🔒 只读模式已启用（SAP_READ_ONLY）：/api/objects 写端点与 /api/adt 写方法返回 403；/api/rfc 不受影响");
@@ -131,13 +164,17 @@ async fn run_client() -> Result<(), Box<dyn std::error::Error>> {
     server::init_metrics();
     // 可选限流（按 IP；未设 SAP_RATE_LIMIT_RPS 则不限流）
     server::init_rate_limiter(cfg.rate_limit_rps);
-    // ADT REST 代理（/api/adt/**；SAP_ADT_BASE_URL 为空串时禁用）
-    adt::init(
-        cfg.adt_base_url,
-        &cfg.adt_user,
-        &cfg.adt_passwd,
-        cfg.request_timeout,
-    );
+    // ADT 能力自描述按默认系统视角（每系统真实开关看 /api/version 的 systems 块）；
+    // 未配置模式为 false（setup 首个默认系统热加载时会翻转）
+    adt::init_capability_adt(state.default().is_some_and(|d| d.adt.is_some()));
+    // 引导式配置开关（SAP_SETUP=off 禁用 POST /api/setup/system；GET 状态仍公开）
+    setup::init(cfg.setup_enabled);
+    if !cfg.setup_enabled {
+        tracing::info!("引导式配置已禁用（SAP_SETUP=off）：POST /api/setup/system 返回 403");
+    }
+    // 未配置模式自动打开引导页（SAP_OPEN_BROWSER=off 关；已配置部署从不弹）。
+    // server::run 在监听成功后触发——浏览器打开时页面必然可访问。
+    setup::init_auto_open(state.default().is_none() && cfg.open_browser);
     // 运行档位（SAP_MODE=runtime）：消费方运行模式——只留交付端口调用面
     server::init_runtime_mode(cfg.runtime_mode);
     if cfg.runtime_mode {
@@ -149,11 +186,14 @@ async fn run_client() -> Result<(), Box<dyn std::error::Error>> {
         path = %cfg.registry_file.display(),
         "API 注册表已启用（GET /api/registry）"
     );
-    let shared: server::SharedPool = Arc::new(pool);
+    // OpenAPI 目录的多系统注入（条目按 system 各自取接口）
+    openapi::init_shared_state(Arc::clone(&state));
 
+    // SYSID 探测（并行；发现同 SYSID 系统会隔离——SDK 描述符缓存按 SYSID 分区）
+    tokio::spawn(systems::probe_all(Arc::clone(&state)));
     // 注册表服务目录预热（v0.13）：后台 watcher 维护 published 条目的类型化
     // operation 缓存，公开的 /openapi.json 只读缓存——不被 SAP 健康状况绑架
-    tokio::spawn(openapi::registry_ops_watcher(Arc::clone(&shared)));
+    tokio::spawn(openapi::registry_ops_watcher());
 
     // 新版本检查（GitHub Releases，后台任务：启动即查 + 每 24h；失败静默）
     if cfg.update_check {
@@ -162,7 +202,7 @@ async fn run_client() -> Result<(), Box<dyn std::error::Error>> {
         tracing::info!("新版本检查已禁用（SAP_UPDATE_CHECK=off）");
     }
 
-    server::run(shared, &cfg.listen_addr, wait_shutdown_signal()).await?;
+    server::run(state, &cfg.listen_addr, wait_shutdown_signal()).await?;
     Ok(())
 }
 

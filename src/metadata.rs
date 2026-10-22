@@ -8,12 +8,16 @@
 //!
 //! 缓存设计：只存 Rust 化的纯数据（不含 SAP 句柄），保证可跨线程共享。
 //! 表/结构体参数的字段信息在拉取时一次性递归解析好。
+//!
+//! v0.16 起缓存**按系统实例化**（挂在 [`crate::systems::SystemHandle`] 上）：
+//! 不同系统的同名函数/类型签名的元数据互不相同，进程级共享会互相污染
+//! （跨系统对象对比场景恰好高频踩中）。键仍是函数名/类型名，隔离靠实例。
 
 use crate::connection::{get_field_infos, RfcConnection};
 use crate::error::RfcError;
 use crate::ffi::{RFCTYPE_STRUCTURE, RFCTYPE_TABLE};
 use std::collections::HashMap;
-use std::sync::{OnceLock, RwLock};
+use std::sync::RwLock;
 
 /// 嵌套结构体递归深度上限，防止 ABAP 深层自引用导致栈溢出。
 const MAX_RECURSION_DEPTH: usize = 5;
@@ -52,36 +56,136 @@ pub struct FuncMetadata {
     pub tables: HashMap<String, HashMap<String, FieldMeta>>,
 }
 
-/// 函数元数据缓存：函数名 -> 元数据
-static FUNC_CACHE: OnceLock<RwLock<HashMap<String, FuncMetadata>>> = OnceLock::new();
-/// DDIC 类型字段缓存：类型名 -> 字段列表
-static TYPE_CACHE: OnceLock<RwLock<HashMap<String, Vec<TypeFieldMeta>>>> = OnceLock::new();
-
-fn func_cache() -> &'static RwLock<HashMap<String, FuncMetadata>> {
-    FUNC_CACHE.get_or_init(|| RwLock::new(HashMap::new()))
+/// 单系统的元数据缓存（函数接口 + DDIC 类型字段）。
+///
+/// 并发模型：读走 `RwLock` 读锁（快路径），未命中拉取后再拿写锁回填。
+/// 锁毒化按错误上抛（与旧全局缓存版一致）。
+pub struct MetadataCache {
+    /// 函数元数据：函数名 -> 元数据
+    func: RwLock<HashMap<String, FuncMetadata>>,
+    /// DDIC 类型字段缓存：类型名 -> 字段列表
+    types: RwLock<HashMap<String, Vec<TypeFieldMeta>>>,
 }
 
-fn type_cache() -> &'static RwLock<HashMap<String, Vec<TypeFieldMeta>>> {
-    TYPE_CACHE.get_or_init(|| RwLock::new(HashMap::new()))
-}
-
-/// 写钩子调用：函数对象写入/删除成功后清除其元数据缓存，
-/// 让下一次接口自省/auto_outputs 拿到新签名（否则读到的是写入前的快照）。
-/// 返回是否确有条目被清除（供日志判断）。
-pub fn invalidate_function(func_name: &str) -> bool {
-    match func_cache().write() {
-        Ok(mut map) => map.remove(&func_name.to_uppercase()).is_some(),
-        Err(_) => false,
+impl Default for MetadataCache {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
-/// 写钩子调用：DDIC 表/结构（tabl/stru）写入或删除成功后清除其字段缓存，
-/// 让下一次 `/api/ddic/type/{name}` 及结构/表参数的字段展开拿到新定义。
-/// 返回是否确有条目被清除（供日志判断）。
-pub fn invalidate_type(type_name: &str) -> bool {
-    match type_cache().write() {
-        Ok(mut map) => map.remove(&type_name.to_uppercase()).is_some(),
-        Err(_) => false,
+fn poisoned(which: &str, e: impl std::fmt::Display) -> RfcError {
+    RfcError {
+        code: -1,
+        message: format!("元数据缓存锁被毒化（{}）: {}", which, e),
+        key: String::new(),
+        ..Default::default()
+    }
+}
+
+impl MetadataCache {
+    /// 空缓存（每系统一份，随 [`crate::systems::SystemHandle`] 创建）。
+    pub fn new() -> Self {
+        Self {
+            func: RwLock::new(HashMap::new()),
+            types: RwLock::new(HashMap::new()),
+        }
+    }
+
+    /// 写钩子调用：函数对象写入/删除成功后清除其元数据缓存，
+    /// 让下一次接口自省/auto_outputs 拿到新签名（否则读到的是写入前的快照）。
+    /// 返回是否确有条目被清除（供日志判断）。
+    pub fn invalidate_function(&self, func_name: &str) -> bool {
+        match self.func.write() {
+            Ok(mut map) => map.remove(&func_name.to_uppercase()).is_some(),
+            Err(_) => false,
+        }
+    }
+
+    /// 写钩子调用：DDIC 表/结构（tabl/stru）写入或删除成功后清除其字段缓存，
+    /// 让下一次 `/api/ddic/type/{name}` 及结构/表参数的字段展开拿到新定义。
+    /// 返回是否确有条目被清除（供日志判断）。
+    pub fn invalidate_type(&self, type_name: &str) -> bool {
+        match self.types.write() {
+            Ok(mut map) => map.remove(&type_name.to_uppercase()).is_some(),
+            Err(_) => false,
+        }
+    }
+
+    /// 获取某函数的元数据。命中缓存直接返回；未命中则从 SAP 拉取并缓存。
+    pub fn get_metadata(
+        &self,
+        conn: &RfcConnection,
+        func_name: &str,
+    ) -> Result<FuncMetadata, RfcError> {
+        // 先查缓存（快路径，读锁）
+        {
+            let map = self.func.read().map_err(|e| poisoned("函数", e))?;
+            if let Some(meta) = map.get(func_name) {
+                return Ok(meta.clone());
+            }
+        }
+
+        // 未命中：从 SAP 拉取
+        let meta = fetch_metadata(conn, func_name)?;
+        let mut map = self.func.write().map_err(|e| poisoned("函数", e))?;
+        map.insert(func_name.to_string(), meta.clone());
+        tracing::debug!(
+            func = func_name,
+            scalars = meta.scalars.len(),
+            tables = meta.tables.len(),
+            "元数据已缓存"
+        );
+        Ok(meta)
+    }
+
+    /// 查询某标量参数的元数据。
+    pub fn param_meta(
+        &self,
+        conn: &RfcConnection,
+        func_name: &str,
+        param_name: &str,
+    ) -> Option<FieldMeta> {
+        let meta = self.get_metadata(conn, func_name).ok()?;
+        meta.scalars.get(&param_name.to_uppercase()).copied()
+    }
+
+    /// 查询某表参数的字段元数据映射（field_name -> FieldMeta）。
+    pub fn table_field_metas(
+        &self,
+        conn: &RfcConnection,
+        func_name: &str,
+        table_param: &str,
+    ) -> Option<HashMap<String, FieldMeta>> {
+        let meta = self.get_metadata(conn, func_name).ok()?;
+        meta.tables.get(&table_param.to_uppercase()).cloned()
+    }
+
+    /// 获取某 DDIC 类型（结构/表，如 MARA、BAPIRETURN）的字段元数据。
+    /// 命中缓存直接返回；未命中则用 RfcGetTypeDesc 拉取并递归解析后缓存。
+    /// 与函数元数据不同，这里返回完整的 TypeFieldMeta（含描述/小数位/嵌套子字段）。
+    pub fn get_type_fields(
+        &self,
+        conn: &RfcConnection,
+        type_name: &str,
+    ) -> Result<Vec<TypeFieldMeta>, RfcError> {
+        let upper = type_name.to_uppercase();
+        // 先查缓存（快路径，读锁）
+        {
+            let map = self.types.read().map_err(|e| poisoned("类型", e))?;
+            if let Some(fields) = map.get(&upper) {
+                return Ok(fields.clone());
+            }
+        }
+
+        // 未命中：用 RfcGetTypeDesc 取类型描述符，递归解析字段
+        let type_handle = conn.get_type_desc(&upper)?;
+        // SAFETY: type_handle 来自刚获取的有效类型描述符，连接仍有效
+        let fields = unsafe { resolve_fields_recursive(type_handle, 0) }?;
+
+        let mut map = self.types.write().map_err(|e| poisoned("类型", e))?;
+        map.insert(upper.clone(), fields.clone());
+        tracing::debug!(r#type = %upper, fields = fields.len(), "DDIC 类型字段已缓存");
+        Ok(fields)
     }
 }
 
@@ -157,90 +261,4 @@ fn fetch_metadata(conn: &RfcConnection, func_name: &str) -> Result<FuncMetadata,
     }
 
     Ok(meta)
-}
-
-/// 获取某函数的元数据。命中缓存直接返回；未命中则从 SAP 拉取并缓存。
-pub fn get_metadata(conn: &RfcConnection, func_name: &str) -> Result<FuncMetadata, RfcError> {
-    // 先查缓存（快路径，读锁）
-    {
-        let map = func_cache().read().map_err(|e| RfcError {
-            code: -1,
-            message: format!("元数据缓存锁被毒化: {}", e),
-            key: String::new(),
-            ..Default::default()
-        })?;
-        if let Some(meta) = map.get(func_name) {
-            return Ok(meta.clone());
-        }
-    }
-
-    // 未命中：从 SAP 拉取
-    let meta = fetch_metadata(conn, func_name)?;
-    let mut map = func_cache().write().map_err(|e| RfcError {
-        code: -1,
-        message: format!("元数据缓存锁被毒化: {}", e),
-        key: String::new(),
-        ..Default::default()
-    })?;
-    map.insert(func_name.to_string(), meta.clone());
-    tracing::debug!(
-        func = func_name,
-        scalars = meta.scalars.len(),
-        tables = meta.tables.len(),
-        "元数据已缓存"
-    );
-    Ok(meta)
-}
-
-/// 查询某标量参数的元数据。
-pub fn param_meta(conn: &RfcConnection, func_name: &str, param_name: &str) -> Option<FieldMeta> {
-    let meta = get_metadata(conn, func_name).ok()?;
-    meta.scalars.get(&param_name.to_uppercase()).copied()
-}
-
-/// 查询某表参数的字段元数据映射（field_name -> FieldMeta）。
-pub fn table_field_metas(
-    conn: &RfcConnection,
-    func_name: &str,
-    table_param: &str,
-) -> Option<HashMap<String, FieldMeta>> {
-    let meta = get_metadata(conn, func_name).ok()?;
-    meta.tables.get(&table_param.to_uppercase()).cloned()
-}
-
-/// 获取某 DDIC 类型（结构/表，如 MARA、BAPIRETURN）的字段元数据。
-/// 命中缓存直接返回；未命中则用 RfcGetTypeDesc 拉取并递归解析后缓存。
-/// 与函数元数据不同，这里返回完整的 TypeFieldMeta（含描述/小数位/嵌套子字段）。
-pub fn get_type_fields(
-    conn: &RfcConnection,
-    type_name: &str,
-) -> Result<Vec<TypeFieldMeta>, RfcError> {
-    let upper = type_name.to_uppercase();
-    // 先查缓存（快路径，读锁）
-    {
-        let map = type_cache().read().map_err(|e| RfcError {
-            code: -1,
-            message: format!("类型缓存锁被毒化: {}", e),
-            key: String::new(),
-            ..Default::default()
-        })?;
-        if let Some(fields) = map.get(&upper) {
-            return Ok(fields.clone());
-        }
-    }
-
-    // 未命中：用 RfcGetTypeDesc 取类型描述符，递归解析字段
-    let type_handle = conn.get_type_desc(&upper)?;
-    // SAFETY: type_handle 来自刚获取的有效类型描述符，连接仍有效
-    let fields = unsafe { resolve_fields_recursive(type_handle, 0) }?;
-
-    let mut map = type_cache().write().map_err(|e| RfcError {
-        code: -1,
-        message: format!("类型缓存锁被毒化: {}", e),
-        key: String::new(),
-        ..Default::default()
-    })?;
-    map.insert(upper.clone(), fields.clone());
-    tracing::debug!(r#type = %upper, fields = fields.len(), "DDIC 类型字段已缓存");
-    Ok(fields)
 }

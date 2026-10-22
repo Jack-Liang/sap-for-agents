@@ -1,0 +1,71 @@
+# 多系统配置（可选）：一个网关同时连接 N 个 SAP 系统。
+#
+# 用法：复制为 sap_systems.toml（或用 SAP_SYSTEMS_FILE 指定路径）后启动。
+# 详见 README §配置 与 docs/MULTI_SYSTEM.zh-CN.md。
+#
+# 不想手工写文件？无配置启动的网关支持引导式配置（v0.17）：
+#   GET  /api/setup          查看状态与「该问用户哪些字段」清单
+#   POST /api/setup/system   校验 → 试连 → 自动生成本文件 → 热加载（无需重启）
+#
+# ── 与 .env 的关系（三层优先级）────────────────────────────────────────
+#   代码内置默认 ←覆盖─ .env/环境变量（网关全局层） ←覆盖─ 本文件每系统字段
+#
+# - 只在 .env：监听地址、API key、限流、runtime 档位、更新检查、registry 路径
+# - .env 给全局默认、本文件按系统覆盖：pool_size / idle_validate_secs /
+#   request_timeout_secs / read_only / ADT 地址与账号
+# - 二选一：连接参数——本文件存在则系统集合完全由本文件定义（.env 的
+#   SAP_ASHOST 一族被忽略，启动日志有提示）；不存在则从 .env 合成单系统
+#
+# ── 作用域 URL ────────────────────────────────────────────────────────
+#   无前缀路径            = default = true 的系统（存量消费方零改动）
+#   /api/s/{系统名}/...   = 指定系统（如 /api/s/prd/rfc、/api/s/prd/functions/ZFOO）
+#   /api/s/{系统名}/ready = 该系统 readiness
+#   GET /api/systems      = 系统清单（Agent 会话第一步）
+#
+# ── client 说明 ────────────────────────────────────────────────────────
+# 同一系统不同 client = 多条目（同 ashost/sysnr、不同 client），完全支持：
+# SAP 仓库对象跨 client、签名必然一致，各条目仍有独立池/ADT/注册表命名空间。
+
+# ── 硬性限制 ──────────────────────────────────────────────────────────
+# 不同后端不得共用同一 SYSID（SDK 描述符缓存按 SYSID 分区，跨后端同 SYSID
+# 会静默共享错误签名）。克隆的开发容器经不同主机访问时常同 SID——冲突系统
+# 会被隔离（503 SYSTEM_SYSID_CONFLICT），改 SID 或只连其一；同后端条目豁免。
+
+[systems.a4h]
+# 连接参数（快捷字段；或用下方 [systems.a4h.conn] 透传任意 SDK 参数）
+ashost = "vhcala4h"
+sysnr = "00"
+client = "001"
+user = "developer"
+# 密码支持 ${VAR} 环境变量插值——密钥放 .env/环境变量，本文件可入库
+passwd = "${SAP_A4H_PASSWD}"
+lang = "EN"              # 可选，默认 EN
+
+# 无前缀路径路由到此系统（多系统时必须恰好一个标记 default）
+default = true
+
+[systems.prd]
+ashost = "sap-prd.example.com"
+sysnr = "10"
+client = "100"
+user = "rfc_gateway"
+passwd = "${SAP_PRD_PASSWD}"
+
+# ── 每系统可选覆盖（缺省用 .env 全局值）───────────────────────────────
+pool_size = 4                        # 连接池上限（默认 SAP_POOL_SIZE/8）
+idle_validate_secs = 30              # 空闲连接借出前 ping 校验阈值
+request_timeout_secs = 60            # 该系统单请求超时
+read_only = true                     # 该系统写端点 403（如生产系统只许读）
+# adt_base_url = "https://host:44300" # 缺省按本系统 ashost:50000 推导；空串 = 禁用
+# adt_user = "otheruser"              # 缺省同本系统 user
+# adt_passwd = "${SAP_PRD_ADT_PASSWD}"
+
+# ── conn 透传表（可选）：任意 RfcOpenConnection 参数 ──────────────────
+# 负载均衡/消息服务器形态（与 ashost 二选一）：
+# [systems.lb]
+# user = "u"
+# passwd = "${SAP_LB_PASSWD}"
+# [systems.lb.conn]
+# MSHOST = "msg.example.com"
+# GROUP = "SPACE"
+# R3NAME = "PRD"

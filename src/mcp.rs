@@ -18,7 +18,7 @@
 //! 挂在 api 路由上：与 /api/* 同一套鉴权（SAP_API_KEY）与限流。
 
 use crate::error::RfcError;
-use crate::server::SharedPool;
+use crate::server::SharedState;
 use axum::response::{IntoResponse, Response};
 use serde_json::{json, Value};
 
@@ -272,7 +272,7 @@ fn tool_err(e: &RfcError) -> Value {
 
 /// `POST /mcp` 入口：解析单条 JSON-RPC 消息并分发。
 pub async fn mcp_handler(
-    axum::extract::State(pool): axum::extract::State<SharedPool>,
+    axum::extract::State(state): axum::extract::State<SharedState>,
     body: Result<axum::Json<Value>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
     let Ok(axum::Json(msg)) = body else {
@@ -313,7 +313,7 @@ pub async fn mcp_handler(
         "tools/call" => {
             let name = params.get("name").and_then(|n| n.as_str()).unwrap_or("");
             let args = params.get("arguments").cloned().unwrap_or(json!({}));
-            match call_tool(pool, name, args).await {
+            match call_tool(state, name, args).await {
                 Ok(payload) => rpc_result(id, tool_ok(payload)),
                 Err(e) => rpc_result(id, tool_err(&e)),
             }
@@ -327,9 +327,36 @@ pub async fn mcp_handler(
 // ========================================================================
 
 /// 便捷：阻塞线程内跑一个元数据查询（走 run_blocking = 池 + 重试 + 超时）
-async fn call_tool(pool: SharedPool, name: &str, args: Value) -> Result<Value, RfcError> {
+fn tool_system(
+    state: &SharedState,
+    args: &Value,
+) -> Result<std::sync::Arc<crate::systems::SystemHandle>, RfcError> {
+    match args.get("system").and_then(|v| v.as_str()) {
+        Some(s) => state.resolve(s).ok_or_else(|| RfcError {
+            code: -1,
+            status: 404,
+            message: format!(
+                "未知系统 '{}'（可用: {}；系统清单见 GET /api/systems）",
+                s,
+                state.names().join(", ")
+            ),
+            key: "SYSTEM_UNKNOWN".into(),
+        }),
+        None => state.default().ok_or_else(|| RfcError {
+            code: -1,
+            status: 503,
+            message: "网关尚未配置任何 SAP 系统（未配置模式）。引导式配置见 GET /api/setup".into(),
+            key: "SYSTEM_NOT_CONFIGURED".into(),
+        }),
+    }
+}
+
+/// 工具执行：复用 server/discovery/executor 既有入口；SAP 类工具可选
+/// `system` 参数选择目标系统（缺省 = 默认系统）。
+async fn call_tool(state: SharedState, name: &str, args: Value) -> Result<Value, RfcError> {
     match name {
         "search_functions" => {
+            let sys = tool_system(&state, &args)?;
             let pattern = req_str(&args, "pattern")?;
             let group = args
                 .get("group")
@@ -341,23 +368,27 @@ async fn call_tool(pool: SharedPool, name: &str, args: Value) -> Result<Value, R
                 .and_then(|v| v.as_u64())
                 .unwrap_or(20)
                 .min(100) as usize;
-            let out = crate::server::run_blocking(pool, move |conn| {
-                crate::discovery::search_functions(conn, &pattern, &group, max)
+            let d_sys = std::sync::Arc::clone(&sys);
+            let out = crate::server::run_blocking(sys, move |conn| {
+                crate::discovery::search_functions(&d_sys.meta, conn, &pattern, &group, max)
             })
             .await?;
             Ok(json!({ "count": out.len(), "functions": out }))
         }
         "get_function_interface" => {
+            let sys = tool_system(&state, &args)?;
             let fname = req_str(&args, "name")?.to_uppercase();
             crate::api::validate_func_name(&fname)?;
             let resp_name = fname.clone();
-            let view = crate::server::run_blocking(pool, move |conn| {
-                crate::server::collect_function_params(conn, &fname)
+            let iface_sys = std::sync::Arc::clone(&sys);
+            let view = crate::server::run_blocking(sys, move |conn| {
+                crate::server::collect_function_params(&iface_sys, conn, &fname)
             })
             .await?;
             Ok(json!({ "name": resp_name, "params": view.params }))
         }
         "get_function_doc" => {
+            let sys = tool_system(&state, &args)?;
             let fname = req_str(&args, "name")?.to_uppercase();
             crate::api::validate_func_name(&fname)?;
             let lang = args
@@ -365,13 +396,15 @@ async fn call_tool(pool: SharedPool, name: &str, args: Value) -> Result<Value, R
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            let out = crate::server::run_blocking(pool, move |conn| {
-                crate::discovery::read_function_doc(conn, &fname, &lang, "")
+            let d_sys = std::sync::Arc::clone(&sys);
+            let out = crate::server::run_blocking(sys, move |conn| {
+                crate::discovery::read_function_doc(&d_sys.meta, conn, &fname, &lang, "")
             })
             .await?;
             Ok(serde_json::to_value(out).unwrap_or(json!({})))
         }
         "invoke_rfc" => {
+            let sys = tool_system(&state, &args)?;
             // args 本身就是 InvokeRequest（多带的工具字段被忽略）
             let mut req: crate::api::InvokeRequest =
                 serde_json::from_value(args).map_err(|e| RfcError {
@@ -390,8 +423,9 @@ async fn call_tool(pool: SharedPool, name: &str, args: Value) -> Result<Value, R
                     .map(|s| s.min(MAX_TIMEOUT_SECS))
                     .unwrap_or(60),
             );
-            let out = crate::server::run_blocking_with_timeout(pool, timeout, move |conn| {
-                crate::executor::execute_collect(conn, &req)
+            let exec_sys = std::sync::Arc::clone(&sys);
+            let out = crate::server::run_blocking_with_timeout(sys, timeout, move |conn| {
+                crate::executor::execute_collect(&exec_sys, conn, &req)
             })
             .await?;
             serde_json::to_value(out).map_err(|e| RfcError {
@@ -402,14 +436,16 @@ async fn call_tool(pool: SharedPool, name: &str, args: Value) -> Result<Value, R
             })
         }
         "read_function_source" => {
+            let sys = tool_system(&state, &args)?;
             let fname = req_str(&args, "name")?.to_uppercase();
             crate::api::validate_func_name(&fname)?;
             let prologue = args
                 .get("prologue")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
-            let out = crate::server::run_blocking(pool, move |conn| {
-                let lines = crate::discovery::read_function_source(conn, &fname)?;
+            let d_sys = std::sync::Arc::clone(&sys);
+            let out = crate::server::run_blocking(sys, move |conn| {
+                let lines = crate::discovery::read_function_source(&d_sys.meta, conn, &fname)?;
                 let prologue_text = if prologue {
                     let deps = crate::discovery::scan_called_functions(&lines, &fname, 50);
                     let p = crate::discovery::build_function_prologue(conn, &deps);
@@ -426,19 +462,23 @@ async fn call_tool(pool: SharedPool, name: &str, args: Value) -> Result<Value, R
             Ok(out)
         }
         "read_program_source" => {
+            let sys = tool_system(&state, &args)?;
             let pname = req_str(&args, "name")?.to_uppercase();
             let resp_name = pname.clone();
-            let out = crate::server::run_blocking(pool, move |conn| {
-                crate::discovery::read_program_source(conn, &pname)
+            let d_sys = std::sync::Arc::clone(&sys);
+            let out = crate::server::run_blocking(sys, move |conn| {
+                crate::discovery::read_program_source(&d_sys.meta, conn, &pname)
             })
             .await?;
             Ok(json!({ "name": resp_name, "count": out.len(), "lines": out }))
         }
         "get_ddic_type" => {
+            let sys = tool_system(&state, &args)?;
             let tname = req_str(&args, "name")?.to_uppercase();
             let resp_name = tname.clone();
-            let out = crate::server::run_blocking(pool, move |conn| {
-                crate::metadata::get_type_fields(conn, &tname)
+            let meta_sys = std::sync::Arc::clone(&sys);
+            let out = crate::server::run_blocking(sys, move |conn| {
+                meta_sys.meta.get_type_fields(conn, &tname)
             })
             .await?;
             let fields: Vec<_> = out
@@ -448,6 +488,7 @@ async fn call_tool(pool: SharedPool, name: &str, args: Value) -> Result<Value, R
             Ok(json!({ "name": resp_name, "fields": fields }))
         }
         "get_ddic_field" => {
+            let sys = tool_system(&state, &args)?;
             let table = req_str(&args, "table")?.to_uppercase();
             let field = req_str(&args, "field")?.to_uppercase();
             let lang = args
@@ -455,13 +496,15 @@ async fn call_tool(pool: SharedPool, name: &str, args: Value) -> Result<Value, R
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            let out = crate::server::run_blocking(pool, move |conn| {
-                crate::discovery::read_ddic_field_info(conn, &table, &field, &lang)
+            let d_sys = std::sync::Arc::clone(&sys);
+            let out = crate::server::run_blocking(sys, move |conn| {
+                crate::discovery::read_ddic_field_info(&d_sys.meta, conn, &table, &field, &lang)
             })
             .await?;
             Ok(serde_json::to_value(out).unwrap_or(json!({})))
         }
         "read_table" => {
+            let sys = tool_system(&state, &args)?;
             let table = req_str(&args, "table")?.to_uppercase();
             let fields: Vec<String> = args
                 .get("fields")
@@ -495,8 +538,10 @@ async fn call_tool(pool: SharedPool, name: &str, args: Value) -> Result<Value, R
                 .unwrap_or(1000)
                 .min(10000) as u32;
             let resp_table = table.clone();
-            let rows = crate::server::run_blocking(pool, move |conn| {
+            let d_sys = std::sync::Arc::clone(&sys);
+            let rows = crate::server::run_blocking(sys, move |conn| {
                 crate::discovery::read_table(
+                    &d_sys.meta,
                     conn,
                     &table,
                     &fields,
@@ -509,22 +554,27 @@ async fn call_tool(pool: SharedPool, name: &str, args: Value) -> Result<Value, R
             Ok(json!({ "table": resp_table, "count": rows.len(), "rows": rows }))
         }
         "list_dumps" => {
+            let sys = tool_system(&state, &args)?;
+            let adt = sys.adt.as_ref().ok_or_else(crate::adt::adt_disabled)?;
             let limit = args
                 .get("limit")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(50)
                 .min(1000);
-            let entries = crate::dumps::fetch_feed(None, None).await?;
+            let entries = crate::dumps::fetch_feed(adt, None, None).await?;
             let out: Vec<_> = entries.into_iter().take(limit as usize).collect();
             Ok(json!({ "count": out.len(), "dumps": out }))
         }
         "get_dump_detail" => {
+            let sys = tool_system(&state, &args)?;
+            let adt = sys.adt.as_ref().ok_or_else(crate::adt::adt_disabled)?;
             let key = req_str(&args, "key")?;
-            let detail = crate::dumps::fetch_detail(&key).await?;
+            let detail = crate::dumps::fetch_detail(adt, &key).await?;
             Ok(serde_json::to_value(detail).unwrap_or(json!({})))
         }
         "write_source" | "edit_code" | "create_object" => {
             use crate::objects::ObjectType;
+            let sys = tool_system(&state, &args)?;
             let tool = name; // 工具名（下方 name 会被对象名遮蔽）
             let otype = req_str(&args, "type")?;
             let name = req_str(&args, "name")?.to_uppercase();
@@ -562,7 +612,7 @@ async fn call_tool(pool: SharedPool, name: &str, args: Value) -> Result<Value, R
             })?;
             crate::server::validate_object_name(&name)?;
             let group =
-                crate::server::resolve_group_if_needed(&pool, obj_type, &name, group_hint).await?;
+                crate::server::resolve_group_if_needed(&sys, obj_type, &name, group_hint).await?;
 
             if tool == "create_object" {
                 // 显式创建壳（可选首版源码一并写入激活）
@@ -575,7 +625,7 @@ async fn call_tool(pool: SharedPool, name: &str, args: Value) -> Result<Value, R
                         .and_then(|v| v.as_str())
                         .map(String::from),
                 };
-                crate::objects::create_object(&pool, obj_type, &name, &group, &spec).await?;
+                crate::objects::create_object(&sys, obj_type, &name, &group, &spec).await?;
                 let mut out = json!({ "created": true, "type": obj_type.api_name(), "name": name });
                 if let Some(src) = args
                     .get("source")
@@ -584,6 +634,7 @@ async fn call_tool(pool: SharedPool, name: &str, args: Value) -> Result<Value, R
                 {
                     if obj_type.has_source() {
                         let outcome = crate::objects::write_object_source(
+                            &sys,
                             obj_type,
                             &name,
                             &group,
@@ -594,7 +645,7 @@ async fn call_tool(pool: SharedPool, name: &str, args: Value) -> Result<Value, R
                             doc.as_deref(),
                         )
                         .await?;
-                        crate::objects::drain_pool_after_write(&pool, obj_type);
+                        crate::objects::drain_pool_after_write(&sys, obj_type);
                         out["write"] = serde_json::to_value(outcome).unwrap_or_default();
                     }
                 }
@@ -611,7 +662,7 @@ async fn call_tool(pool: SharedPool, name: &str, args: Value) -> Result<Value, R
             let outcome: serde_json::Value = if tool == "write_source" {
                 let source = req_str(&args, "source")?;
                 let o = crate::objects::write_object_maybe_create(
-                    &pool, obj_type, &name, &group, &source, &opts,
+                    &sys, obj_type, &name, &group, &source, &opts,
                 )
                 .await?;
                 serde_json::to_value(&o).unwrap_or_default()
@@ -627,7 +678,7 @@ async fn call_tool(pool: SharedPool, name: &str, args: Value) -> Result<Value, R
                     .unwrap_or("")
                     .to_string();
                 crate::objects::replace_object_maybe_create(
-                    &pool,
+                    &sys,
                     obj_type,
                     &name,
                     &group,
@@ -641,6 +692,7 @@ async fn call_tool(pool: SharedPool, name: &str, args: Value) -> Result<Value, R
         }
         "delete_object" => {
             use crate::objects::ObjectType;
+            let sys = tool_system(&state, &args)?;
             let otype = req_str(&args, "type")?;
             let name = req_str(&args, "name")?.to_uppercase();
             let group_hint = args.get("group").and_then(|v| v.as_str()).map(String::from);
@@ -658,11 +710,11 @@ async fn call_tool(pool: SharedPool, name: &str, args: Value) -> Result<Value, R
             })?;
             crate::server::validate_object_name(&name)?;
             let group =
-                crate::server::resolve_group_if_needed(&pool, obj_type, &name, group_hint).await?;
+                crate::server::resolve_group_if_needed(&sys, obj_type, &name, group_hint).await?;
             let outcome =
-                crate::objects::delete_object(obj_type, &name, &group, transport.as_deref())
+                crate::objects::delete_object(&sys, obj_type, &name, &group, transport.as_deref())
                     .await?;
-            crate::objects::drain_pool_after_write(&pool, obj_type);
+            crate::objects::drain_pool_after_write(&sys, obj_type);
             Ok(serde_json::to_value(outcome).unwrap_or_default())
         }
         "list_registry_apis" => {
@@ -671,15 +723,21 @@ async fn call_tool(pool: SharedPool, name: &str, args: Value) -> Result<Value, R
                 .get("include_deleted")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
-            let entries = crate::registry::list_entries(q.as_deref(), include_deleted)?;
+            let system = args
+                .get("system")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let entries =
+                crate::registry::list_entries(q.as_deref(), system.as_deref(), include_deleted)?;
             let count = entries.len();
             Ok(json!({ "count": count, "entries": entries }))
         }
         "get_gateway_info" => {
             // 与 GET /api/version 同源（version 模块内含懒加载缓存）
-            Ok(crate::version::gateway_info(&pool).await)
+            Ok(crate::version::gateway_info(&state).await)
         }
         "where_used" => {
+            let sys = tool_system(&state, &args)?;
             let fname = req_str(&args, "name")?.to_uppercase();
             crate::api::validate_func_name(&fname)?;
             let max = args
@@ -688,14 +746,17 @@ async fn call_tool(pool: SharedPool, name: &str, args: Value) -> Result<Value, R
                 .unwrap_or(200)
                 .min(2000) as usize;
             let resp_name = fname.clone();
-            let usages = crate::server::run_blocking(pool, move |conn| {
-                crate::discovery::read_where_used(conn, &fname, max)
+            let d_sys = std::sync::Arc::clone(&sys);
+            let usages = crate::server::run_blocking(sys, move |conn| {
+                crate::discovery::read_where_used(&d_sys.meta, conn, &fname, max)
             })
             .await?;
             Ok(json!({ "name": resp_name, "count": usages.len(), "usages": usages }))
         }
         "syntax_check" => {
             use crate::objects::ObjectType;
+            let sys = tool_system(&state, &args)?;
+            let adt = sys.adt.as_ref().ok_or_else(crate::adt::adt_disabled)?;
             let otype = req_str(&args, "type")?;
             let name = req_str(&args, "name")?.to_uppercase();
             let source = req_str(&args, "source")?;
@@ -708,7 +769,7 @@ async fn call_tool(pool: SharedPool, name: &str, args: Value) -> Result<Value, R
             })?;
             crate::server::validate_object_name(&name)?;
             let group =
-                crate::server::resolve_group_if_needed(&pool, obj_type, &name, group_hint).await?;
+                crate::server::resolve_group_if_needed(&sys, obj_type, &name, group_hint).await?;
             let base = obj_type.base_rel(&name, &group);
             // FM 语法检查同样按 SEDI 形态（与写入口径一致）
             let source = if obj_type == ObjectType::Function {
@@ -716,7 +777,7 @@ async fn call_tool(pool: SharedPool, name: &str, args: Value) -> Result<Value, R
             } else {
                 source
             };
-            let issues = crate::objects::syntax_check(&base, &source).await?;
+            let issues = crate::objects::syntax_check(adt, &base, &source).await?;
             Ok(json!({ "type": otype, "name": name, "count": issues.len(), "issues": issues }))
         }
         _ => Err(RfcError {

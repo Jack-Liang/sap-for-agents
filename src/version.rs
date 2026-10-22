@@ -13,14 +13,16 @@
 //! - **client 从本地配置读**：登录客户端号不需要 RFC 调用。
 
 use crate::connection::RemoteSystemInfo;
-use crate::server::SharedPool;
+use crate::server::SharedState;
+use crate::systems::SystemHandle;
 use serde_json::{json, Value};
 use std::sync::Arc;
 use std::time::Duration;
-/// 登录客户端号（启动期由 [`init_sap_client`] 写入）。
+/// 登录客户端号（启动期由 [`init_sap_client`] 写入；**默认系统**的客户端号，
+/// v0.16 多系统下保留作 `sap` 块的兼容字段）。
 static SAP_CLIENT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
-/// 启动期写入 SAP 客户端号（main 调一次；读自 `SAP_CLIENT` 配置，零 RFC 成本）。
+/// 启动期写入 SAP 客户端号（main 调一次；读自默认系统配置，零 RFC 成本）。
 pub fn init_sap_client(client: String) {
     let _ = SAP_CLIENT.set(client);
 }
@@ -30,37 +32,115 @@ pub fn git_commit() -> &'static str {
     option_env!("SAP_GIT_COMMIT").unwrap_or("unknown")
 }
 
-/// SAP 系统信息缓存：成功一次永久复用；失败不缓存（下次重试）。
-/// RwLock 而非 OnceCell：OnceCell 一旦写入无法重试失败的获取。
-static SAP_INFO: tokio::sync::RwLock<Option<Arc<RemoteSystemInfo>>> =
-    tokio::sync::RwLock::const_new(None);
-
 /// SAP 系统信息获取的超时上限（独立于全局请求超时：自描述端点不该被慢 SAP 拖住）。
 const SAP_INFO_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// 组装完整的自描述 JSON（`/api/version` 与 `get_gateway_info` 共用）。
-pub async fn gateway_info(pool: &SharedPool) -> Value {
+///
+/// v0.16 多系统：`sap` 块保持 = **默认系统**（兼容既有消费方），新增 `systems`
+/// 全量块（每系统并行懒加载一次、缓存于各自 handle；失败不缓存、值为 null
+/// 附 `<name>_error` 字段）。端点整体仍 200——SAP 宕机时恰恰最需要这份自描述。
+pub async fn gateway_info(state: &SharedState) -> Value {
     let mut out = local_info();
     // latest 与 SAP 块独立：任一不可用不影响另一个
     out["latest"] = latest_json().await;
-    match fetch_cached_sap_info(pool).await {
-        Ok(info) => {
-            out["sap"] = json!({
-                "sysid": info.sysid,
-                "release": info.release,
-                "host": info.host,
-                "os": info.os,
-                "destination": info.destination,
-                // 客户端号来自本地配置（RFC 层免费），失败场景也照常给出
-                "client": SAP_CLIENT.get().cloned().unwrap_or_default(),
-            })
-        }
-        Err(e) => {
+    match state.default() {
+        Some(default) => match fetch_cached_sap_info(&default).await {
+            Ok(info) => {
+                out["sap"] = sap_info_json(&info, SAP_CLIENT.get().cloned().unwrap_or_default());
+            }
+            Err(e) => {
+                out["sap"] = Value::Null;
+                out["sap_error"] = json!(e.message);
+            }
+        },
+        // 未配置模式：不是 SAP 故障，是还没有任何系统——指路 setup 引导
+        None => {
             out["sap"] = Value::Null;
-            out["sap_error"] = json!(e.message);
+            out["sap_error"] =
+                json!("网关未配置任何 SAP 系统（未配置模式）；引导式配置见 GET /api/setup");
         }
     }
+    // 全量系统块：并行取各系统信息（每系统首取 ≤10s，并行后整体 ≤10s）
+    let handles = state.list();
+    let default = state.default();
+    let infos = futures_join_all(handles).await;
+    let mut systems = serde_json::Map::new();
+    for (sys, info) in infos {
+        let is_default = default.as_ref().is_some_and(|d| Arc::ptr_eq(&sys, d));
+        match info {
+            Ok(i) => {
+                systems.insert(
+                    sys.name.clone(),
+                    json!({
+                        "default": is_default,
+                        "read_only": sys.read_only,
+                        "adt": sys.adt.is_some(),
+                        "quarantined": sys.is_quarantined(),
+                        "sysid": i.sysid,
+                        "release": i.release,
+                        "host": i.host,
+                        "os": i.os,
+                        "destination": i.destination,
+                    }),
+                );
+            }
+            Err(e) => {
+                systems.insert(
+                    sys.name.clone(),
+                    json!({
+                        "default": is_default,
+                        "read_only": sys.read_only,
+                        "adt": sys.adt.is_some(),
+                        "quarantined": sys.is_quarantined(),
+                        "sysid": sys.sysid(),
+                        "sap_error": e.message,
+                    }),
+                );
+            }
+        }
+    }
+    out["systems"] = Value::Object(systems);
     out
+}
+
+/// `sap` 块的组装（默认系统视角）。
+fn sap_info_json(info: &RemoteSystemInfo, client: String) -> Value {
+    json!({
+        "sysid": info.sysid,
+        "release": info.release,
+        "host": info.host,
+        "os": info.os,
+        "destination": info.destination,
+        // 客户端号来自本地配置（RFC 层免费），失败场景也照常给出
+        "client": client,
+    })
+}
+
+/// 并行取一批系统的信息（每系统一个懒加载缓存任务）。
+async fn futures_join_all(
+    handles: Vec<Arc<SystemHandle>>,
+) -> Vec<(
+    Arc<SystemHandle>,
+    Result<Arc<RemoteSystemInfo>, crate::error::RfcError>,
+)> {
+    let futs: Vec<_> = handles
+        .into_iter()
+        .map(|sys| async move {
+            let info = fetch_cached_sap_info(&sys).await;
+            (sys, info)
+        })
+        .collect();
+    futures_join(futs).await
+}
+
+/// 极简 join（不引 futures crate）：轮询完成顺序输出。
+async fn futures_join<F: std::future::Future>(futs: Vec<F>) -> Vec<F::Output> {
+    let mut results = Vec::with_capacity(futs.len());
+    for f in futs {
+        results.push(f.await);
+    }
+    results
 }
 
 /// 纯本地部分：版本 / commit / 能力开关。零 SAP 依赖、纯函数，单测锁定形状。
@@ -75,35 +155,38 @@ pub fn local_info() -> Value {
             "mode": if crate::server::runtime_mode_active() { "runtime" } else { "full" },
             // true = 已设 SAP_API_KEY，/api/* 需 Bearer token（本端点除外）
             "auth": crate::auth::is_enabled(),
-            // true = SAP_READ_ONLY=1，写端点（objects 写 / ADT 写方法）返回 403
+            // true = 默认系统只读（写端点返回 403；每系统可独立配置）
             "read_only": crate::server::read_only_active(),
-            // true = SAP_ADT_BASE_URL 非空，ADT 代理与 dumps 端点可用
-            "adt": crate::adt::is_enabled(),
+            // true = 默认系统 ADT 代理可用（ADT 代理与 dumps 端点按系统启用）
+            "adt": crate::adt::capabilities_adt_enabled(),
             // true = API 注册表已启用（GET /api/registry；Agent 跨会话记忆）
             "registry": crate::registry::is_enabled(),
+            // true = 引导式配置可写（POST /api/setup/system；SAP_SETUP=off 关闭）
+            "setup": crate::setup::is_enabled(),
             // 按 IP 每秒请求上限；null = 不限流
             "rate_limit_rps": crate::server::rate_limit_rps(),
         },
     })
 }
 
-/// 取缓存的 SAP 系统信息；未缓存时借连接调一次 `RFC_SYSTEM_INFO`。
+/// 取某系统缓存的 SAP 信息；未缓存时借连接调一次 `RFC_SYSTEM_INFO`。
 /// 成功 → 写缓存永久复用；失败 → 不缓存，调用方拿到错误（下次重试）。
 async fn fetch_cached_sap_info(
-    pool: &SharedPool,
+    sys: &Arc<SystemHandle>,
 ) -> Result<Arc<RemoteSystemInfo>, crate::error::RfcError> {
-    if let Some(cached) = SAP_INFO.read().await.clone() {
+    if let Some(cached) = sys.sap_info.read().await.clone() {
         return Ok(cached);
     }
     // 未缓存：取一次（并发首批请求可能重复取，无害——池有多条连接，结果幂等）
     let fetched =
-        crate::server::run_blocking_with_timeout(Arc::clone(pool), SAP_INFO_TIMEOUT, |conn| {
+        crate::server::run_blocking_with_timeout(Arc::clone(sys), SAP_INFO_TIMEOUT, |conn| {
             conn.system_info()
         })
         .await?;
     let info = Arc::new(fetched);
-    *SAP_INFO.write().await = Some(Arc::clone(&info));
+    *sys.sap_info.write().await = Some(Arc::clone(&info));
     tracing::info!(
+        system = %sys.name,
         sysid = %info.sysid,
         release = %info.release,
         "SAP 系统信息已缓存（/api/version）"

@@ -11,7 +11,7 @@
 use crate::api::{FieldSpec, InvokeRequest, ScalarValue};
 use crate::connection::RfcConnection;
 use crate::error::RfcError;
-use crate::executor::execute_collect;
+use crate::executor::execute_collect_with;
 use serde::Serialize;
 use std::collections::HashMap;
 
@@ -32,6 +32,7 @@ pub struct FunctionEntry {
 /// - `group`: 函数组过滤（空表示不限制）
 /// - `max_results`: 最多返回条数（防巨型结果集，默认 50）
 pub fn search_functions(
+    meta: &crate::metadata::MetadataCache,
     conn: &RfcConnection,
     pattern: &str,
     group: &str,
@@ -59,7 +60,7 @@ pub fn search_functions(
 
     // 无匹配时 SAP 抛 ABAP_EXCEPTION(NO_FUNCTION_FOUND)——按搜索 API 惯例视为"空结果"而非错误。
     // （且避免 error_info.message 残留上次失败调用信息，误导调用方 / 串扰多用户）
-    let resp = match execute_collect(conn, &req) {
+    let resp = match execute_collect_with(meta, conn, &req) {
         Ok(r) => r,
         Err(e) if e.key == "NO_FUNCTION_FOUND" => return Ok(Vec::new()),
         Err(e) => return Err(e),
@@ -140,6 +141,7 @@ pub struct FieldSemantics {
 /// - `field`: 字段名（如 MATNR）
 /// - `lang`: 语言（如 ZH/EN，影响文本标签语言）
 pub fn read_ddic_field_info(
+    meta: &crate::metadata::MetadataCache,
     conn: &RfcConnection,
     table: &str,
     field: &str,
@@ -166,7 +168,7 @@ pub fn read_ddic_field_info(
         ..Default::default()
     };
 
-    let resp = execute_collect(conn, &req)?;
+    let resp = execute_collect_with(meta, conn, &req)?;
     let dfies = resp.structs.get("DFIES_WA").cloned().unwrap_or_default();
 
     let fixed_values = resp
@@ -272,6 +274,7 @@ pub struct FunctionDoc {
 ///
 /// 并非所有函数都有文档；无文档时返回空 long_text（不报错）。
 pub fn read_function_doc(
+    meta: &crate::metadata::MetadataCache,
     conn: &RfcConnection,
     func_name: &str,
     lang: &str,
@@ -291,7 +294,7 @@ pub fn read_function_doc(
         ..Default::default()
     };
 
-    match execute_collect(conn, &req) {
+    match execute_collect_with(meta, conn, &req) {
         Ok(resp) => {
             let lines = resp.tables.get("LINE").cloned().unwrap_or_default();
             // TLINE 结构：TDFORMAT(2) + TDLINE(132)，拼接所有 TDLINE 成完整文档
@@ -351,6 +354,7 @@ fn text_lines_spec() -> Vec<FieldSpec> {
 /// （server 层）走 ADT 降级通道兜底——宽表方案对这个 FM 不存在。
 /// 返回源码行列表（每行一个字符串）。
 pub fn read_function_source(
+    meta: &crate::metadata::MetadataCache,
     conn: &RfcConnection,
     func_name: &str,
 ) -> Result<Vec<String>, RfcError> {
@@ -363,7 +367,7 @@ pub fn read_function_source(
         table_outputs: HashMap::from([("SOURCE".to_string(), source_line_spec())]),
         ..Default::default()
     };
-    let resp = execute_collect(conn, &req)?;
+    let resp = execute_collect_with(meta, conn, &req)?;
     Ok(resp
         .tables
         .get("SOURCE")
@@ -497,6 +501,7 @@ fn raw_param_docs(resp: &crate::api::InvokeResponse) -> ParamDocs {
 ///
 /// 函数不存在时返回 404 `FU_NOT_FOUND`（与 SDK 通道同语义）。
 pub fn read_function_interface_rfc(
+    meta: &crate::metadata::MetadataCache,
     conn: &RfcConnection,
     func_name: &str,
 ) -> Result<(Vec<RawInterfaceParam>, ParamDocs), RfcError> {
@@ -531,7 +536,7 @@ pub fn read_function_interface_rfc(
         ]),
         ..Default::default()
     };
-    let resp = match execute_collect(conn, &req) {
+    let resp = match execute_collect_with(meta, conn, &req) {
         Ok(r) => r,
         // FL 046 在 FII 的错误键是 FUNCTION_NOT_FOUND——归一成 SDK 通道的
         // FU_NOT_FOUND，让上游（降级逻辑/HTTP 层）只认一种「函数不存在」。
@@ -558,7 +563,11 @@ pub fn read_function_interface_rfc(
 
 /// 读 ABAP 程序源代码（内部调 `RPY_PROGRAM_READ`，源码在 `SOURCE_EXTENDED` 表）。
 /// 程序不存在时 SAP 返回错误（透传 → 404）；存在但无源码 → 空 Vec。
-pub fn read_program_source(conn: &RfcConnection, prog_name: &str) -> Result<Vec<String>, RfcError> {
+pub fn read_program_source(
+    meta: &crate::metadata::MetadataCache,
+    conn: &RfcConnection,
+    prog_name: &str,
+) -> Result<Vec<String>, RfcError> {
     let req = InvokeRequest {
         func_name: "RPY_PROGRAM_READ".to_string(),
         inputs: HashMap::from([
@@ -577,7 +586,7 @@ pub fn read_program_source(conn: &RfcConnection, prog_name: &str) -> Result<Vec<
         table_outputs: HashMap::from([("SOURCE_EXTENDED".to_string(), source_line_spec())]),
         ..Default::default()
     };
-    let resp = execute_collect(conn, &req)?;
+    let resp = execute_collect_with(meta, conn, &req)?;
     Ok(resp
         .tables
         .get("SOURCE_EXTENDED")
@@ -614,6 +623,7 @@ fn source_line_spec() -> Vec<FieldSpec> {
 /// > 安全：`where_clauses` 是 ABAP SQL 片段，调用方可传任意 WHERE——
 /// > 读权限边界靠 SAP 侧（账号 `S_TABU_DIS` 表权限，见 `docs/SAP_PERMISSIONS.md`）。
 pub fn read_table(
+    meta: &crate::metadata::MetadataCache,
     conn: &RfcConnection,
     table: &str,
     fields: &[String],
@@ -675,7 +685,7 @@ pub fn read_table(
         )]),
         ..Default::default()
     };
-    let resp = execute_collect(conn, &req)?;
+    let resp = execute_collect_with(meta, conn, &req)?;
     // 解析 ET_DATA.LINE：按 delimiter 分隔 → 按 fields 顺序映射成 {字段名: 值}
     let rows = resp
         .tables
@@ -743,11 +753,13 @@ pub struct WhereUsedEntry {
 /// OBJ_TYPE 的正确取值（'FUNC' vs 'FF'）在不同版本存在分歧：先按 'FUNC'
 /// 查，空结果再按 'FF' 兜底一次（有索引的系统第一次即命中，代价为零）。
 pub fn read_where_used(
+    meta: &crate::metadata::MetadataCache,
     conn: &RfcConnection,
     func_name: &str,
     max_results: usize,
 ) -> Result<Vec<WhereUsedEntry>, RfcError> {
     fn query(
+        meta: &crate::metadata::MetadataCache,
         conn: &RfcConnection,
         name: &str,
         obj_type: &str,
@@ -805,7 +817,7 @@ pub fn read_where_used(
             )]),
             ..Default::default()
         };
-        let resp = crate::executor::execute_collect(conn, &req)?;
+        let resp = crate::executor::execute_collect_with(meta, conn, &req)?;
         let rows = resp.tables.get("ENVIRONMENT").cloned().unwrap_or_default();
         Ok(rows
             .into_iter()
@@ -828,11 +840,11 @@ pub fn read_where_used(
             .collect())
     }
 
-    let out = query(conn, func_name, "FUNC", max_results)?;
+    let out = query(meta, conn, func_name, "FUNC", max_results)?;
     if !out.is_empty() {
         return Ok(out);
     }
-    query(conn, func_name, "FF", max_results)
+    query(meta, conn, func_name, "FF", max_results)
 }
 
 /// 扫描 ABAP 源码行里的 `CALL FUNCTION 'X'` 目标（FM 依赖）。
@@ -1016,10 +1028,14 @@ pub fn should_fallback_to_adt(err: &RfcError) -> bool {
 /// 反解函数所属的函数组（ADT 的 FM 源码 URL 需要两级名字）。
 /// FM 名在 SAP 全局唯一，但其资源嵌在组下；这里用 `RFC_FUNCTION_SEARCH`
 /// 精确名搜索拿组名（vsp 的镜像做法：它用 ADT 搜索从结果 URI 里反解组名）。
-pub fn resolve_function_group(conn: &RfcConnection, func_name: &str) -> Result<String, RfcError> {
+pub fn resolve_function_group(
+    meta: &crate::metadata::MetadataCache,
+    conn: &RfcConnection,
+    func_name: &str,
+) -> Result<String, RfcError> {
     let target = func_name.trim().to_uppercase();
     // 多取几条防模糊命中（如 Z_FOO 与 Z_FOO_X），本地精确匹配
-    let hits = search_functions(conn, &target, "", 10)?;
+    let hits = search_functions(meta, conn, &target, "", 10)?;
     for h in &hits {
         if h.name == target && !h.group.trim().is_empty() {
             return Ok(h.group.trim().to_string());

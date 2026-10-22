@@ -188,6 +188,141 @@ const SPEC_JSON: &str = r##"{
         }
       }
     },
+    "/api/systems": {
+      "get": {
+        "tags": [
+          "ops"
+        ],
+        "summary": "List connected SAP systems (multi-system, public)",
+        "description": "v0.16: the gateway can connect to several SAP systems at once (sap_systems.toml). This endpoint lists them — name, whether default, read_only, adt enabled, sysid (once connected), quarantined. Every /api/* endpoint also has a scoped form: /api/s/{system}/... (e.g. POST /api/s/prd/rfc) targets that system; unprefixed paths hit the default. Single-system deployments list one entry.",
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "System inventory"
+          }
+        }
+      }
+    },
+    "/api/setup": {
+      "get": {
+        "tags": [
+          "ops"
+        ],
+        "summary": "Guided-setup status and field checklist (public)",
+        "description": "v0.17: first-run onboarding for agents. When the gateway starts with no sap_systems.toml and no SAP_* connection env vars, it still listens (unconfigured mode): business endpoints return 503 SYSTEM_NOT_CONFIGURED and this endpoint tells an agent how to proceed — whether a config is in place, where the config file lives, whether setup writes are allowed (SAP_SETUP=off disables), and a `fields` checklist (name/ashost/sysnr/client/user/passwd/...) to interview the user with. POST /api/setup/system then validates, optionally test-connects, persists sap_systems.toml and hot-loads the system without a restart.",
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "Setup status + interview field schema"
+          }
+        }
+      }
+    },
+    "/api/setup/system": {
+      "post": {
+        "tags": [
+          "ops"
+        ],
+        "summary": "Add an SAP system (guided setup: validate → test-connect → persist → hot-load)",
+        "description": "v0.17: agent-guided configuration write. Body fields mirror one [systems.{name}] table of sap_systems.toml (unknown keys are rejected). Flow: build_spec validation (same rules as startup parsing, incl. ${VAR} interpolation) → real test connection (RFC open + system info; skipped with `test:false`) → SYSID conflict check → persist to sap_systems.toml (existing entries preserved; env-synthesized default system persisted on first write) → hot-load into the running gateway. The first system always becomes the default. 400 SETUP_PARAM_INVALID / 409 SETUP_NAME_EXISTS or SYSTEM_SYSID_CONFLICT / 403 SETUP_DISABLED (SAP_SETUP=off) / 502 SETUP_CONNECT_FAILED (nothing persisted).",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "name"
+                ],
+                "properties": {
+                  "name": {
+                    "type": "string",
+                    "description": "System name (URL segment /api/s/{name}/...): 1-32 chars, lowercase/digits/-/_"
+                  },
+                  "ashost": {
+                    "type": "string",
+                    "description": "Application server host (direct form; or use conn.MSHOST for load balancing)"
+                  },
+                  "sysnr": {
+                    "type": "string",
+                    "description": "System number (two digits, e.g. 00) — required with ashost"
+                  },
+                  "client": {
+                    "type": "string",
+                    "description": "Logon client (three digits)"
+                  },
+                  "user": {
+                    "type": "string",
+                    "description": "SAP logon user (required)"
+                  },
+                  "passwd": {
+                    "type": "string",
+                    "description": "SAP password; supports ${VAR} env-var indirection (recommended)"
+                  },
+                  "lang": {
+                    "type": "string",
+                    "description": "Logon language (default EN)"
+                  },
+                  "default": {
+                    "type": "boolean",
+                    "description": "Make this the default system (the first system always becomes default)"
+                  },
+                  "test": {
+                    "type": "boolean",
+                    "description": "Test-connect before persisting (default true; false = offline pre-provisioning, unverified)"
+                  },
+                  "conn": {
+                    "type": "object",
+                    "additionalProperties": {
+                      "type": "string"
+                    },
+                    "description": "Free-form SDK connection params (upper-cased, passed through): MSHOST/R3NAME/GROUP for load-balanced connections"
+                  },
+                  "read_only": {
+                    "type": "boolean"
+                  },
+                  "pool_size": {
+                    "type": "integer"
+                  },
+                  "idle_validate_secs": {
+                    "type": "integer"
+                  },
+                  "request_timeout_secs": {
+                    "type": "integer"
+                  },
+                  "adt_base_url": {
+                    "type": "string"
+                  },
+                  "adt_user": {
+                    "type": "string"
+                  },
+                  "adt_passwd": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Saved + hot-loaded (connection block carries sysid/release when tested)"
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          },
+          "502": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
     "/api/rfc": {
       "post": {
         "tags": [
@@ -3054,7 +3189,7 @@ pub fn build_spec(base_url: &str, auth_enabled: bool) -> Value {
     spec
 }
 
-/// 给 spec 里全部 `/api/*` operation 打上 bearerAuth 标记（`/api/version` 公开例外）。
+/// 给 spec 里全部 `/api/*` operation 打上 bearerAuth 标记（`/api/version` 等公开例外）。
 /// build_spec 与动态合并（/api/openapi、注册表目录）共用，保证鉴权模式下
 /// 生成器产出的客户端会带 token。
 fn mark_api_security(spec: &mut Value) {
@@ -3063,9 +3198,13 @@ fn mark_api_security(spec: &mut Value) {
             if !path.starts_with("/api/") {
                 continue;
             }
-            // /api/version 刻意公开：Agent 需要在拿到 token 之前知道
-            // capabilities.auth（要不要 token）
-            if path == "/api/version" {
+            // /api/version、/api/systems、/api/setup 刻意公开：Agent 需要在拿到
+            // token 之前知道 capabilities.auth（要不要 token）、有哪些系统、
+            // 以及未配置模式下如何引导配置
+            if path.as_str() == "/api/version"
+                || path.as_str() == "/api/systems"
+                || path.as_str() == "/api/setup"
+            {
                 continue;
             }
             if let Some(ops) = item.as_object_mut() {
@@ -3459,12 +3598,25 @@ struct RegistryOpsCache {
 static REGISTRY_OPS: tokio::sync::RwLock<Option<RegistryOpsCache>> =
     tokio::sync::RwLock::const_new(None);
 
+/// 启动期注入的多系统注册表（main 组装后调用一次）。
+/// 目录重建按条目 system 从这里取连接；未注入（测试/异常路径）时目录为空。
+static SHARED_STATE: std::sync::OnceLock<crate::server::SharedState> = std::sync::OnceLock::new();
+
+/// 启动期注入多系统注册表（main 调一次）。
+pub fn init_shared_state(state: crate::server::SharedState) {
+    let _ = SHARED_STATE.set(state);
+}
+
+fn shared_state() -> Option<crate::server::SharedState> {
+    SHARED_STATE.get().cloned()
+}
+
 /// 缓存 TTL：签名漂移跟随的上限（正常变更走 generation 立即失效）。
 const REGISTRY_OPS_TTL: CacheTtl = CacheTtl::from_secs(600);
 
 /// 重建全部 published 条目的 operation（借连接池逐个拉接口元数据）。
 /// 单条目失败 → 占位 operation（缺口可见，不吞错，不拖垮整个目录）。
-async fn rebuild_registry_ops(pool: &crate::server::SharedPool) -> Vec<(String, Value)> {
+async fn rebuild_registry_ops(state: &crate::server::SharedState) -> Vec<(String, Value)> {
     let entries = match crate::registry::published_entries() {
         Ok(e) => e,
         Err(e) => {
@@ -3474,9 +3626,28 @@ async fn rebuild_registry_ops(pool: &crate::server::SharedPool) -> Vec<(String, 
     };
     let mut ops = Vec::with_capacity(entries.len());
     for entry in entries {
+        // 条目按其 system 字段路由到对应系统（v0.16 多系统）
+        let Some(sys) = state.resolve(&entry.system) else {
+            let path = format!("/api/invokes/{}", entry.alias);
+            let placeholder = json!({
+                "post": {
+                    "tags": ["registry"],
+                    "operationId": format!("invoke_{}", entry.alias.replace('/', "_")),
+                    "summary": format!("{} (unknown system)", entry.intent),
+                    "description": format!(
+                        "Entry {} references system '{}' which is not configured in this                          gateway deployment. Update the entry (PUT /api/registry/{}) or                          add the system to sap_systems.toml.",
+                        entry.alias, entry.system, entry.alias
+                    ),
+                    "responses": { "200": { "description": "Flat result" } }
+                }
+            });
+            ops.push((path, placeholder));
+            continue;
+        };
         let func = entry.func_name.clone();
-        let r = crate::server::run_blocking(Arc::clone(pool), move |conn| {
-            crate::server::collect_function_params(conn, &func)
+        let iface_sys = Arc::clone(&sys);
+        let r = crate::server::run_blocking(Arc::clone(&sys), move |conn| {
+            crate::server::collect_function_params(&iface_sys, conn, &func)
         })
         .await;
         let op = match r {
@@ -3506,14 +3677,17 @@ async fn rebuild_registry_ops(pool: &crate::server::SharedPool) -> Vec<(String, 
 
 /// 取注册表 operation（缓存优先：代际一致且未过 TTL 直接复用）。
 /// 重建失败（如 SAP 不可达）时退回旧缓存——公开规范永远可用，最多旧一点。
-pub async fn registry_ops(pool: &crate::server::SharedPool) -> Arc<Vec<(String, Value)>> {
+pub async fn registry_ops() -> Arc<Vec<(String, Value)>> {
     let gen = crate::registry::generation();
     if let Some(cached) = REGISTRY_OPS.read().await.as_ref() {
         if cached.generation == gen && cached.built_at.elapsed() < REGISTRY_OPS_TTL {
             return Arc::clone(&cached.ops);
         }
     }
-    let ops = Arc::new(rebuild_registry_ops(pool).await);
+    let ops = Arc::new(match shared_state() {
+        Some(state) => rebuild_registry_ops(&state).await,
+        None => Vec::new(),
+    });
     *REGISTRY_OPS.write().await = Some(RegistryOpsCache {
         generation: gen,
         built_at: std::time::Instant::now(),
@@ -3534,7 +3708,7 @@ async fn registry_ops_cached() -> Option<Arc<Vec<(String, Value)>>> {
 
 /// 后台 watcher（main spawn）：代际变化、缓存为空或 TTL 到期时重建。
 /// 让公开的 /openapi.json 永远命中缓存，不被 SAP 的健康状况绑架。
-pub async fn registry_ops_watcher(pool: crate::server::SharedPool) {
+pub async fn registry_ops_watcher() {
     loop {
         tokio::time::sleep(CacheTtl::from_secs(2)).await;
         let gen = crate::registry::generation();
@@ -3543,7 +3717,10 @@ pub async fn registry_ops_watcher(pool: crate::server::SharedPool) {
             Some(c) => c.generation != gen || c.built_at.elapsed() >= REGISTRY_OPS_TTL,
         };
         if need {
-            let ops = rebuild_registry_ops(&pool).await;
+            let ops = match shared_state() {
+                Some(state) => rebuild_registry_ops(&state).await,
+                None => Vec::new(),
+            };
             tracing::info!(count = ops.len(), generation = gen, "注册表服务目录已重建");
             *REGISTRY_OPS.write().await = Some(RegistryOpsCache {
                 generation: gen,
@@ -3778,6 +3955,7 @@ mod tests {
         let entry = Entry {
             alias: "z_calc".into(),
             func_name: "Z_CALC".into(),
+            system: "default".into(),
             group: Some("ZMATH".into()),
             intent: "calculator for frontend".into(),
             notes: "integers only".into(),

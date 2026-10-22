@@ -29,6 +29,8 @@ curl -H "Authorization: Bearer <SAP_API_KEY>" http://127.0.0.1:3000/api/function
 
 | Goal | Endpoint |
 |------|-----------|
+| Gateway not configured yet (first run) → **guided setup**: checklist of what to ask the user for, then write & hot-load a system | `GET /api/setup` (public) → `POST /api/setup/system` |
+| New session → **list connected systems** (multi-system deployments; single-system ones list one entry — see "Multiple systems" below) | `GET /api/systems` (public) |
 | New session → **check the registry first**: cross-session memory of agent-built APIs (alias, intent, pitfalls, example invocations) | `GET /api/registry` |
 | Want to publish/update one API's contract (intent / notes / example) | `PUT /api/registry/{alias}` |
 | External system/frontend wants to call a registered API **without the SAP dialect** (flat JSON in / flat JSON out) | `POST /api/invokes/{alias}` |
@@ -63,6 +65,37 @@ curl -H "Authorization: Bearer <SAP_API_KEY>" http://127.0.0.1:3000/api/function
 | You are an MCP client (Claude etc.) — mount the gateway as an MCP tool server | `POST /mcp` (Streamable HTTP, stateless) |
 | Human-friendly interactive API docs | `GET /docs` (Redoc rendering of the spec) |
 
+## First-run setup (agent-guided configuration)
+
+A fresh deployment (no `sap_systems.toml`, no `SAP_*` connection env vars) **still starts and listens** — every SAP-touching endpoint answers `503 SYSTEM_NOT_CONFIGURED` until a system is configured. That state is your cue to onboard the user:
+
+```bash
+# 1. Discover: what's missing, which fields to ask for, whether writes are allowed
+curl http://127.0.0.1:3000/api/setup
+# → {"configured":false,"writable":true,"fields":[{"name":"ashost","required":"direct form",...},...],
+#    "example":{...},"connection_forms":{...}}
+
+# 2. Interview the user per the fields list: a short system name (lowercase, e.g. a4h),
+#    ashost/sysnr/client, user, password. Recommend a ${VAR} password so the secret
+#    never appears in plaintext (it is interpolated from the environment at connect time).
+
+# 3. Submit: validated → real test connection → persisted → hot-loaded (no restart)
+curl -X POST http://127.0.0.1:3000/api/setup/system -H "Content-Type: application/json" \
+  -d '{"name":"a4h","ashost":"vhcala4h","sysnr":"00","client":"001",
+       "user":"DEVELOPER","passwd":"${SAP_A4H_PASSWD}"}'
+# → {"saved":true,"default":true,"file":"sap_systems.toml",
+#    "connection":{"tested":true,"sysid":"A4H","release":"753",...},"systems_count":1,...}
+
+# 4. Confirm — the gateway is fully operational immediately
+curl http://127.0.0.1:3000/api/systems
+```
+
+- Body fields mirror one `[systems.{name}]` table of `sap_systems.toml` (unknown keys → 422); load-balanced connections use `conn: {"MSHOST": "...", "R3NAME": "...", "GROUP": "..."}` instead of `ashost`/`sysnr`.
+- Human handoff: an unconfigured desktop run auto-opens `/setup` in the user's browser; the page offers a copy-paste message describing exactly this flow (address filled in). If the user pastes it to you, just execute the steps above.
+- The connection is **tested before anything is persisted** — wrong host/credentials return `502 SETUP_CONNECT_FAILED` (or `502 SETUP_CONNECT_TIMEOUT`) and nothing is written. `test:false` skips the check for offline pre-provisioning.
+- Success = persisted to `sap_systems.toml` **and hot-loaded**. The first system always becomes the default; add more systems later the same way (`default:true` switches the default). If the process had been running on env-var config, that system is persisted into the file too, so a restart changes nothing.
+- `409 SETUP_NAME_EXISTS` → pick another name; `409 SYSTEM_SYSID_CONFLICT` → two backends share a SYSID (see "Multiple systems"); `403 SETUP_DISABLED` → the deployer set `SAP_SETUP=off`, edit the file manually instead.
+
 ## Standard workflow
 
 Most tasks follow six steps: **check registry → search → inspect interface → read docs → view source → invoke**:
@@ -77,6 +110,25 @@ Most tasks follow six steps: **check registry → search → inspect interface �
 ```
 
 > Do not skip step 2 and invoke directly — SAP parameter names are case-sensitive and must be uppercase, and the type (CHAR/INT/BCD...) determines how to pass values. Inspecting the interface first avoids 90% of parameter mistakes.
+
+## Multiple systems
+
+The gateway can be deployed with **several SAP systems connected at once** (configured by the deployer via `sap_systems.toml`). All `/api/*` business endpoints work unchanged (they hit the **default** system), and every one of them also has a **scoped form** that targets a specific system — insert `/api/s/{system}` where the `/api` prefix sits:
+
+```bash
+curl http://127.0.0.1:3000/api/s/prd/rfc                  # POST → invoke on system "prd"
+curl http://127.0.0.1:3000/api/s/prd/functions/BAPI_USER_GETLIST
+curl http://127.0.0.1:3000/api/s/a4h/dumps/grouped
+curl http://127.0.0.1:3000/api/s/prd/ready                # that system's readiness
+```
+
+- Start a session with `GET /api/systems` — it lists each system (`name`, whether `default`, `read_only`, `adt`, `sysid`, `quarantined`). On a single-system deployment it returns one entry and you can ignore scoping entirely.
+- Unknown system name → `404 SYSTEM_UNKNOWN` (the error lists valid names). Compare objects across systems by calling the same read endpoint under two scopes (e.g. `/api/functions/ZFOO/source` on `a4h` vs `prd`) and diffing.
+- Flat delivery port `/api/invokes/{alias}` is **routed by the entry's recorded `system`** (aliases are global); an explicit scope that disagrees with the entry returns `409 SYSTEM_MISMATCH`. `GET /api/registry?system=prd` filters entries.
+- MCP tools accept an optional `system` argument (default = default system).
+- Systems can also be **added at runtime**: `POST /api/setup/system` validates → test-connects → appends to `sap_systems.toml` → hot-loads (see "First-run setup"). No restart needed; removal still means editing the file and restarting.
+- Several entries pointing at the **same system with different clients** (same ashost/sysnr, different `client`) are fully supported: repository objects are cross-client in SAP, so signatures are identical and each entry still gets its own pool / ADT / registry namespace.
+- Hard limit: two **different backends** sharing one SYSID (e.g. cloned dev containers reached via different hosts) are quarantined with `503 SYSTEM_SYSID_CONFLICT` — the SDK's descriptor cache is partitioned by SYSID, so cross-backend SYSID twins would silently share wrong signatures.
 
 ## Endpoint quick reference (copyable examples)
 

@@ -5,7 +5,7 @@
 use std::env;
 
 /// 服务运行配置
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct AppConfig {
     /// SAP 连接参数（已组装成 RfcConnection::new 所需的键值对）
     pub conn_params: Vec<(&'static str, String)>,
@@ -44,6 +44,18 @@ pub struct AppConfig {
     /// 启动时与每 24h 查 GitHub 最新 Release（仅一个匿名 GET，无遥测），
     /// 结果进 `/api/version` 的 latest 块与首页页脚。
     pub update_check: bool,
+    /// 多系统配置文件路径（`SAP_SYSTEMS_FILE`，默认 `./sap_systems.toml`）。
+    /// 文件不存在 → 从本配置的 SAP_* 环境变量合成单系统 `default`（存量路径）；
+    /// 存在 → 系统集合完全由该文件定义（见 systems.rs）。
+    pub systems_file: std::path::PathBuf,
+    /// 引导式配置（`SAP_SETUP`，默认开启；off/false/0/no 关闭）：
+    /// 未配置任何系统时允许 `POST /api/setup/system` 写入 sap_systems.toml
+    /// 并热加载（见 setup.rs）。锁定部署可关闭。
+    pub setup_enabled: bool,
+    /// 未配置模式下是否自动在浏览器打开引导页 `/setup`
+    /// （`SAP_OPEN_BROWSER`，默认开启；off/false/0/no 关闭——服务器/无头
+    /// 部署防打扰）。已配置的部署从不自动打开。
+    pub open_browser: bool,
 }
 
 fn required(key: &str) -> Result<String, String> {
@@ -51,12 +63,36 @@ fn required(key: &str) -> Result<String, String> {
 }
 
 /// 从环境变量读取配置。调用方应先执行 dotenvy::dotenv()。
+///
+/// 连接变量组（ASHOST/SYSNR/CLIENT/USER/PASSWD）**要么全缺要么全有**：
+/// 全缺且无 sap_systems.toml → 未配置模式（conn_params 为空，网关照常监听，
+/// 引导见 setup.rs）；缺一部分 → 报错（半截配置几乎必然是失误）。
 pub fn load() -> Result<AppConfig, String> {
-    let ashost = required("SAP_ASHOST")?;
-    let sysnr = required("SAP_SYSNR")?;
-    let client = required("SAP_CLIENT")?;
-    let user = required("SAP_USER")?;
-    let passwd = required("SAP_PASSWD")?;
+    let conn_keys = [
+        "SAP_ASHOST",
+        "SAP_SYSNR",
+        "SAP_CLIENT",
+        "SAP_USER",
+        "SAP_PASSWD",
+    ];
+    let unconfigured = conn_keys.iter().all(|k| env::var(k).is_err());
+    let (ashost, sysnr, client, user, passwd) = if unconfigured {
+        (
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+        )
+    } else {
+        (
+            required("SAP_ASHOST")?,
+            required("SAP_SYSNR")?,
+            required("SAP_CLIENT")?,
+            required("SAP_USER")?,
+            required("SAP_PASSWD")?,
+        )
+    };
     let lang = env::var("SAP_LANG").unwrap_or_else(|_| "EN".to_string());
     let listen_addr = env::var("SAP_LISTEN_ADDR").unwrap_or_else(|_| "127.0.0.1:3000".to_string());
     let pool_size = env::var("SAP_POOL_SIZE")
@@ -91,11 +127,20 @@ pub fn load() -> Result<AppConfig, String> {
         .ok()
         .and_then(|s| s.parse::<u32>().ok())
         .filter(|&r| r >= 1);
-    // ADT 代理基地址：未设 → 按 ashost 推导默认；显式空串 → 禁用
-    let adt_base_url = match env::var("SAP_ADT_BASE_URL") {
-        Ok(s) if s.trim().is_empty() => None,
-        Ok(s) => Some(s.trim().to_string()),
-        Err(_) => Some(format!("http://{}:50000", ashost)),
+    // ADT 代理基地址：未设 → 按 ashost 推导默认；显式空串 → 禁用；
+    // 未配置模式（无 ashost）→ 无法推导即禁用
+    let adt_base_url = if unconfigured {
+        match env::var("SAP_ADT_BASE_URL") {
+            Ok(s) if s.trim().is_empty() => None,
+            Ok(s) => Some(s.trim().to_string()),
+            Err(_) => None,
+        }
+    } else {
+        match env::var("SAP_ADT_BASE_URL") {
+            Ok(s) if s.trim().is_empty() => None,
+            Ok(s) => Some(s.trim().to_string()),
+            Err(_) => Some(format!("http://{}:50000", ashost)),
+        }
     };
     let adt_user = env::var("SAP_ADT_USER").unwrap_or_else(|_| user.clone());
     let adt_passwd = env::var("SAP_ADT_PASSWD").unwrap_or_else(|_| passwd.clone());
@@ -125,17 +170,45 @@ pub fn load() -> Result<AppConfig, String> {
             )
         })
         .unwrap_or(true);
+    // 引导式配置开关（默认开启）
+    let setup_enabled = env::var("SAP_SETUP")
+        .map(|v| {
+            !matches!(
+                v.trim().to_lowercase().as_str(),
+                "0" | "false" | "off" | "no"
+            )
+        })
+        .unwrap_or(true);
+    // 未配置模式自动打开引导页浏览器（默认开启；仅未配置时生效）
+    let open_browser = env::var("SAP_OPEN_BROWSER")
+        .map(|v| {
+            !matches!(
+                v.trim().to_lowercase().as_str(),
+                "0" | "false" | "off" | "no"
+            )
+        })
+        .unwrap_or(true);
+    // 多系统配置文件（默认工作目录下的 sap_systems.toml；不存在则走环境变量合成）
+    let systems_file = std::path::PathBuf::from(
+        env::var("SAP_SYSTEMS_FILE").unwrap_or_else(|_| "sap_systems.toml".to_string()),
+    );
 
-    // 键为 'static 字面量，值使用环境变量的 String（运行期存活）
-    Ok(AppConfig {
-        conn_params: vec![
+    // 键为 'static 字面量，值使用环境变量的 String（运行期存活）。
+    // 未配置模式 → 空表（系统集合由 setup API 写入 toml 后热加载）。
+    let conn_params: Vec<(&'static str, String)> = if unconfigured {
+        vec![]
+    } else {
+        vec![
             ("ASHOST", ashost),
             ("SYSNR", sysnr),
             ("CLIENT", client),
             ("USER", user),
             ("PASSWD", passwd),
             ("LANG", lang),
-        ],
+        ]
+    };
+    Ok(AppConfig {
+        conn_params,
         listen_addr,
         pool_size,
         pool_idle_validate,
@@ -149,6 +222,9 @@ pub fn load() -> Result<AppConfig, String> {
         registry_file,
         runtime_mode,
         update_check,
+        systems_file,
+        setup_enabled,
+        open_browser,
     })
 }
 
@@ -184,6 +260,9 @@ mod tests {
             "SAP_UPDATE_CHECK",
             "SAP_REGISTRY_FILE",
             "SAP_MODE",
+            "SAP_SYSTEMS_FILE",
+            "SAP_SETUP",
+            "SAP_OPEN_BROWSER",
         ] {
             unsafe {
                 std::env::remove_var(k);
@@ -339,6 +418,65 @@ mod tests {
         set_all_required();
         let cfg = load().unwrap();
         assert_eq!(cfg.request_timeout, std::time::Duration::from_secs(60));
+    }
+
+    #[test]
+    fn load_unconfigured_when_all_conn_vars_missing() {
+        let _g = ENV_LOCK.lock().unwrap();
+        clear_env();
+        // 五个连接变量全缺 → 未配置模式：空 conn_params（网关可启动，走 setup 引导）
+        let cfg = load().unwrap();
+        assert!(cfg.conn_params.is_empty(), "未配置模式 conn_params 应为空");
+        assert!(cfg.adt_base_url.is_none(), "无 ashost 无法推导 ADT，应禁用");
+        assert!(cfg.setup_enabled, "SAP_SETUP 未设应默认开启");
+    }
+
+    #[test]
+    fn load_partial_conn_vars_still_errors() {
+        let _g = ENV_LOCK.lock().unwrap();
+        clear_env();
+        // 半截配置（有 ASHOST 缺其余）→ 保留 fail-fast
+        unsafe {
+            std::env::set_var("SAP_ASHOST", "h");
+        }
+        let err = load().unwrap_err();
+        assert!(err.contains("SAP_SYSNR"), "半截配置应指出缺失变量: {}", err);
+    }
+
+    #[test]
+    fn load_setup_switch_disables() {
+        let _g = ENV_LOCK.lock().unwrap();
+        for (val, expect) in [("off", false), ("0", false), ("NO", false), ("on", true)] {
+            clear_env();
+            unsafe {
+                std::env::set_var("SAP_SETUP", val);
+            }
+            assert_eq!(
+                load().unwrap().setup_enabled,
+                expect,
+                "SAP_SETUP={val} 应为 {expect}"
+            );
+        }
+    }
+
+    #[test]
+    fn load_open_browser_defaults_on_and_disables() {
+        let _g = ENV_LOCK.lock().unwrap();
+        clear_env();
+        assert!(
+            load().unwrap().open_browser,
+            "未设 SAP_OPEN_BROWSER 应默认开启"
+        );
+        for val in ["off", "false", "0", "no"] {
+            clear_env();
+            unsafe {
+                std::env::set_var("SAP_OPEN_BROWSER", val);
+            }
+            assert!(
+                !load().unwrap().open_browser,
+                "SAP_OPEN_BROWSER={val} 应关闭"
+            );
+        }
     }
 
     #[test]
