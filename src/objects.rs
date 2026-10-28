@@ -1654,8 +1654,22 @@ pub async fn write_object_source(
     //    否则柄是死的（无状态签发）或请求被拒（跨会话 token）
     let mut sess = WriteSession::establish(adt, &base).await?;
 
-    // ① 锁
-    let lock = lock_object(adt, &base, &mut sess).await?;
+    // ① 锁。部分旧补丁级别（ED1/752 实证）的 ADT URI mapper 只认小写 URI：
+    //    大写锁定报 uriMappingError，小写正常（GET 两种大小写都通）。
+    //    命中 uriMappingError 时降级小写 base 重试一次，后续 PUT/元数据/
+    //    解锁/激活沿用降级后的 base（会话与 URL 大小写无关）。
+    let mut base = base;
+    let mut source_rel = source_rel;
+    let lock = match lock_object(adt, &base, &mut sess).await {
+        Ok(l) => l,
+        Err(e) if e.key == "ADT_uriMappingError" => {
+            tracing::warn!(base = %base, "ADT 锁定 uriMappingError，降级小写 URI 重试");
+            base = base.to_lowercase();
+            source_rel = source_rel.to_lowercase();
+            lock_object(adt, &base, &mut sess).await?
+        }
+        Err(e) => return Err(e),
+    };
     let transport_used = transport
         .map(str::to_string)
         .filter(|t| !t.trim().is_empty())
@@ -1952,26 +1966,44 @@ async fn fm_set_rfc_enabled(
     lock_handle: &str,
     transport: Option<&str>,
 ) -> Result<(), String> {
-    // 读当前元数据（v3 契约；stateful 会话内）
-    let get_resp = adt
-        .request_raw(
-            axum::http::Method::GET,
-            fm_base_rel,
-            &[],
-            None,
-            None,
-            "application/vnd.sap.adt.functions.fmodules.v3+xml",
-            STATEFUL,
-            sess.cookie_header().as_deref(),
-            Some(sess.token.as_str()),
-        )
-        .await
-        .map_err(|e| e.message)?;
-    sess.absorb(&get_resp);
-    if get_resp.status != 200 {
-        return Err(format!("元数据读取返回 {}", get_resp.status));
+    // 读当前元数据（stateful 会话内）。内容类型按版本协商：S/4 支持 v3，
+    // 752/ERP 系统可能只认 v2 甚至默认 xml——406 时逐级降级重试。
+    const META_CTS: [&str; 3] = [
+        "application/vnd.sap.adt.functions.fmodules.v3+xml",
+        "application/vnd.sap.adt.functions.fmodules.v2+xml",
+        "application/xml",
+    ];
+    let mut meta_ct = META_CTS[0];
+    let mut meta = String::new();
+    for &ct in META_CTS.iter() {
+        meta_ct = ct;
+        let get_resp = adt
+            .request_raw(
+                axum::http::Method::GET,
+                fm_base_rel,
+                &[],
+                None,
+                None,
+                ct,
+                STATEFUL,
+                sess.cookie_header().as_deref(),
+                Some(sess.token.as_str()),
+            )
+            .await
+            .map_err(|e| e.message)?;
+        sess.absorb(&get_resp);
+        if get_resp.status == 200 {
+            meta = String::from_utf8_lossy(&get_resp.body).to_string();
+            break;
+        }
+        if get_resp.status != 406 {
+            return Err(format!("元数据读取返回 {}", get_resp.status));
+        }
+        // 406（内容类型不协商）→ 尝试下一个内容类型
     }
-    let meta = String::from_utf8_lossy(&get_resp.body).to_string();
+    if meta.is_empty() {
+        return Err("元数据读取失败：fmodules v3/v2/默认 xml 均不被接受（406）".to_string());
+    }
     let elems = walk_xml(&meta);
     let root = elems.iter().find(|e| e.name == "abapFunctionModule");
     let attr = |k: &str| -> String { root.and_then(|e| e.attr(k)).unwrap_or("").to_string() };
@@ -2014,20 +2046,34 @@ async fn fm_set_rfc_enabled(
         fm_name
     };
     let desc = attr("description");
-    let body = format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+    let body = if meta_ct == META_CTS[0] {
+        // v3 契约：合成最小文档（S/4 实证可用）
+        format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
 <fmodule:abapFunctionModule xmlns:fmodule=\"http://www.sap.com/adt/functions/fmodules\" \
 xmlns:adtcore=\"http://www.sap.com/adt/core\" \
 adtcore:description=\"{desc}\" adtcore:name=\"{name}\" adtcore:type=\"FUGR/FF\" \
 fmodule:processingType=\"rfc\"{extra}>\
 <adtcore:containerRef adtcore:name=\"{group}\" adtcore:type=\"FUGR/F\" adtcore:uri=\"{uri}\"/>\
 </fmodule:abapFunctionModule>",
-        desc = xml_attr_escape(&desc),
-        name = xml_attr_escape(&fm_name),
-        extra = extra,
-        group = xml_attr_escape(group),
-        uri = xml_attr_escape(&container_uri),
-    );
+            desc = xml_attr_escape(&desc),
+            name = xml_attr_escape(&fm_name),
+            extra = extra,
+            group = xml_attr_escape(group),
+            uri = xml_attr_escape(&container_uri),
+        )
+    } else {
+        // v2 等旧契约（如 ED1/752）：元数据 PUT 是整文档替换，合成最小文档会
+        // 触发 ExceptionResourceSaveFailure——把 GET 回的原文档 processingType
+        // 原位翻转后整篇回写，保留系统期望的全部属性。
+        let flipped = meta.replace("processingType=\"normal\"", "processingType=\"rfc\"");
+        if flipped == meta {
+            // 没有 normal 属性可翻转（异常形态）：原样回写让系统报错说话
+            meta.clone()
+        } else {
+            flipped
+        }
+    };
     let mut query: Vec<(&str, &str)> = vec![("lockHandle", lock_handle)];
     if let Some(t) = transport.filter(|t| !t.trim().is_empty()) {
         query.push(("corrNr", t));
@@ -2038,7 +2084,7 @@ fmodule:processingType=\"rfc\"{extra}>\
             fm_base_rel,
             &query,
             Some(body.as_bytes()),
-            Some("application/vnd.sap.adt.functions.fmodules.v3+xml"),
+            Some(meta_ct),
             "*/*",
             STATEFUL,
             sess.cookie_header().as_deref(),
@@ -2053,7 +2099,7 @@ fmodule:processingType=\"rfc\"{extra}>\
         Err(format!(
             "ADT 返回 {}: {}",
             put_resp.status,
-            truncate(&String::from_utf8_lossy(&put_resp.body), 200)
+            truncate(&String::from_utf8_lossy(&put_resp.body), 1200)
         ))
     }
 }

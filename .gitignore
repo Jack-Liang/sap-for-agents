@@ -47,3 +47,4 @@ nwrfcsdk/**
 servers.toml
 # API 注册表（网关本地状态，不提交）
 registry.json
+sap_systems.toml

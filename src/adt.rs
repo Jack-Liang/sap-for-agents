@@ -391,10 +391,18 @@ impl AdtEndpoint {
         } else {
             None
         };
-        let mut resp = send(csrf.clone()).send().await.map_err(|e| {
-            metrics::counter!("adt_calls_total", "method" => method.as_str().to_owned(), "result" => "err").increment(1);
-            adt_unreachable(e)
-        })?;
+        // 传输层重试一次：ED1 的坏节点对部分请求直接断连（connection reset），
+        // 重发通常落到健康节点。与下面 uriMappingError 重试互补。
+        let mut resp = match send(csrf.clone()).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(error = %e, "ADT 请求传输层失败（坏节点断连？），重发一次");
+                send(csrf.clone()).send().await.map_err(|e2| {
+                    metrics::counter!("adt_calls_total", "method" => method.as_str().to_owned(), "result" => "err").increment(1);
+                    adt_unreachable(e2)
+                })?
+            }
+        };
 
         // 403 通常是 token 过期：刷新后重试一次（仅共享缓存的写方法；
         // 编排专用 token 下 403 是业务错误——锁冲突等——必须原样上抛）
@@ -409,29 +417,51 @@ impl AdtEndpoint {
             }
         }
 
-        let status = resp.status().as_u16();
-        let etag = resp
-            .headers()
-            .get("etag")
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_owned);
-        let cookies = resp
-            .headers()
-            .get_all("set-cookie")
-            .iter()
-            .filter_map(|v| v.to_str().ok())
-            .filter_map(|c| {
-                let pair = c.split(';').next()?.trim();
-                let (name, value) = pair.split_once('=')?;
-                Some((name.trim().to_string(), value.trim().to_string()))
-            })
-            .collect();
-        let body = resp.bytes().await.map_err(|e| {
-            metrics::counter!("adt_calls_total", "method" => method.as_str().to_owned(), "result" => "err").increment(1);
-            adt_unreachable(e)
-        })?;
-        metrics::counter!("adt_calls_total", "method" => method.as_str().to_owned(), "result" => "ok")
-            .increment(1);
+        // 响应读取最多两轮：ED1 这类 Web Dispatcher 负载均衡下，坏节点的 ADT
+        // URI mapper 会稳定返回 500 + `uriMappingError`（实测 200/500 完美交替），
+        // 原样重发一次通常就轮到健康节点。会话 cookie / CSRF 原样带上。
+        let mut retries_left = 1;
+        let (status, etag, cookies, body) = loop {
+            let status = resp.status().as_u16();
+            let etag = resp
+                .headers()
+                .get("etag")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned);
+            let cookies = resp
+                .headers()
+                .get_all("set-cookie")
+                .iter()
+                .filter_map(|v| v.to_str().ok())
+                .filter_map(|c| {
+                    let pair = c.split(';').next()?.trim();
+                    let (name, value) = pair.split_once('=')?;
+                    Some((name.trim().to_string(), value.trim().to_string()))
+                })
+                .collect();
+            let body = resp.bytes().await.map_err(|e| {
+                metrics::counter!("adt_calls_total", "method" => method.as_str().to_owned(), "result" => "err").increment(1);
+                adt_unreachable(e)
+            })?;
+            const URI_MAP_ERR: &[u8] = b"uriMappingError";
+            let retryable = status == 500
+                && retries_left > 0
+                && body
+                    .windows(URI_MAP_ERR.len())
+                    .any(|w| w.eq_ignore_ascii_case(URI_MAP_ERR));
+            if !retryable {
+                metrics::counter!("adt_calls_total", "method" => method.as_str().to_owned(), "result" => "ok")
+                    .increment(1);
+                break (status, etag, cookies, body);
+            }
+            retries_left -= 1;
+            tracing::warn!("ADT 响应 500 uriMappingError（负载均衡坏节点），原样重发一次");
+            resp = send(csrf.clone()).send().await.map_err(|e| {
+                metrics::counter!("adt_calls_total", "method" => method.as_str().to_owned(), "result" => "err").increment(1);
+                adt_unreachable(e)
+            })?;
+        };
+
         Ok(AdtRawResponse {
             status,
             etag,
