@@ -486,20 +486,45 @@ async fn lock_object(
     base: &str,
     sess: &mut WriteSession,
 ) -> Result<LockInfo, RfcError> {
-    let resp = adt
-        .request_raw(
-            axum::http::Method::POST,
-            base,
-            &[("_action", "LOCK"), ("accessMode", "MODIFY")],
-            None,
-            None,
-            "application/vnd.sap.as+xml;charset=UTF-8;dataname=com.sap.adt.lock.result",
-            STATEFUL,
-            sess.cookie_header().as_deref(),
-            Some(sess.token.as_str()),
-        )
-        .await?;
-    sess.absorb(&resp);
+    // 锁参数降级链（ED1/752 include 资源实证）：标准 MODIFY+stateful 在
+    // include 上报 400 accessMode 转换失败 → 依次试 EXCLUSIVE、无 accessMode
+    let mut resp = None;
+    for (query, hdrs) in [
+        (&[("_action", "LOCK"), ("accessMode", "MODIFY")][..], STATEFUL),
+        (&[("_action", "LOCK"), ("accessMode", "EXCLUSIVE")][..], STATEFUL),
+        (&[("_action", "LOCK")][..], STATEFUL),
+        (&[("_action", "LOCK"), ("accessMode", "MODIFY")][..], &[][..]),
+    ] {
+        let r = adt
+            .request_raw(
+                axum::http::Method::POST,
+                base,
+                query,
+                None,
+                None,
+                "application/vnd.sap.as+xml;charset=UTF-8;dataname=com.sap.adt.lock.result",
+                hdrs,
+                sess.cookie_header().as_deref(),
+                Some(sess.token.as_str()),
+            )
+            .await?;
+        sess.absorb(&r);
+        if r.status == 200
+            || !(r.status == 400
+                && String::from_utf8_lossy(&r.body).contains("accessMode"))
+        {
+            resp = Some(r);
+            break;
+        }
+        tracing::warn!(status = r.status, "ADT 锁定 accessMode 组合失败，降级重试");
+    }
+    let resp = resp.ok_or_else(|| RfcError {
+        code: -1,
+        status: 502,
+        message: "ADT 锁定全部参数组合失败".into(),
+        key: "ADT_LOCK_FAILED".into(),
+    })?;
+    // 降级链内每轮已 absorb 过选中响应，这里无需重复
     if resp.status != 200 {
         let body = String::from_utf8_lossy(&resp.body).to_string();
         // 失败响应体带 SAP 的一手原因（会话限额/授权/服务状态），必须落日志——
@@ -1615,7 +1640,52 @@ pub async fn write_object_source(
     rfc_enabled: bool,
     doc: Option<&str>,
 ) -> Result<WriteOutcome, RfcError> {
+    write_object_source_in(
+        sys, obj_type, name, group, source, transport, activate, rfc_enabled, doc, None,
+    )
+    .await
+}
+
+/// `include`：类测试包含（Some("testclasses") → PUT {base}/includes/testclasses），
+/// 其余 None = source/main。
+#[allow(clippy::too_many_arguments)]
+pub async fn write_object_source_in(
+    sys: &std::sync::Arc<crate::systems::SystemHandle>,
+    obj_type: ObjectType,
+    name: &str,
+    group: &str,
+    source: &str,
+    transport: Option<&str>,
+    activate: bool,
+    rfc_enabled: bool,
+    doc: Option<&str>,
+    include: Option<&str>,
+) -> Result<WriteOutcome, RfcError> {
     let adt = sys.adt.as_ref().ok_or_else(crate::adt::adt_disabled)?;
+    // include 变体前置校验：仅 class 的 "testclasses" 合法。不认识就 400——
+    // 静默降级会把测试类源码写进 source/main（覆盖主源码）
+    match include {
+        None | Some("testclasses") => {}
+        Some(other) => {
+            return Err(RfcError {
+                code: -1,
+                status: 400,
+                message: format!(
+                    "不支持的 include 变体 \"{}\"（仅 class 支持 \"testclasses\"）",
+                    other
+                ),
+                key: "INCLUDE_UNSUPPORTED".into(),
+            });
+        }
+    }
+    if include.is_some() && obj_type != ObjectType::Class {
+        return Err(RfcError {
+            code: -1,
+            status: 400,
+            message: "include 变体仅支持 class 类型".into(),
+            key: "INCLUDE_UNSUPPORTED".into(),
+        });
+    }
     if !obj_type.has_source() {
         return Err(RfcError {
             code: -1,
@@ -1639,7 +1709,16 @@ pub async fn write_object_source(
     }
     let type_name = obj_type.api_name();
     let base = obj_type.base_rel(name, group);
-    let source_rel = obj_type.source_rel(name, group);
+    let mut source_rel = obj_type.source_rel(name, group);
+    // 类测试包含（CCAU）：源码写入 include 资源本身（ED1/752 上不存在
+    // .../testclasses/source/main 子资源形态）。URI 强制小写——ED1/752 的
+    // URI mapper 只认小写。首写（include 尚不存在）走 POST 创建语义，
+    // ⚠️ ED1/752 实证：该路径最终被服务端 403「当前编辑中」卡住，首建
+    // 需 SE24/Eclipse 手动完成；include 已存在时的更新流程未及验证。
+    let is_test_incl = include == Some("testclasses") && obj_type == ObjectType::Class;
+    if is_test_incl {
+        source_rel = format!("{}/includes/testclasses", base).to_lowercase();
+    }
     // FM 源码规范化：经典注释块签名在这台 SEDI 系统会被拒收
     let source_owned: String;
     let source = if obj_type == ObjectType::Function {
@@ -1651,22 +1730,36 @@ pub async fn write_object_source(
     let mut warnings = Vec::new();
 
     // ⓪ 建立专用 stateful 会话：锁的签发、token 的签发必须同源，
-    //    否则柄是死的（无状态签发）或请求被拒（跨会话 token）
-    let mut sess = WriteSession::establish(adt, &base).await?;
+    //    否则柄是死的（无状态签发）或请求被拒（跨会话 token）。
+    //    会话与锁同建在对象容器（类）上——include URL 上出生的会话里
+    //    锁不可用（ED1/752 实证）。
+    let sess_base = base.clone();
+    let mut sess = WriteSession::establish(adt, &sess_base).await?;
 
     // ① 锁。部分旧补丁级别（ED1/752 实证）的 ADT URI mapper 只认小写 URI：
     //    大写锁定报 uriMappingError，小写正常（GET 两种大小写都通）。
     //    命中 uriMappingError 时降级小写 base 重试一次，后续 PUT/元数据/
     //    解锁/激活沿用降级后的 base（会话与 URL 大小写无关）。
     let mut base = base;
-    let mut source_rel = source_rel;
-    let lock = match lock_object(adt, &base, &mut sess).await {
+    if is_test_incl {
+        base = base.to_lowercase();
+    }
+    // 锁目标：一律对象容器（类）——除 testclasses：include 保存校验的正是
+    // CCAU 自己的锁（持类锁保存报 403「当前编辑中」/「已在请求中锁定」，
+    // 无锁保存报 423）。include 锁经 lock_object 内的参数降级链取得。
+    let mut lock_base = if is_test_incl {
+        source_rel.clone()
+    } else {
+        base.clone()
+    };
+    let lock = match lock_object(adt, &lock_base, &mut sess).await {
         Ok(l) => l,
         Err(e) if e.key == "ADT_uriMappingError" => {
             tracing::warn!(base = %base, "ADT 锁定 uriMappingError，降级小写 URI 重试");
             base = base.to_lowercase();
             source_rel = source_rel.to_lowercase();
-            lock_object(adt, &base, &mut sess).await?
+            lock_base = lock_base.to_lowercase();
+            lock_object(adt, &lock_base, &mut sess).await?
         }
         Err(e) => return Err(e),
     };
@@ -1679,18 +1772,29 @@ pub async fn write_object_source(
         });
 
     // ② PUT 源码；失败先解锁再报错（不留孤儿锁）
-    let mut put_query: Vec<(String, String)> =
-        vec![("lockHandle".into(), lock.lock_handle.clone())];
-    if let Some(t) = &transport_used {
+    // testclasses 首写：POST 创建语义 + version=inactive + 不带 corrNr
+    //（include 尚未进入传输请求对象清单，ED1 实证带 corrNr 时保存报 SaveFailure）
+    let mut put_query: Vec<(String, String)> = vec![("lockHandle".into(), lock.lock_handle.clone())];
+    if is_test_incl {
+        put_query.push(("version".into(), "inactive".into()));
+    }
+    if let Some(t) = transport_used.as_ref().filter(|_| !is_test_incl) {
         put_query.push(("corrNr".into(), t.clone()));
     }
     let put_query_ref: Vec<(&str, &str)> = put_query
         .iter()
         .map(|(k, v)| (k.as_str(), v.as_str()))
         .collect();
+    // testclasses 首写用 POST：PUT 对尚不存在的 include 报 SaveFailure
+    // 「CCAU 不具有任何非活动版本」（ED1/752 实证），POST+include 锁才是创建语义
+    let write_method = if is_test_incl {
+        axum::http::Method::POST
+    } else {
+        axum::http::Method::PUT
+    };
     let put_resp = match adt
         .request_raw(
-            axum::http::Method::PUT,
+            write_method,
             &source_rel,
             &put_query_ref,
             Some(source.as_bytes()),
@@ -1705,7 +1809,7 @@ pub async fn write_object_source(
         Ok(r) => r,
         Err(e) => {
             // 尽力解锁；解锁失败只记警告
-            if let Err(w) = unlock_object(adt, &base, &lock.lock_handle, &mut sess).await {
+            if let Err(w) = unlock_object(adt, &lock_base, &lock.lock_handle, &mut sess).await {
                 warnings.push(w);
             }
             drop_session(adt, &base, &sess).await;
@@ -1719,7 +1823,7 @@ pub async fn write_object_source(
     };
     sess.absorb(&put_resp);
     if !(200..300).contains(&put_resp.status) {
-        if let Err(w) = unlock_object(adt, &base, &lock.lock_handle, &mut sess).await {
+        if let Err(w) = unlock_object(adt, &lock_base, &lock.lock_handle, &mut sess).await {
             warnings.push(w);
         }
         drop_session(adt, &base, &sess).await;
@@ -1766,7 +1870,7 @@ pub async fn write_object_source(
     }
 
     // ③ 先解锁再激活（SAP 要求：不解锁时对象自身 ENQUEUE 以 403 拒绝激活）
-    if let Err(w) = unlock_object(adt, &base, &lock.lock_handle, &mut sess).await {
+    if let Err(w) = unlock_object(adt, &lock_base, &lock.lock_handle, &mut sess).await {
         warnings.push(w);
     }
     drop_session(adt, &base, &sess).await;

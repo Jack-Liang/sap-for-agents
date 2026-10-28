@@ -2127,6 +2127,10 @@ struct ObjectWriteBody {
     /// 接口文档（Markdown，仅 func）：随代码存入注册表条目、流入 OpenAPI 目录
     #[serde(default)]
     doc: Option<String>,
+    /// 源码资源变体（仅 class）：`"testclasses"` = 本地测试类包含
+    /// （PUT oo/classes/{名}/includes/testclasses），缺省 = source/main
+    #[serde(default)]
+    include: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -2168,7 +2172,7 @@ async fn object_write_handler(
     let sys = sap.arc();
     let group = resolve_group_if_needed(&sys, obj_type, &name, body.group.clone()).await?;
     let rfc = body.rfc_enabled.unwrap_or(false);
-    let outcome = match crate::objects::write_object_source(
+    let outcome = match crate::objects::write_object_source_in(
         &sys,
         obj_type,
         &name,
@@ -2178,6 +2182,7 @@ async fn object_write_handler(
         body.activate,
         rfc,
         body.doc.as_deref(),
+        body.include.as_deref(),
     )
     .await
     {
@@ -2191,7 +2196,7 @@ async fn object_write_handler(
                 software_component: None,
             };
             crate::objects::create_object(&sys, obj_type, &name, &group, &spec).await?;
-            crate::objects::write_object_source(
+            crate::objects::write_object_source_in(
                 &sys,
                 obj_type,
                 &name,
@@ -2201,6 +2206,7 @@ async fn object_write_handler(
                 body.activate,
                 rfc,
                 body.doc.as_deref(),
+                body.include.as_deref(),
             )
             .await?
         }
