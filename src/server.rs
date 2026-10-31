@@ -908,15 +908,16 @@ fn summarize_params(req: &InvokeRequest) -> String {
 }
 
 /// 脱敏 + 截断单个标量值（用于审计摘要）。敏感 key（密码/token 等）→ `***`，长值截断 80 字符。
+///
+/// 匹配规则是「大写后包含任一片段」，因此 SAP 常见的各种命名都能覆盖：
+/// `IV_PASSWD` / `IV_PASSWORD` / `BAPIPWD`（BAPI_USER_* 的密码字段）/ `IV_PW` /
+/// `API_TOKEN` / `CLIENT_SECRET` / `API_KEY`。新增片段时注意别误伤业务字段
+/// （例如 `KEY` 已会命中 `KEYDATE`，属于可接受的宁可多遮）。
 fn mask_value(key: &str, value: &ScalarValue) -> String {
     const SENSITIVE: &[&str] = &[
-        "PASSWD",
-        "PASSWORD",
-        "PASS",
-        "SECRET",
-        "TOKEN",
-        "CREDENTIAL",
-        "KEY",
+        "PASSWD", "PASSWORD", "PASSWORT", "PASS", // 各种密码写法（含德语）
+        "PWD", "PW",   // SAP BAPI 系（BAPIPWD）与简写（IV_PW）
+        "SECRET", "TOKEN", "CREDENTIAL", "KEY",
     ];
     let upper = key.to_uppercase();
     if SENSITIVE.iter().any(|s| upper.contains(s)) {
@@ -2555,6 +2556,10 @@ mod tests {
         assert_eq!(mask_value("USER_PASSWD", &secret), "***");
         assert_eq!(mask_value("API_KEY", &secret), "***");
         assert_eq!(mask_value("TOKEN", &secret), "***");
+        // SAP 原生密码字段（BAPI_USER_* 的密码参数就叫 BAPIPWD，此前漏网）
+        assert_eq!(mask_value("BAPIPWD", &secret), "***");
+        assert_eq!(mask_value("IV_PW", &secret), "***");
+        assert_eq!(mask_value("CLIENT_SECRET", &secret), "***");
         // 非敏感 key 保留值
         assert_eq!(
             mask_value("REQUTEXT", &ScalarValue::Chars("hi".into())),
