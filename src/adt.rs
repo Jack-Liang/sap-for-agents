@@ -89,6 +89,11 @@ impl AdtEndpoint {
             base64::engine::general_purpose::STANDARD.encode(format!("{}:{}", user, passwd))
         );
         let client = reqwest::Client::builder()
+            // ADT 永远直连 SAP，无视 HTTP_PROXY/HTTPS_PROXY/ALL_PROXY 环境变量。
+            // 本机代理是白名单型的，对内网 IP 一律返 403 空 body（<30ms），
+            // 一旦网关进程在带代理的 shell 里启动，ADT 全线挂掉而不自知
+            // （RFC 走 CPIC socket 不走 HTTP，所以表现为"RFC 全通、ADT 全 403"）。
+            .no_proxy()
             .timeout(timeout)
             .build()
             .unwrap_or_default();
