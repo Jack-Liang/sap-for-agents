@@ -116,8 +116,14 @@ impl AdtEndpoint {
         &self.base_url
     }
 
-    /// 取缓存的 CSRF token（未失效直接用）。token 从 `url` 自身签发：
-    /// 对该 URL 发 GET + Fetch 头，ICF 对已认证请求都会返回 token（含 404 资源）。
+    /// 取缓存的 CSRF token（未失效直接用）。token 优先从 `url` 自身签发：
+    /// 对该 URL 发 GET + Fetch 头，ICF 对已认证请求通常都会返回 token。
+    ///
+    /// **回落**：部分资源 GET 直接 404/405 且不带 `X-CSRF-Token`
+    /// （ED1/752 实证：`GET /sap/bc/adt/ddic/tabletypes` → 404 无 token，
+    /// 导致建表类型全线 `ADT_CSRF_FAILED`）。CSRF token 是**会话级**的
+    /// （按 client+user 签发，与具体资源无关），所以签不出时改由
+    /// `/sap/bc/adt/discovery` 签发——该资源恒可用且稳定回 token。
     async fn csrf_token(
         &self,
         url: &str,
@@ -133,6 +139,42 @@ impl AdtEndpoint {
             }
         }
 
+        // ① 目标 URL 自身
+        let mut got = self.fetch_csrf_token(url).await?;
+        // ② 回落 discovery（token 与资源无关，只与会话有关）
+        if got.is_none() {
+            let disco = format!("{}/sap/bc/adt/discovery", self.base_url);
+            tracing::debug!(url = %url, "目标 URL 未签发 CSRF token，回落 discovery 签发");
+            got = self.fetch_csrf_token(&disco).await?;
+        }
+
+        match got {
+            Some((token, cookie)) => {
+                if let Ok(mut guard) = self.csrf.lock() {
+                    *guard = Some(CsrfToken {
+                        token: token.clone(),
+                        cookie: cookie.clone(),
+                        fetched: Instant::now(),
+                    });
+                }
+                tracing::debug!("ADT CSRF token 已获取并缓存");
+                Ok(Some((token, cookie)))
+            }
+            None => Err(RfcError {
+                code: -1,
+                status: 502,
+                message: "ADT CSRF token 获取失败（响应缺少 X-CSRF-Token 头）".into(),
+                key: "ADT_CSRF_FAILED".into(),
+            }),
+        }
+    }
+
+    /// 单次 GET + `X-CSRF-Token: Fetch`，取回 (token, cookie)。
+    /// 响应不带可用 token 时返回 `Ok(None)`（由调用方决定回落还是报错）。
+    async fn fetch_csrf_token(
+        &self,
+        url: &str,
+    ) -> Result<Option<(String, Option<String>)>, RfcError> {
         let resp = self
             .client
             .get(url)
@@ -157,23 +199,8 @@ impl AdtEndpoint {
             .reduce(|a, b| format!("{}; {}", a, b));
 
         match token {
-            Some(token) if !token.is_empty() && token != "Fetch" => {
-                if let Ok(mut guard) = self.csrf.lock() {
-                    *guard = Some(CsrfToken {
-                        token: token.clone(),
-                        cookie: cookie.clone(),
-                        fetched: Instant::now(),
-                    });
-                }
-                tracing::debug!("ADT CSRF token 已获取并缓存");
-                Ok(Some((token, cookie)))
-            }
-            _ => Err(RfcError {
-                code: -1,
-                status: 502,
-                message: "ADT CSRF token 获取失败（响应缺少 X-CSRF-Token 头）".into(),
-                key: "ADT_CSRF_FAILED".into(),
-            }),
+            Some(t) if !t.is_empty() && t != "Fetch" => Ok(Some((t, cookie))),
+            _ => Ok(None),
         }
     }
 
