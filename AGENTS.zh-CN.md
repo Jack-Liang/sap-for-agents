@@ -358,6 +358,17 @@ curl -X POST http://127.0.0.1:3000/api/rfc \
   -d '{"func_name":"Z_CALC","inputs":{"IV_A":20,"IV_B":22},"auto_outputs":["EV_SUM"]}'
 # → {"scalars":{"EV_SUM":42},...}
 
+# 老版本（7.52）上的函数模块：先建「组」，再建「函数」
+# （建组必须带 devclass/transport——漏了组就落在 $TMP）
+curl -X POST http://127.0.0.1:3000/api/objects/fugr/ZMATH/create \
+  -H "Content-Type: application/json" \
+  -d '{"description":"math helpers","devclass":"ZMATH","transport":"A4HK900123"}'
+curl -X POST http://127.0.0.1:3000/api/objects/func/Z_CALC/create \
+  -H "Content-Type: application/json" \
+  -d '{"description":"calculator","group":"ZMATH","devclass":"ZMATH","transport":"A4HK900123",
+       "rfc_enabled":true,"source":"FUNCTION z_calc.\nENDFUNCTION."}'
+# 新模块要经 /api/rfc 调用，必须重启网关（SDK 描述符缓存）。
+
 # 删除对象（删 fugr 会连带其中的函数模块）
 curl -X DELETE "http://127.0.0.1:3000/api/objects/func/Z_CALC?group=ZMATH"
 
@@ -373,15 +384,27 @@ curl -X POST http://127.0.0.1:3000/api/objects/prog/ZMY_REPORT/syntax \
 - `PUT /source` 请求体：`source`（全量源码）+ 同上可选字段。
 - `syntax` 请求体：`source`。返回 `issues[]`：`severity`（E/W/…）、`line`、`offset`、`text`。
 - 响应里的 `activated.success` 是**逻辑结果**：激活失败时 HTTP 仍为 200，带 `activated.messages[]` / `problems[]`（"Line N: 文本"）——读它、改源码、重试。传输层错误（网络/会话）才走 4xx/5xx。
-- 锁冲突（他人正在编辑）→ 409 `OBJECT_LOCKED`，消息来自 SAP 原文。
+- 锁冲突（他人正在编辑）→ 409 `OBJECT_LOCKED`，消息来自 SAP 原文。另一种冲突长这样：HTTP 500 `ExceptionResourceSaveFailure` + *「… is already locked in request ED1K… of user X」*——该对象已被登记在另一个请求里，**把这个请求号当 `transport` 传**，换新请求接不过去。
 - **`tabl`/`stru` 写入无锁（etag 乐观并发）**：源码化 DDIC 对象（透明表与结构）完全不用 ADT 编辑锁——网关按 GET etag → PUT（`If-Match`）→ 激活 写入，没有 stateful 会话，也就没有 423 `InvalidLockHandle` 一族的问题。读与写之间被并发修改会以 412 `ETAG_CONFLICT` 暴露——重读源码再试即可。源码是 DDL 文本（表 `define table ...`，结构 `define structure ...`——结构只需 `@EndUserText.label` + `@AbapCatalog.enhancement.category`，表还需 `@AbapCatalog.tableCategory`、`@AbapCatalog.deliveryClass`、`@AbapCatalog.dataMaintenance`），`syntax` 检查同样适用。缺注解会被以 "Can't save due to errors in source; execute check for details" 拒绝（跑一下 `POST .../syntax` 即可看到缺哪个）。⚠️ 其余 DDIC 类型（域、数据元素、表类型）在现行版本上是**结构编辑器对象、无文本源码**——本组端点不支持；请改用下方小节的裸代理配方创建。
 - **函数模块签名可经源码写入（SEDI 形态）**：参数签名**内联写在 FUNCTION 语句里**——`FUNCTION zfm IMPORTING VALUE(iv) TYPE i EXPORTING VALUE(ev) TYPE i.` … `ENDFUNCTION.`——签名会注册进 FM 接口（已端到端实证）。网关也接受经典 `*" IMPORTING ...` 注释块形态（`/api/functions/{n}/source` 的返回形态）并自动转换。⚠️ 例外：**曾/现 rfc_enabled** 的模块接口被冻结——源码写得进、激活也成功，但参数变化被 SAP 忽略；改签名请删除重建（配合 `create` + `rfc_enabled` 成本很低）。删除重建改签名后，接口读取立即新鲜，但调用需重启网关（见下方写后一致性）。
 - **`rfc_enabled: true`**（create / `PUT source` / `replace`，仅 func）：源码写完后，网关在同一把锁下 PUT 模块元数据（`fmodule:processingType="rfc"`，描述先读回再带上——该 PUT 是整文档替换）。新 FM 立即可经 `POST /api/rfc` 调用。
-- **创建走 ADT-first**：`POST /api/objects/{type}/{name}/create`（body：`description` 必填；可选 `devclass`（默认 `$TMP`）、`transport`、`software_component`（仅 package；缺省按 ZLOCAL→LOCAL→HOME 逐个试）、`source` 首版源码一步写入+激活）。网关按标准 ADT objectcreation XML 创建（Eclipse / vscode_abap_remote_fs / vibing-steampunk 同一契约）；`prog`/`func` 在 ADT 失败时回退 RFC RPY 插入路径。`func` 在组缺失时自动建 `fugr`（ADT 路径——ABAP Cloud Trial 上同样有效，绕开了 RFC 建组不写 TADIR 的限制）。更丝滑的形态：`PUT .../source` 与 `POST .../replace` 支持 `"create": true` + `"description"`——对象不存在时网关自动建壳并重试；建错的壳一个 `DELETE` 即可清掉。
+- **创建走 ADT-first**：`POST /api/objects/{type}/{name}/create`（body：`description` 必填；可选 `devclass`（默认 `$TMP`）、`transport`、`software_component`（仅 package；缺省按 ZLOCAL→LOCAL→HOME 逐个试）、`source` 首版源码一步写入+激活）。网关按标准 ADT objectcreation XML 创建（Eclipse / vscode_abap_remote_fs / vibing-steampunk 同一契约）；`prog`/`func` 在 ADT 失败时回退 RFC RPY 插入路径。`func` 在组缺失时自动建 `fugr`（ADT 路径——ABAP Cloud Trial 上同样有效，绕开了 RFC 建组不写 TADIR 的限制）。更丝滑的形态：`PUT .../source` 与 `POST .../replace` 支持 `"create": true` + `"description"`——对象不存在时网关自动建壳并重试；建错的壳一个 `DELETE` 即可清掉。⚠️ `create: true` 只在 `prog` / `class` / `incl` / `intf` 上验证过；7.52 上对 `func` 的 PUT 恒回 **405 `ResourceMethodNotSupported`**（该路由不存在，重试无意义）——请用 `POST /api/objects/func/{名称}/create`，见下方 7.52 小节。
 - 写入需 ADT 已启用；写入失败也会尽力 UNLOCK，不留孤儿锁。
 - **replace 匹配容忍阶梯**（依次）：精确 → CRLF/LF 归一 → 末尾 `\n` 修剪（末行锚点）→ **大小写不敏感唯一匹配**。SAP 存储源码原文，而部分读取路径曾返回大写化视图——兜底吸收这个漂移；大小写不敏感多命中仍按命中数报错。
 - **读回保留原文大小写**：`/api/programs/{name}/source` 现以 `WITH_LOWERCASE` 请求——读到即存到，从读回内容取的锚点必然匹配。`GET /api/objects/{type}/{name}/source`（ADT 通道）是新类型与函数模块的规范读入口（SEDI 形态，与写入口径一致）。
 - **只读部署**：部署者可能以 `SAP_READ_ONLY=1` 运行网关——写端点（`PUT .../source`、`POST .../replace`、`POST .../create`、`DELETE`、`/api/adt` 非读方法）此时返回 403 `READ_ONLY`。这是刻意为之：不要重试写操作，改为只读操作与 `POST .../syntax`（仍可用，不落库）。`POST /api/rfc` 不受该开关影响。
+
+### 函数组与函数模块（7.52 实测要点）
+
+在 SAP_BASIS 7.52 / EHP8 上验证——当上面那套「纯 ADT」的路子走不通时，实际可行的路径：
+
+- **`func` 无法经「写源码」创建。** `PUT /api/objects/func/{n}/source` 带 `"create": true` 每次都是 405 `ResourceMethodNotSupported`（该 release 的对象级 source 路由不接受 PUT）。用 `POST /api/objects/func/{n}/create`，body 带 `group` + `devclass` + `transport` + `rfc_enabled` + `source`，一次完成建壳 + 写源 + 激活 + 置 RFC。
+- **先建 `fugr`，并且必须带 `devclass` 和 `transport`。** 这个 release 上 `POST /api/objects/fugr/{g}/create` 的 ADT 调用会失败，网关回落 RPY 插入——而这条路径才是对的：RPY 会置 `TRDIR-UCCHECK = 'X'`。组若存在但该标记为空，组内每个函数激活都报「程序不与 Unicode 兼容」。建完组请查 `TRDIR-UCCHECK`，为空就 `DELETE` 掉重建，让 RPY 路径跑一遍。
+- **这样建出来的模块在 `TADIR` 里没有 `FUNC` 行**——`OBJECT='FUNC' AND DEVCLASS=<包>` 查不到任何记录，连存在多年的模块也一样。这是常态、不是登记失败：abapGit 按 `ENLFDIR` + 组成员序列化函数组，照常能推能拉。别去手工补 `TADIR`。
+- **新建模块、或任何参数清单变更，都必须重启网关后才能被 `/api/rfc` 调用。** SDK 描述符缓存是进程级的；`GET /api/functions/{n}` 实时读接口、看着是对的，而 `/api/rfc` 仍按旧编组视图调用。
+- **源码必须是完整的 SEDI 形态**：`FUNCTION z_x.` 要**带句号**，结尾要有 `ENDFUNCTION.`。漏句号时扫描器会把后面第一条语句吞进 FUNCTION 语句；漏 `ENDFUNCTION.` 则报 FUNCTION 未关闭。
+- **签名注释块里的 `TABLES x STRUCTURE y` 会踩 7.52 的保存扫描**（`Parameter x declares no type`），改成 `TYPE <表类型>` 又因为 TABLES 形参需要表类型被拒。请写 ADT 规范形态——签名内联 `TABLES OPTIONS LIKE /SAPDS/RFC_DB_OPT`，与 `GET /api/adt/functions/groups/{g}/fmodules/{fm}/source/main` 返回的完全一致；这个形态一次保存激活成功，且 RFC 侧契约不变。
+- 函数组的成员 include 不能经 `programs/incl` 资源写（SAP 报「这一语法不能用于对象名称」）——必须走 `func` 资源。
 
 ### 结构化 DDIC 类型（doma / dtel / ttyp）——经裸代理创建
 
