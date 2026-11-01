@@ -339,6 +339,39 @@ extern "system" {
         errorInfo: *mut RFC_ERROR_INFO,
     ) -> RFC_RC;
 
+    /// 按名字查 SDK 仓库缓存的函数描述符（repositoryID = 后端 SYSID），
+    /// 不在缓存时返回 null 句柄（配合 Remove 用于精确计数）。
+    pub fn RfcGetCachedFunctionDesc(
+        repositoryID: *const SAP_UC,
+        funcName: *const SAP_UC,
+        errorInfo: *mut RFC_ERROR_INFO,
+    ) -> RFC_FUNCTION_DESC_HANDLE;
+
+    /// 按名字从 SDK 仓库缓存移除函数描述符（repositoryID = 后端 SYSID）。
+    /// SDK 头文件注明的设计场景：后端签名已变、而外部 RFC 程序仍在运行——
+    /// 继续用旧缓存会得到缺字段/错值。⚠️ 实测名字不在缓存时也返回 RFC_OK
+    /// （不区分"没找到"），精确计数须先用 GetCachedFunctionDesc 判存在。
+    pub fn RfcRemoveFunctionDesc(
+        repositoryID: *const SAP_UC,
+        functionName: *const SAP_UC,
+        errorInfo: *mut RFC_ERROR_INFO,
+    ) -> RFC_RC;
+
+    /// 按名字查 SDK 仓库缓存的类型（结构/表）描述符（repositoryID = 后端 SYSID），
+    /// 不在缓存时返回 null 句柄。
+    pub fn RfcGetCachedTypeDesc(
+        repositoryID: *const SAP_UC,
+        typeName: *const SAP_UC,
+        errorInfo: *mut RFC_ERROR_INFO,
+    ) -> RFC_TYPE_DESC_HANDLE;
+
+    /// 按名字从 SDK 仓库缓存移除类型（结构/表）描述符（repositoryID = 后端 SYSID）。
+    pub fn RfcRemoveTypeDesc(
+        repositoryID: *const SAP_UC,
+        typeName: *const SAP_UC,
+        errorInfo: *mut RFC_ERROR_INFO,
+    ) -> RFC_RC;
+
     /// 取函数名（回调里从 funcHandle 反查函数名，用于路由）
     pub fn RfcGetFunctionName(
         funcDesc: RFC_FUNCTION_DESC_HANDLE,

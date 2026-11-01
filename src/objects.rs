@@ -1884,13 +1884,19 @@ pub async fn write_object_source_in(
     };
 
     // ⑤ 缓存失效：函数写入成功即清 FUNC_CACHE——下一次接口自省/auto_outputs
-    //    必然拿到新签名（否则读到的是写入前的快照）。注意 SAP 侧函数组加载
-    //    仍按连接缓存（池排干由调用方 drain_pool_after_write 处理）、SDK 描述符
-    //    缓存进程级不可失效（删库重建的 FM 新参数要重启网关才可见，见 AGENTS.md）。
+    //    必然拿到新签名（否则读到的是写入前的快照）。另外两层各有着落：SAP 侧
+    //    函数组加载按连接缓存（池排干由调用方 drain_pool_after_write 处理）；
+    //    SDK 描述符缓存按 SYSID 进程级持有、换连接刷不掉，必须用
+    //    RfcRemoveFunctionDesc 点名移除（v0.18.1 起写后即做，删除重建的新签名
+    //    立即可调，无需 reload/重启——A4H 实测闭环）。
     if obj_type == ObjectType::Function {
         let cleared = sys.meta.invalidate_function(name.trim());
         if cleared {
             tracing::debug!(func = %name.trim(), "写后清除 FUNC_CACHE 条目");
+        }
+        if let Some(sysid) = sys.sysid() {
+            let removed = crate::connection::drop_sdk_function_desc(&sysid, name.trim());
+            tracing::debug!(func = %name.trim(), removed, "写后移除 SDK 描述符缓存条目");
         }
     }
 
@@ -2362,11 +2368,16 @@ pub async fn delete_object(
     }
     // 成功：DELETE 已消耗锁柄，直接结束会话
     drop_session(adt, &base, &sess).await;
-    // 写后失效：函数删除即清 FUNC_CACHE（防幽灵元数据）
+    // 写后失效：函数删除即清 FUNC_CACHE（防幽灵元数据）+ 点名移除 SDK 描述符
+    // 缓存条目（随后的同名重建的新签名才不会撞上旧编组视图）
     if obj_type == ObjectType::Function {
         let cleared = sys.meta.invalidate_function(name.trim());
         if cleared {
             tracing::debug!(func = %name.trim(), "删除后清除 FUNC_CACHE 条目");
+        }
+        if let Some(sysid) = sys.sysid() {
+            let removed = crate::connection::drop_sdk_function_desc(&sysid, name.trim());
+            tracing::debug!(func = %name.trim(), removed, "删除后移除 SDK 描述符缓存条目");
         }
     }
     // 注册表钩子：函数删除成功 → 墓碑化（保留条目留档；失败只记警告）

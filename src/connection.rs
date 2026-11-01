@@ -16,6 +16,61 @@ pub struct RfcConnection {
 // spawn_blocking 在专用阻塞线程执行，从根本上规避跨 await 点问题。
 unsafe impl Send for RfcConnection {}
 
+/// 按名字把函数描述符从 SDK 的进程级仓库缓存中移除（repositoryID = 后端 SYSID）。
+///
+/// SDK 的描述符缓存按 **SYSID** 分区、**进程全局**（sapnwrfc.h：RFC Runtime 为每个
+/// R/3 System ID 维护一份缓存，与连接无关）——换连接、排干连接池都刷不掉它。
+/// 后端签名变更（经本网关删除重建、或 SE37 直改）后必须点名移除，下一次
+/// `RfcGetFunctionDesc` 才会重新从 DDIC 拉取；否则旧编组视图会静默错读错写。
+///
+/// 返回是否确有缓存条目被移除（名字本就不在缓存 → false，属正常，不报错）。
+/// 本调用是纯本地缓存操作，无网络往返，可直接在异步上下文执行。
+pub fn drop_sdk_function_desc(sysid: &str, func_name: &str) -> bool {
+    let sysid_uc = str_to_sap_uc(sysid);
+    let name_uc = str_to_sap_uc(&func_name.to_uppercase());
+    let mut error_info = unsafe { std::mem::zeroed::<RFC_ERROR_INFO>() };
+    // 先判存在再移除：RfcRemoveFunctionDesc 对不存在的条目也返回 RFC_OK（实测），
+    // 直接调用无法区分"真移除了"与"本来就没有"，计数会虚高。
+    let cached = unsafe {
+        RfcGetCachedFunctionDesc(sysid_uc.as_ptr(), name_uc.as_ptr(), &mut error_info)
+    };
+    if cached.is_null() {
+        return false;
+    }
+    let rc = unsafe {
+        RfcRemoveFunctionDesc(sysid_uc.as_ptr(), name_uc.as_ptr(), &mut error_info)
+    };
+    rc == RFC_OK
+}
+
+/// [`drop_sdk_function_desc`] 的类型版：移除结构/表类型描述符（tabl/stru 写后、
+/// reload 时用）。同样纯本地、无网络往返。
+pub fn drop_sdk_type_desc(sysid: &str, type_name: &str) -> bool {
+    let sysid_uc = str_to_sap_uc(sysid);
+    let name_uc = str_to_sap_uc(&type_name.to_uppercase());
+    let mut error_info = unsafe { std::mem::zeroed::<RFC_ERROR_INFO>() };
+    // 同 drop_sdk_function_desc：先判存在，Remove 对缺失条目也返回 RFC_OK
+    let cached = unsafe { RfcGetCachedTypeDesc(sysid_uc.as_ptr(), name_uc.as_ptr(), &mut error_info) };
+    if cached.handle.is_null() {
+        return false;
+    }
+    let rc = unsafe { RfcRemoveTypeDesc(sysid_uc.as_ptr(), name_uc.as_ptr(), &mut error_info) };
+    rc == RFC_OK
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 名字不在 SDK 仓库缓存时移除返回 false 且不报错——纯本地缓存操作，
+    /// 不建立连接、不触网，任意 bogus SYSID/函数名都安全。
+    #[test]
+    fn drop_sdk_desc_missing_entry_is_graceful_false() {
+        assert!(!drop_sdk_function_desc("ZZZ", "Z_NO_SUCH_FUNC_FOR_TEST"));
+        assert!(!drop_sdk_type_desc("ZZZ", "Z_NO_SUCH_TYPE_FOR_TEST"));
+    }
+}
+
 impl RfcConnection {
     /// 通过键值对参数建立直连
     pub fn new(params: &[(&str, &str)]) -> Result<Self, RfcError> {

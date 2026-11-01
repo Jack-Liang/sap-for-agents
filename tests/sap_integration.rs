@@ -1906,13 +1906,14 @@ fn function_interface_fresh_via_fii() {
         .any(|p| p["name"] == "REQUTEXT"));
 }
 
-/// 签名漂移的端到端闭环：创建 rfc FM → 调用（SDK 描述符定格 v1）→
-/// 删库重建改签名 → 接口端点**立即**显示新参数（FII 实时）→
-/// 平坦调用触碰新参数 → 409 SIGNATURE_STALE → /api/rfc 设新参数 →
-/// 错误带重启提示。这正是 v0.15 要消灭的「改完签名要瞎猜」体验。
+/// 签名漂移的端到端闭环（v0.18.1 自愈版）：创建 rfc FM → 调用（SDK 描述符
+/// 定格 v1）→ 删库重建改签名 → 接口端点**立即**显示新参数（FII 实时）→
+/// 平坦调用与 /api/rfc 带**新参数直接成功**——写后钩子已用 RfcRemoveFunctionDesc
+/// 点名移除 SDK 旧缓存条目（按 SYSID 进程级、换连接刷不掉的那层），
+/// 无需 reload、无需重启。v0.15 的「改完签名要瞎猜/重启」体验就此消灭。
 #[test]
 #[ignore]
-fn signature_change_contract_fresh_invoke_guarded() {
+fn signature_change_write_hook_self_heals() {
     let _s = start_server();
     let name = format!("ZAGWSTLE{}", std::process::id() % 10000);
     let group = "ZAGW_STALE_GRP";
@@ -1998,34 +1999,39 @@ fn signature_change_contract_fresh_invoke_guarded() {
     let iv_a = params.iter().find(|p| p["name"] == "IV_A").unwrap();
     assert_eq!(iv_a["type"], "INT");
 
-    // ⑤ 平坦调用触碰新参数 → 409 SIGNATURE_STALE（守卫拒绝按旧签名错读错写）
+    // ⑤ 平坦调用带新参数 → 直接成功（写后钩子已移除 SDK 旧描述符条目）
     let resp = http_client()
         .post(format!("{}/api/invokes/{}", _s.base_url, alias))
         .json(&serde_json::json!({"iv_a": 1, "iv_b": 2}))
         .send()
         .unwrap();
-    assert_eq!(resp.status(), 409, "触碰新参数应 409: {} {resp:?}", alias);
+    assert_eq!(resp.status(), 200, "新签名应立即可调: {} {resp:?}", alias);
     let body: serde_json::Value = resp.json().unwrap();
-    assert_eq!(body["error"]["key"], "SIGNATURE_STALE");
-    assert!(
-        body["error"]["message"].as_str().unwrap().contains("IV_B"),
-        "消息应点名新参数"
-    );
+    assert_eq!(body["EV_SUM"], 3, "v2 逻辑 iv_a+iv_b: {body}");
 
-    // ⑥ /api/rfc 直接设新参数 → SDK 报字段不存在，错误应带重启提示
+    // ⑥ /api/rfc 带新参数 → 同样直接成功
     let resp = http_client()
         .post(format!("{}/api/rfc", _s.base_url))
-        .json(&serde_json::json!({"func_name": name, "inputs": {"IV_B": 1}}))
+        .json(&serde_json::json!({
+            "func_name": name, "inputs": {"IV_A": 10, "IV_B": 5}, "auto_outputs": ["EV_SUM"]
+        }))
         .send()
         .unwrap();
+    assert_eq!(resp.status(), 200, "/api/rfc 新签名应立即可调: {resp:?}");
     let body: serde_json::Value = resp.json().unwrap();
-    assert_eq!(body["error"]["key"], "RFC_INVALID_PARAMETER");
+    assert_eq!(body["scalars"]["EV_SUM"], 15, "v2 逻辑 iv_a+iv_b: {body}");
+
+    // ⑦ reload 响应带 SDK 描述符移除计数字段（结构断言；函数已不在缓存，移除数为 0）
+    let resp = http_client()
+        .post(format!("{}/api/admin/reload", _s.base_url))
+        .json(&serde_json::json!({"func_names": [name]}))
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().unwrap();
     assert!(
-        body["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("重启网关"),
-        "应带重启提示: {body}"
+        body.get("sdk_desc_removed").is_some(),
+        "reload 响应应带 sdk_desc_removed: {body}"
     );
 
     // ⑦ 清理：删 FM + 清注册表条目

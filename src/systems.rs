@@ -404,34 +404,77 @@ pub struct ReloadReport {
     pub func_metadata_cleared: usize,
     /// 清掉的 DDIC 类型元数据条数
     pub type_metadata_cleared: usize,
+    /// 从 SDK 仓库缓存点名移除的函数描述符条数（缓存中本就无此名的跳过）
+    pub sdk_desc_removed: usize,
+    /// 从 SDK 仓库缓存点名移除的类型描述符条数
+    pub sdk_type_removed: usize,
 }
 
 impl SystemHandle {
-    /// 让该系统"像刚重启过"：连接池换代 + 清空元数据缓存。
+    /// 让该系统"像刚重启过"：连接池换代 + 清空元数据缓存 + **点名移除 SDK
+    /// 描述符缓存条目**。
     ///
-    /// 场景：SAP 端改了某 RFC 的参数（增删改）。两处缓存会让人以为"必须重启
-    /// 网关"——SDK 的函数描述符按**连接**缓存，网关自己的 [`MetadataCache`]
-    /// 又按**函数名**缓存。这里把两者一起作废，且**不需要重启进程**：
-    /// 监听端口不变、在途请求用旧连接跑完（归还时丢弃），新请求必然拿到
-    /// 新建连接、重新向 SAP 拉取签名。
+    /// 场景：SAP 端改了某 RFC 的参数（增删改）。三层缓存会让人以为"必须重启
+    /// 网关"——SAP 侧函数组加载按**连接**缓存（换代丢弃旧连接即可）、SDK 的
+    /// 函数/类型描述符按 **SYSID 进程级**缓存（与连接无关，sapnwrfc.h 明言
+    /// "cache for every R/3 System ID"，必须用 `RfcRemoveFunctionDesc` 点名
+    /// 移除）、网关自己的 [`MetadataCache`] 按**函数名**缓存。这里把三层一起
+    /// 作废，且**不需要重启进程**：监听端口不变、在途请求用旧连接跑完（归还
+    /// 时丢弃），新请求重新向 SAP 拉取签名。
+    ///
+    /// SDK 层的移除范围 = [`MetadataCache`] 清出的名字 + `extra_funcs`（调用方
+    /// 传入的点名清单，覆盖"调用过但从未自省过"的函数）。未成功连过（无
+    /// SYSID）的系统没有 SDK 缓存可言，跳过该层。
     ///
     /// 注意：只影响运行时状态，不重读 `.env` / `sap_systems.toml`。
     /// 改配置（监听地址、API key、连接参数）仍需进程重启。
-    pub fn reload(&self) -> ReloadReport {
+    pub fn reload(&self, extra_funcs: &[String]) -> ReloadReport {
         let connections_closed = self.pool.reload();
-        let (func_metadata_cleared, type_metadata_cleared) = self.meta.clear_all();
+        let cleared = self.meta.clear_all();
+        let crate::metadata::ClearedMetadata {
+            func_names,
+            type_names,
+        } = cleared;
+        let func_metadata_cleared = func_names.len();
+        let type_metadata_cleared = type_names.len();
+        // SDK 层移除范围 = 元数据缓存清出的名字 + 调用方点名（覆盖"调用过但
+        // 从未自省过"的函数）。去重合并。
+        let mut names = func_names;
+        for f in extra_funcs {
+            let up = f.trim().to_uppercase();
+            if !up.is_empty() && !names.contains(&up) {
+                names.push(up);
+            }
+        }
+        let (mut sdk_desc_removed, mut sdk_type_removed) = (0usize, 0usize);
+        if let Some(sysid) = self.sysid() {
+            for name in &names {
+                if crate::connection::drop_sdk_function_desc(&sysid, name) {
+                    sdk_desc_removed += 1;
+                }
+            }
+            for name in &type_names {
+                if crate::connection::drop_sdk_type_desc(&sysid, name) {
+                    sdk_type_removed += 1;
+                }
+            }
+        }
         tracing::info!(
             system = %self.name,
             connections_closed,
             func_metadata_cleared,
             type_metadata_cleared,
-            "系统已 reload：连接池换代 + 元数据清空（RFC 签名变更生效）"
+            sdk_desc_removed,
+            sdk_type_removed,
+            "系统已 reload：连接池换代 + 元数据清空 + SDK 描述符点名移除（RFC 签名变更生效）"
         );
         ReloadReport {
             system: self.name.clone(),
             connections_closed,
             func_metadata_cleared,
             type_metadata_cleared,
+            sdk_desc_removed,
+            sdk_type_removed,
         }
     }
 

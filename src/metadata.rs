@@ -73,6 +73,16 @@ impl Default for MetadataCache {
     }
 }
 
+/// [`MetadataCache::clear_all`] 的返回：被清掉的条目名清单（供 reload 层
+/// 继续清除 SDK 进程级描述符缓存里的同名条目）。
+#[derive(Debug, Default)]
+pub struct ClearedMetadata {
+    /// 被清掉的函数元数据条目名
+    pub func_names: Vec<String>,
+    /// 被清掉的 DDIC 类型字段缓存条目名
+    pub type_names: Vec<String>,
+}
+
 fn poisoned(which: &str, e: impl std::fmt::Display) -> RfcError {
     RfcError {
         code: -1,
@@ -115,24 +125,22 @@ impl MetadataCache {
     ///
     /// 场景：SAP 端改了某 RFC 的参数（增删改）后，网关既有的函数元数据与
     /// 描述符全部过期。清空后下一次调用会重新向 SAP 拉取签名。
-    pub fn clear_all(&self) -> (usize, usize) {
-        let funcs = match self.func.write() {
-            Ok(mut map) => {
-                let n = map.len();
-                map.clear();
-                n
-            }
-            Err(_) => 0,
+    /// 返回被清掉的函数/类型名清单——调用方（`SystemHandle::reload`）据此把
+    /// **SDK 进程级描述符缓存**里的对应条目一并移除（`RfcRemoveFunctionDesc`
+    /// 按 SYSID 分区，换连接刷不掉，必须点名）。
+    pub fn clear_all(&self) -> ClearedMetadata {
+        let func_names = match self.func.write() {
+            Ok(mut map) => map.drain().map(|(k, _)| k).collect(),
+            Err(_) => Vec::new(),
         };
-        let types = match self.types.write() {
-            Ok(mut map) => {
-                let n = map.len();
-                map.clear();
-                n
-            }
-            Err(_) => 0,
+        let type_names = match self.types.write() {
+            Ok(mut map) => map.drain().map(|(k, _)| k).collect(),
+            Err(_) => Vec::new(),
         };
-        (funcs, types)
+        ClearedMetadata {
+            func_names,
+            type_names,
+        }
     }
 
     /// 获取某函数的元数据。命中缓存直接返回；未命中则从 SAP 拉取并缓存。
@@ -285,4 +293,35 @@ fn fetch_metadata(conn: &RfcConnection, func_name: &str) -> Result<FuncMetadata,
     }
 
     Ok(meta)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clear_all_returns_cleared_names_for_sdk_desc_removal() {
+        let cache = MetadataCache::new();
+        cache
+            .func
+            .write()
+            .unwrap()
+            .insert("Z_A".into(), FuncMetadata::default());
+        cache
+            .func
+            .write()
+            .unwrap()
+            .insert("Z_B".into(), FuncMetadata::default());
+        cache.types.write().unwrap().insert("Z_T".into(), Vec::new());
+
+        let cleared = cache.clear_all();
+        let mut funcs = cleared.func_names.clone();
+        funcs.sort();
+        assert_eq!(funcs, vec!["Z_A", "Z_B"], "函数名清单供 reload 点名移除 SDK 缓存");
+        assert_eq!(cleared.type_names, vec!["Z_T"]);
+
+        // 清空后再 clear 为空（不重复上报）
+        let again = cache.clear_all();
+        assert!(again.func_names.is_empty() && again.type_names.is_empty());
+    }
 }

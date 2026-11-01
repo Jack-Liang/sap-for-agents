@@ -547,25 +547,43 @@ impl tower::Service<axum::extract::Request> for ScopeService {
 /// `POST /api/admin/reload`（作用域形态 `/api/s/{system}/admin/reload`）。
 ///
 /// 让目标系统"像刚重启过"：**连接池换代**（空闲连接立刻关闭，借出中的归还
-/// 即弃）+ **清空函数/DDIC 元数据缓存**。用于 SAP 端改了 RFC 参数后让新签名
-/// 生效，而不必重启网关进程——监听不断、在途请求不受影响。
+/// 即弃）+ **清空函数/DDIC 元数据缓存** + **点名移除 SDK 描述符缓存条目**
+/// （`RfcRemoveFunctionDesc`，按 SYSID 进程级缓存——换连接刷不掉的那层）。
+/// 用于 SAP 端改了 RFC 参数后让新签名生效，而不必重启网关进程——监听不断、
+/// 在途请求不受影响。
+///
+/// 请求体可选：`{"func_names": ["Z_FOO", ...]}`——显式点名要从 SDK 缓存移除的
+/// 函数（覆盖"调用过但从未自省过、不在元数据缓存里"的长尾；SE37 直改签名后
+/// 推荐带上）。缺省时移除元数据缓存清出的全部名字。
 ///
 /// 语义边界（写清楚免得误用）：
 /// - ✅ 改 RFC 参数/表结构 → 调本端点即可
 /// - ❌ 改 `.env`（监听地址、API key、池大小）或 `sap_systems.toml`（连接参数、
 ///   新系统）→ 仍须重启进程；多系统新增可用 `POST /api/setup/system` 热加载
 /// - 与 `read_only` 无关：不改 SAP 数据，只重置本端缓存（只读系统同样可用）
-async fn admin_reload_handler(sap: Sap) -> Result<Json<serde_json::Value>, RfcError> {
+#[derive(serde::Deserialize, Default)]
+struct AdminReloadBody {
+    #[serde(default)]
+    func_names: Vec<String>,
+}
+
+async fn admin_reload_handler(
+    sap: Sap,
+    body: Option<Json<AdminReloadBody>>,
+) -> Result<Json<serde_json::Value>, RfcError> {
     // 被隔离（SYSID 冲突）的系统不提供服务，也不允许借 reload 绕过检查
     sap.check_available()?;
-    let report = sap.reload();
+    let extra = body.map(|Json(b)| b.func_names).unwrap_or_default();
+    let report = sap.reload(&extra);
     Ok(Json(serde_json::json!({
         "status": "reloaded",
         "system": report.system,
         "connections_closed": report.connections_closed,
         "func_metadata_cleared": report.func_metadata_cleared,
         "type_metadata_cleared": report.type_metadata_cleared,
-        "note": "连接池已换代：新请求会重新拉取 RFC 签名；在途请求用旧连接跑完后丢弃。配置文件未重读。",
+        "sdk_desc_removed": report.sdk_desc_removed,
+        "sdk_type_removed": report.sdk_type_removed,
+        "note": "连接池已换代 + SDK 描述符缓存已按名移除：新请求会重新拉取 RFC 签名；在途请求用旧连接跑完后丢弃。配置文件未重读。",
     })))
 }
 
@@ -1237,14 +1255,16 @@ pub(crate) async fn run_invoke_and_log(
             Ok(Json(resp))
         }
         Err(mut e) => {
-            // 「字段不存在」类错误附加签名漂移提示：SDK 描述符缓存进程级不可失效，
-            // 函数签名在网关启动后变过时，设/读新参数都会报这个错——给出路标
-            // 而不是让调用方对着裸 SDK 错误猜。
+            // 「字段不存在」类错误附加签名漂移提示：SDK 描述符缓存按 SYSID
+            // 进程级持有（与连接无关），签名在 SAP 端变过（SE37 直改；经本
+            // 网关的写入已自动移除缓存条目，一般走不到这里）时，设/读新参数
+            // 都会报这个错——给出路标而不是让调用方对着裸 SDK 错误猜。
             if e.key == "RFC_INVALID_PARAMETER" && e.message.contains("not found") {
                 e.message.push_str(&format!(
-                    "（若 {} 的签名近期变更过：网关 SDK 描述符缓存仍持旧接口，\
-                     重启网关后重试；实时接口见 GET /api/functions/{}）",
-                    func_name, func_name
+                    "（若 {} 的签名近期在 SAP 端变更过：POST /api/admin/reload 重读签名即可，\
+                     无需重启进程——多系统用 /api/s/{{system}}/admin/reload；为确定性起见可带 \
+                     {{\"func_names\":[\"{}\"]}} 点名移除旧缓存；实时接口见 GET /api/functions/{}）",
+                    func_name, func_name, func_name
                 ));
             }
             record_audit(AuditRecord {

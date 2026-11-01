@@ -66,7 +66,8 @@ struct IdleConn {
     conn: RfcConnection,
     idle_since: std::time::Instant,
     /// 连接所属的池代次（[`RfcConnectionPool::reload`] 递增）。借出时比对：
-    /// 落后代次的连接一律丢弃，保证 reload 后不会复用带旧函数描述符的连接。
+    /// 落后代次的连接一律丢弃，保证 reload 后不会复用带旧**函数组加载**的
+    /// 连接（SAP 侧按连接缓存；SDK 描述符是另一层，见 [`Self::reload`]）。
     epoch: u64,
 }
 
@@ -91,7 +92,9 @@ pub struct RfcConnectionPool {
     /// 空闲多久后借出前需先 `RFC_PING` 校验（< 阈值视为刚归还、直接借出）
     idle_validate_after: std::time::Duration,
     /// 池代次：每次 [`Self::reload`] 递增，旧代次连接在借出/归还时被丢弃。
-    /// 用于 SAP 端函数接口变更后强制重建连接（重新加载函数描述符）。
+    /// 用于 SAP 端函数接口变更后强制重建连接（SAP 侧函数组加载按连接缓存，
+    /// 新连接才会重读；SDK 描述符缓存另由 [`crate::connection::
+    /// drop_sdk_function_desc`] 点名移除，见 [`Self::reload`] 注释）。
     epoch: AtomicU64,
     inner: Mutex<PoolInner>,
     /// 空闲连接可用时唤醒等待者
@@ -373,8 +376,10 @@ impl RfcConnectionPool {
     ///
     /// 与 [`Self::drain_idle`] 的区别：drain 只清空闲栈，借出中的连接归还后
     /// 仍会入池复用；换代则连它们也作废（归还时丢弃）。用于 SAP 端**函数接口
-    /// 本身变了**（参数增删改）之后——SDK 的函数描述符按连接缓存，只有重建
-    /// 连接才会重新向 SAP 拉取签名。
+    /// 本身变了**（参数增删改）之后——SAP 侧函数组加载按连接缓存，只有重建
+    /// 连接才会重读。⚠️ SDK 的函数/类型描述符缓存**不随连接走**（按 SYSID
+    /// 进程级持有，A4H 实测换连接后旧签名仍在），那层由调用方用
+    /// [`crate::connection::drop_sdk_function_desc`] 点名移除。
     ///
     /// 调用方随后应同时清理元数据缓存（`MetadataCache`），否则网关层仍会
     /// 用旧签名构造请求。
