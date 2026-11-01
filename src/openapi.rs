@@ -323,6 +323,40 @@ const SPEC_JSON: &str = r##"{
         }
       }
     },
+    "/api/admin/reload": {
+      "post": {
+        "tags": [
+          "ops"
+        ],
+        "summary": "Reload a system's runtime state (pool generation + metadata cache)",
+        "description": "v0.18: makes a system behave as if the gateway had just been restarted — without restarting the process. The listener stays up and in-flight requests finish on their old connection. Two caches go stale when an SAP-side RFC interface changes (parameters added/removed/retyped): the SDK's per-connection function-descriptor cache and the gateway's per-function metadata cache. This endpoint bumps the connection-pool generation (idle connections closed immediately, borrowed ones dropped on return) and clears the function/DDIC metadata cache, so the next call reconnects and re-reads the signature from SAP. Call it after changing an RFC in SE37/SE80 and before trusting /api/functions or /api/rfc. Scoped form: POST /api/s/{system}/admin/reload. It does NOT re-read .env or sap_systems.toml — config changes still need a process restart (adding systems hot-loads via POST /api/setup/system). Safe on read_only systems: it only resets local caches.",
+        "responses": {
+          "200": {
+            "description": "Reloaded: system, connections_closed, func_metadata_cleared, type_metadata_cleared"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/admin/restart": {
+      "post": {
+        "tags": [
+          "ops"
+        ],
+        "summary": "Gracefully restart the gateway process (drain then exit)",
+        "description": "v0.18: the only correct way to apply changes that live outside a system's runtime state — .env values (SAP_API_KEY, SAP_LISTEN_ADDR, SAP_POOL_SIZE, SAP_REQUEST_TIMEOUT_SECS) or a different binary. Returns 202 immediately; the restart happens asynchronously. Sequence: /ready starts returning 503 with Retry-After for SAP_DRAIN_SECS seconds (default 5) while the listener keeps serving in-flight requests, then the process exits with code 0. The process only comes back if a supervisor restarts it (`start.sh` guard loop, launchd KeepAlive, systemd Restart=always, docker --restart). Started as a bare exec, it stays down — check the `warning` field in the response. For RFC signature changes use POST /api/admin/reload instead: it needs no restart and keeps the listener up. Scoped form: POST /api/s/{system}/admin/restart (the system segment is ignored — restart is process-wide).",
+        "responses": {
+          "202": {
+            "description": "Accepted: status=restarting, drain_secs, warning about supervisor requirement"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
     "/api/rfc": {
       "post": {
         "tags": [

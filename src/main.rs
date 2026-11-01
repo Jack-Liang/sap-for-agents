@@ -128,6 +128,9 @@ async fn run_client() -> Result<(), Box<dyn std::error::Error>> {
         version::init_sap_client(client);
     }
 
+    // 排空窗口下发到 server 模块（信号处理与 restart handler 都从那里读）
+    crate::server::set_drain_secs(cfg.drain_secs);
+
     let registry = match systems::build_registry(specs, &cfg) {
         Ok(r) => r,
         Err(e) => {
@@ -266,6 +269,25 @@ async fn wait_shutdown_signal() {
         _ = ctrl_c => tracing::info!("收到 Ctrl+C 信号"),
         _ = terminate => tracing::info!("收到 SIGTERM 信号"),
     }
+
+    // 排空窗口：先把 /ready 打成 503，但监听继续服务——给上游负载均衡器/前端
+    // 一个「摘流量 + 退避」的机会。直接关监听的话，调用方看到的是 ECONNREFUSED，
+    // 多数 HTTP 客户端对它不走重试逻辑，比 503 难处理得多。
+    let secs = crate::server::drain_secs();
+    if secs == 0 {
+        tracing::info!("排空已禁用（SAP_DRAIN_SECS=0），立即停机");
+        return;
+    }
+    // CAS：both 模式下信号被多处监听，只让第一个进入排空窗口
+    if !crate::server::begin_drain() {
+        return;
+    }
+    tracing::info!(
+        drain_secs = secs,
+        "/ready 已转 503 + Retry-After，排空窗口开始（监听仍在服务在途请求）"
+    );
+    tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
+    tracing::info!("排空结束，开始优雅停机");
 }
 
 /// 配置缺失时的友好引导。检测「无 .env 文件」这一典型场景，给出针对性步骤。

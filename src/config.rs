@@ -20,6 +20,9 @@ pub struct AppConfig {
     pub api_key: Option<String>,
     /// 单次 SAP 调用的全局超时（默认 60s，由 `SAP_REQUEST_TIMEOUT_SECS` 配置）
     pub request_timeout: std::time::Duration,
+    /// 停机排空窗口秒数（`SAP_DRAIN_SECS`，默认 5；0 = 收到信号立刻停机）。
+    /// 窗口内 `/ready` 返回 503 + `Retry-After`，监听继续服务，让上游摘流量。
+    pub drain_secs: u64,
     /// 可选限流（按 IP 的每秒请求数；None=不限流，由 `SAP_RATE_LIMIT_RPS` 配置，≥1）
     pub rate_limit_rps: Option<u32>,
     /// ADT REST 代理基地址（`SAP_ADT_BASE_URL`；未设 → 默认 `http://<ashost>:50000`，
@@ -122,6 +125,11 @@ pub fn load() -> Result<AppConfig, String> {
             .filter(|&n| n >= 1)
             .unwrap_or(60),
     );
+    // 停机排空窗口（默认 5s；0 = 禁用，收到信号立刻停机）
+    let drain_secs = env::var("SAP_DRAIN_SECS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(5);
     // 可选限流（按 IP 的每秒请求数；未设/0/非法 → None=不限流）
     let rate_limit_rps = env::var("SAP_RATE_LIMIT_RPS")
         .ok()
@@ -214,6 +222,7 @@ pub fn load() -> Result<AppConfig, String> {
         pool_idle_validate,
         api_key,
         request_timeout,
+        drain_secs,
         rate_limit_rps,
         adt_base_url,
         adt_user,

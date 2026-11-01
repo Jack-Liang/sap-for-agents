@@ -111,6 +111,30 @@ impl MetadataCache {
         }
     }
 
+    /// 全量清空缓存（`POST /api/admin/reload` 调用）。返回 (函数条数, 类型条数)。
+    ///
+    /// 场景：SAP 端改了某 RFC 的参数（增删改）后，网关既有的函数元数据与
+    /// 描述符全部过期。清空后下一次调用会重新向 SAP 拉取签名。
+    pub fn clear_all(&self) -> (usize, usize) {
+        let funcs = match self.func.write() {
+            Ok(mut map) => {
+                let n = map.len();
+                map.clear();
+                n
+            }
+            Err(_) => 0,
+        };
+        let types = match self.types.write() {
+            Ok(mut map) => {
+                let n = map.len();
+                map.clear();
+                n
+            }
+            Err(_) => 0,
+        };
+        (funcs, types)
+    }
+
     /// 获取某函数的元数据。命中缓存直接返回；未命中则从 SAP 拉取并缓存。
     pub fn get_metadata(
         &self,

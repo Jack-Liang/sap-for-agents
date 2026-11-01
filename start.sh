@@ -222,7 +222,6 @@ else
 fi
 echo ""
 
-# 6. 启动
 echo "=== 检查通过，启动服务 ==="
 echo ""
 
@@ -236,4 +235,33 @@ elif [ "$OS" = "linux" ]; then
     export LD_LIBRARY_PATH="$SDK_LIB_ABS:${LD_LIBRARY_PATH:-}"
 fi
 
-exec cargo run --release
+# 守护循环：`POST /api/admin/restart` 会 exit(0) 让进程退出，需要有人把它拉起来，
+# 否则一次「重启」就变成永久停机。循环让同一份脚本兼当 supervisor。
+# SAP_GUARD=off 退回单次 exec（退出即结束）——交给 launchd/systemd 兜底时用。
+if [ "${SAP_GUARD:-on}" = "off" ]; then
+    exec cargo run --release
+fi
+
+# 循环内要读子进程退出码，`set -e` 会让脚本在非 0 退出时直接中止
+set +e
+
+STOP=0
+RESTARTS=0
+trap 'STOP=1' INT TERM
+
+while [ "$STOP" -eq 0 ]; do
+    cargo run --release
+    RC=$?
+
+    # 收到 Ctrl+C / SIGTERM：不再重启（信号已透传给上面的服务，它会先排空再退）
+    if [ "$STOP" -ne 0 ]; then
+        echo ""
+        ok "服务已停止（本次运行周期内自动重启 $RESTARTS 次）"
+        break
+    fi
+
+    RESTARTS=$((RESTARTS + 1))
+    echo ""
+    warn "进程退出（code $RC），1 秒后自动重启（累计第 $RESTARTS 次）—— Ctrl+C 可停止"
+    sleep 1
+done

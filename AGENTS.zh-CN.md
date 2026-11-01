@@ -31,6 +31,8 @@ curl -H "Authorization: Bearer <SAP_API_KEY>" http://127.0.0.1:3000/api/function
 |------|-----------|
 | 网关还没配置过（首次启动）→ **引导式配置**：拿「该问用户什么」清单，采集后写入并热加载 | `GET /api/setup`（公开）→ `POST /api/setup/system` |
 | 新会话先**列系统清单**（多系统部署；单系统只返回一条——见下文「多系统」节） | `GET /api/systems`（公开） |
+| 你（或人在 SE37）**改了某个 RFC 的参数**，网关还在报旧签名 → 重载该系统运行态（不重启） | `POST /api/admin/reload`（或 `POST /api/s/{system}/admin/reload`） |
+| **改了 `.env` 或换了二进制**，需要进程真的重启（先排空再退出，由 supervisor 拉起） | `POST /api/admin/restart`（202；轮询 `/ready` 等它 503 → 200） |
 | 新会话先**查注册表**：Agent 建过哪些接口的跨会话记忆（别名、意图、踩坑记录、调用示例） | `GET /api/registry` |
 | 想发布/完善某个接口的契约（intent / notes / example） | `PUT /api/registry/{alias}` |
 | 外部系统/前端想调用注册接口且**免学 SAP 方言**（扁平 JSON 进出） | `POST /api/invokes/{alias}` |
@@ -127,6 +129,8 @@ curl http://127.0.0.1:3000/api/s/prd/ready                # 该系统的 readine
 - 平坦交付端口 `/api/invokes/{alias}` **按条目记录的 system 路由**（别名是全局命名空间）；显式作用域与条目不符 → `409 SYSTEM_MISMATCH`。`GET /api/registry?system=prd` 按系统过滤。
 - MCP 工具接受可选 `system` 参数（缺省 = 默认系统）。
 - 系统也可以**运行期追加**：`POST /api/setup/system` 校验 → 试连 → 追加进 `sap_systems.toml` → 热加载（见「首次启动引导」节）。无需重启；移除系统仍需编辑文件后重启。
+- SAP 端**改了 RFC 接口**（SE37 里增删改参数）会被缓存两层——SDK 按**连接**缓存描述符、网关按**函数名**缓存元数据。`POST /api/admin/reload` 把两层一起作废：连接池换代（空闲连接立刻关闭，借出中的归还即弃）+ 清空函数/DDIC 元数据缓存，下一次调用必然重连并从 SAP 重读签名。**Agent 或前端要做"重启"就调这个**——它不重启进程，也不重读 `.env` / `sap_systems.toml`。作用域形态 `POST /api/s/{system}/admin/reload`。响应：`system`、`connections_closed`、`func_metadata_cleared`、`type_metadata_cleared`。
+- 当改动落在系统运行态**之外**（`.env` 里的值、换了二进制）时，需要 `POST /api/admin/restart`。它**立刻返回 202**，重启异步发生：`/ready` 在 `SAP_DRAIN_SECS`（默认 5 秒）窗口内一律 **503 + `Retry-After`**，监听继续把在途请求跑完，窗口结束进程 `exit(0)`。**必须有 supervisor 才能自动恢复**（`start.sh` 守护循环 / launchd `KeepAlive` / systemd `Restart=always` / docker `--restart`）；裸 `exec` 启动的进程退出后不会回来。调用方的正确串法：POST → 收 202 → 轮询 `/ready` → 见 503（此时别发新业务）→ 见 200 → 恢复。`SIGTERM`/`SIGINT` 走同一条排空路径，所以普通 `kill` 也不会再甩给调用方 `ECONNREFUSED`，而是可重试的 503。
 - **同一系统不同 client**（同 ashost/sysnr、不同 `client`）完全支持：SAP 仓库对象跨 client、签名必然一致，各条目仍有独立的池 / ADT / 注册表命名空间。
 - 硬性限制：**不同后端**共用同一 SYSID（如经不同主机访问的克隆开发容器）会被隔离（`503 SYSTEM_SYSID_CONFLICT`）——SDK 描述符缓存按 SYSID 分区，跨后端的 SYSID 孪生会静默共享错误签名。
 

@@ -15,6 +15,7 @@ use crate::ffi::{
     RFC_ABAP_RUNTIME_FAILURE, RFC_CLOSED, RFC_COMMUNICATION_FAILURE, RFC_INVALID_HANDLE,
     RFC_LOGON_FAILURE, RFC_RC,
 };
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex};
 
 /// 触发「丢弃该连接」的 SAP 错误码集合。
@@ -64,6 +65,9 @@ const ACQUIRE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120)
 struct IdleConn {
     conn: RfcConnection,
     idle_since: std::time::Instant,
+    /// 连接所属的池代次（[`RfcConnectionPool::reload`] 递增）。借出时比对：
+    /// 落后代次的连接一律丢弃，保证 reload 后不会复用带旧函数描述符的连接。
+    epoch: u64,
 }
 
 /// 池的内部可变状态：空闲连接栈 + 当前总连接数。
@@ -86,6 +90,9 @@ pub struct RfcConnectionPool {
     max_size: usize,
     /// 空闲多久后借出前需先 `RFC_PING` 校验（< 阈值视为刚归还、直接借出）
     idle_validate_after: std::time::Duration,
+    /// 池代次：每次 [`Self::reload`] 递增，旧代次连接在借出/归还时被丢弃。
+    /// 用于 SAP 端函数接口变更后强制重建连接（重新加载函数描述符）。
+    epoch: AtomicU64,
     inner: Mutex<PoolInner>,
     /// 空闲连接可用时唤醒等待者
     cv: Condvar,
@@ -113,10 +120,12 @@ impl RfcConnectionPool {
             params,
             max_size,
             idle_validate_after,
+            epoch: AtomicU64::new(0),
             inner: Mutex::new(PoolInner {
                 idle: vec![IdleConn {
                     conn,
                     idle_since: std::time::Instant::now(),
+                    epoch: 0,
                 }],
                 total: 1,
             }),
@@ -140,6 +149,7 @@ impl RfcConnectionPool {
             params,
             max_size,
             idle_validate_after,
+            epoch: AtomicU64::new(0),
             inner: Mutex::new(PoolInner {
                 idle: vec![],
                 total: 0,
@@ -171,13 +181,17 @@ impl RfcConnectionPool {
 
         // None = 本轮需要取连接（首轮 acquire 复用池，重试轮 create 保证新鲜）
         let mut conn: Option<RfcConnection> = None;
+        // 手上连接所属的池代次：若期间发生 reload（换代），归还时直接丢弃，
+        // 避免旧连接（带旧函数描述符）重新入池污染后续调用。
+        let mut conn_epoch: u64 = 0;
         for attempt in 1..=MAX_ATTEMPTS {
             // 1) 确保手上有连接
             let c = match conn.take() {
                 Some(c) => c,
                 None => {
+                    conn_epoch = self.epoch.load(Ordering::SeqCst);
                     let got = if attempt == 1 {
-                        self.acquire() // 首轮：复用空闲或按需新建
+                        self.acquire(conn_epoch) // 首轮：复用空闲或按需新建
                     } else {
                         self.create_and_count() // 重试轮：保证新鲜，不碰空闲栈
                     };
@@ -202,7 +216,7 @@ impl RfcConnectionPool {
             // 2) 执行
             match f(&c) {
                 Ok(r) => {
-                    self.release(c);
+                    self.release(c, conn_epoch);
                     return Ok(r);
                 }
                 Err(e) if should_discard(&e) => {
@@ -221,7 +235,7 @@ impl RfcConnectionPool {
                 }
                 Err(e) => {
                     // 非通信错误（参数错/ABAP 业务异常）：连接仍健康，归还
-                    self.release(c);
+                    self.release(c, conn_epoch);
                     return Err(e);
                 }
             }
@@ -255,12 +269,22 @@ impl RfcConnectionPool {
     /// 业务请求拿到的永远是已确认可达的连接。校验失败 → 丢弃该连接，继续取下一个。
     ///
     /// 等待有总超时上限（ACQUIRE_TIMEOUT），避免池耗尽时调用方永久挂起。
-    fn acquire(&self) -> Result<RfcConnection, RfcError> {
+    ///
+    /// `epoch` 为调用方当前代次：栈里落后代次的连接（reload 之前建立的）
+    /// 直接丢弃后继续取，保证借出的连接一定属于当前代次。
+    fn acquire(&self, epoch: u64) -> Result<RfcConnection, RfcError> {
         let mut guard = self.inner.lock().map_err(|e| poison_err("连接池锁", e))?;
         let deadline = std::time::Instant::now() + ACQUIRE_TIMEOUT;
         loop {
             // 有空闲：pop 出来
             if let Some(entry) = guard.idle.pop() {
+                // 落后代次（reload 之前建连）：丢弃，不参与复用
+                if entry.epoch != epoch {
+                    drop(entry.conn);
+                    guard.total = guard.total.saturating_sub(1);
+                    self.cv.notify_one();
+                    continue;
+                }
                 // 刚归还不久：直接借出（热路径，不加 ping 开销）
                 if entry.idle_since.elapsed() < self.idle_validate_after {
                     return Ok(entry.conn);
@@ -321,15 +345,57 @@ impl RfcConnectionPool {
     }
 
     /// 归还健康连接到空闲栈（记录归还时刻，供借出时判断是否需校验），唤醒一个等待者。
-    fn release(&self, conn: RfcConnection) {
+    ///
+    /// `epoch` 为该连接借出时的代次：若期间发生 reload，这条连接已落后代次，
+    /// 直接关闭而不入池（下次调用必然重建、重新加载函数描述符）。
+    fn release(&self, conn: RfcConnection, epoch: u64) {
+        if epoch != self.epoch.load(Ordering::SeqCst) {
+            // 落后代次：关闭并腾出配额
+            drop(conn);
+            if let Ok(mut guard) = self.inner.lock() {
+                guard.total = guard.total.saturating_sub(1);
+            }
+            self.cv.notify_one();
+            return;
+        }
         if let Ok(mut guard) = self.inner.lock() {
             guard.idle.push(IdleConn {
                 conn,
                 idle_since: std::time::Instant::now(),
+                epoch,
             });
         }
         // 无论锁成功与否都唤醒（锁毒化时等待者会自行报错）
         self.cv.notify_one();
+    }
+
+    /// 连接池换代：让所有既有连接失效并返回**立刻**关闭的条数。
+    ///
+    /// 与 [`Self::drain_idle`] 的区别：drain 只清空闲栈，借出中的连接归还后
+    /// 仍会入池复用；换代则连它们也作废（归还时丢弃）。用于 SAP 端**函数接口
+    /// 本身变了**（参数增删改）之后——SDK 的函数描述符按连接缓存，只有重建
+    /// 连接才会重新向 SAP 拉取签名。
+    ///
+    /// 调用方随后应同时清理元数据缓存（`MetadataCache`），否则网关层仍会
+    /// 用旧签名构造请求。
+    pub fn reload(&self) -> usize {
+        let new_epoch = self.epoch.fetch_add(1, Ordering::SeqCst) + 1;
+        let dropped = match self.inner.lock() {
+            Ok(mut guard) => {
+                let taken = std::mem::take(&mut guard.idle);
+                guard.total = guard.total.saturating_sub(taken.len());
+                taken
+            }
+            Err(_) => return 0,
+        };
+        let n = dropped.len();
+        drop(dropped); // 显式 drop 触发连接关闭
+        tracing::info!(
+            epoch = new_epoch,
+            closed = n,
+            "连接池已换代（reload）：空闲连接立刻关闭，借出中的归还即弃"
+        );
+        n
     }
 
     /// 排干全部空闲连接（写钩子调用）。返回关闭的连接数。

@@ -24,8 +24,44 @@ use metrics::{counter, gauge, histogram};
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use std::net::IpAddr;
 use std::num::NonZeroU32;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
+
+/// 停机排空标志：置位后 `/ready` 一律 503 + `Retry-After`。
+///
+/// 为什么需要它：`with_graceful_shutdown` 一收到信号就**立即停止 accept**，
+/// 调用方看到的是 `ECONNREFUSED`——比 503 难处理得多（多数 HTTP 客户端
+/// 不走重试逻辑）。所以先置位本标志、监听继续服务一个窗口期，让上游负载
+/// 均衡器/前端有时间摘流量并退避，窗口结束后才真正关监听。
+static DRAINING: AtomicBool = AtomicBool::new(false);
+
+/// 排空窗口秒数（`SAP_DRAIN_SECS`，默认 5；0 = 关闭排空，收到信号立刻停机）。
+/// 用原子量而非 `AppConfig` 字段，是因为信号处理路径与 restart handler 都不持有配置。
+static DRAIN_SECS: AtomicU64 = AtomicU64::new(5);
+
+/// 标记进入排空态（`/ready` 转 503）。返回 `true` 表示本次是**首个**置位者。
+///
+/// 返回布尔值是为了在 `SAP_ROLE=both` 这类多处监听同一信号的场景下做 CAS，
+/// 避免两处都走进排空窗口（第二个监听者看到 `false` 应直接返回）。
+pub fn begin_drain() -> bool {
+    !DRAINING.swap(true, Ordering::SeqCst)
+}
+
+/// 当前是否处于排空态。
+pub fn is_draining() -> bool {
+    DRAINING.load(Ordering::SeqCst)
+}
+
+/// 排空窗口秒数；0 表示禁用排空。
+pub fn drain_secs() -> u64 {
+    DRAIN_SECS.load(Ordering::SeqCst)
+}
+
+/// 由启动期配置写入排空窗口（`SAP_DRAIN_SECS`）。
+pub fn set_drain_secs(secs: u64) {
+    DRAIN_SECS.store(secs, Ordering::SeqCst);
+}
 
 /// 全局共享状态：多系统注册表（每系统含连接池 + ADT 端点 + 元数据缓存）
 pub type SharedState = Arc<SystemRegistry>;
@@ -366,6 +402,12 @@ pub fn app(state: SharedState) -> Router {
         // 落盘 sap_systems.toml 并热加载；与业务面同守卫栈——鉴权/限流/
         // runtime/只读。GET /api/setup 挂公开侧）
         .route("/api/setup/system", post(crate::setup::add_handler))
+        // 运行时重载（v0.18）：让目标系统"像刚重启过"——连接池换代 + 清元数据。
+        // 前端在 SAP 端改完 RFC 参数后调一次即可让新签名生效，无需重启进程。
+        // 作用域形态 /api/s/{system}/admin/reload 由 ScopeService 自动映射。
+        .route("/api/admin/reload", post(admin_reload_handler))
+        // 进程级重启（与系统无关，但同样映射作用域形态，方便调用方统一前缀）。
+        .route("/api/admin/restart", post(admin_restart_handler))
         .layer(axum::middleware::from_fn(runtime_mode_guard))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
@@ -502,6 +544,71 @@ impl tower::Service<axum::extract::Request> for ScopeService {
 /// `GET /api/systems` —— 多系统清单（公开免鉴权）：Agent 会话第一步。
 /// name / 是否默认 / read_only / ADT 启用 / 已登记的 SYSID / 隔离状态。
 /// 未配置模式：count=0、default=null，指向 setup 引导。
+/// `POST /api/admin/reload`（作用域形态 `/api/s/{system}/admin/reload`）。
+///
+/// 让目标系统"像刚重启过"：**连接池换代**（空闲连接立刻关闭，借出中的归还
+/// 即弃）+ **清空函数/DDIC 元数据缓存**。用于 SAP 端改了 RFC 参数后让新签名
+/// 生效，而不必重启网关进程——监听不断、在途请求不受影响。
+///
+/// 语义边界（写清楚免得误用）：
+/// - ✅ 改 RFC 参数/表结构 → 调本端点即可
+/// - ❌ 改 `.env`（监听地址、API key、池大小）或 `sap_systems.toml`（连接参数、
+///   新系统）→ 仍须重启进程；多系统新增可用 `POST /api/setup/system` 热加载
+/// - 与 `read_only` 无关：不改 SAP 数据，只重置本端缓存（只读系统同样可用）
+async fn admin_reload_handler(sap: Sap) -> Result<Json<serde_json::Value>, RfcError> {
+    // 被隔离（SYSID 冲突）的系统不提供服务，也不允许借 reload 绕过检查
+    sap.check_available()?;
+    let report = sap.reload();
+    Ok(Json(serde_json::json!({
+        "status": "reloaded",
+        "system": report.system,
+        "connections_closed": report.connections_closed,
+        "func_metadata_cleared": report.func_metadata_cleared,
+        "type_metadata_cleared": report.type_metadata_cleared,
+        "note": "连接池已换代：新请求会重新拉取 RFC 签名；在途请求用旧连接跑完后丢弃。配置文件未重读。",
+    })))
+}
+
+/// `POST /api/admin/restart`（作用域形态 `/api/s/{system}/admin/restart`）。
+///
+/// 真·进程重启：先置排空态（`/ready` 立刻 503 + `Retry-After`），等
+/// `SAP_DRAIN_SECS` 窗口让上游摘流量、在途请求跑完，然后 `exit(0)`。
+///
+/// 与 `/api/admin/reload` 的分工：
+/// - reload：只换连接池 + 清元数据缓存，**监听不断**，够用于「SAP 端改 RFC 参数」
+/// - restart：连进程一起换，用于「改 `.env` / 换二进制」。代价是必须有 supervisor
+///   兜底拉起，否则进程退出后不再回来
+///
+/// 返回 202 是刻意的：重启是异步发生的，调用方不该等——拿到 202 就该转去轮询
+/// `/ready`，等它先 503 再 200。
+async fn admin_restart_handler() -> (axum::http::StatusCode, Json<serde_json::Value>) {
+    let secs = drain_secs();
+    tokio::spawn(async move {
+        // 先让 202 回到调用方，再置位——否则调用方可能拿到连接中断而非正常响应
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        begin_drain();
+        tracing::info!(
+            drain_secs = secs,
+            "restart 请求：进入排空态，/ready 已转 503（在途请求继续完成）"
+        );
+        if secs > 0 {
+            tokio::time::sleep(Duration::from_secs(secs)).await;
+        }
+        tracing::info!("restart 请求：排空结束，进程退出（等待 supervisor 拉起）");
+        std::process::exit(0);
+    });
+
+    (
+        axum::http::StatusCode::ACCEPTED,
+        Json(serde_json::json!({
+            "status": "restarting",
+            "drain_secs": secs,
+            "note": "已进入排空态：/ready 立刻返回 503 + Retry-After，在途请求继续完成；窗口结束后进程退出。",
+            "warning": "进程须由 supervisor 拉起才会自动恢复（start.sh 守护循环 / launchd KeepAlive / systemd Restart=always）。",
+        })),
+    )
+}
+
 async fn systems_handler(
     axum::extract::State(state): axum::extract::State<SharedState>,
 ) -> Json<serde_json::Value> {
@@ -741,7 +848,26 @@ async fn version_handler(
 ///
 /// 超时后 `spawn_blocking` 内的 ping 仍会跑完（无法取消），但 ping 本身很快；
 /// 最坏占用一个连接几秒，探针频率（默认 10s）下可接受。
-async fn ready_handler(sap: Sap) -> (axum::http::StatusCode, Json<serde_json::Value>) {
+async fn ready_handler(sap: Sap) -> axum::response::Response {
+    // 排空态优先于 SAP 探测：此刻进程还没退，但马上要退——直接给可重试信号。
+    // 不探 SAP 是有意的：这一秒内的探测结果对调用方没有决策价值，只会拖慢响应。
+    if is_draining() {
+        let retry_after = drain_secs().max(1);
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            [(
+                axum::http::header::RETRY_AFTER,
+                retry_after.to_string(),
+            )],
+            Json(serde_json::json!({
+                "status": "draining",
+                "retry_after_secs": retry_after,
+                "message": "网关正在重启（排空窗口），请退避后重试；在途请求不受影响",
+            })),
+        )
+            .into_response();
+    }
+
     const READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
     let ping =
@@ -768,6 +894,7 @@ async fn ready_handler(sap: Sap) -> (axum::http::StatusCode, Json<serde_json::Va
             })),
         ),
     }
+    .into_response()
 }
 
 /// GET /agents.md —— 返回嵌入的 AGENTS.md（供 AI/Agent 读取）
@@ -3034,6 +3161,7 @@ mod tests {
             pool_idle_validate: Duration::from_secs(30),
             api_key: None,
             request_timeout: Duration::from_secs(5),
+            drain_secs: 5,
             rate_limit_rps: None,
             adt_base_url: None,
             adt_user: String::new(),
@@ -3219,6 +3347,7 @@ mod tests {
             pool_idle_validate: Duration::from_secs(30),
             api_key: None,
             request_timeout: Duration::from_secs(5),
+            drain_secs: 5,
             rate_limit_rps: None,
             adt_base_url: None,
             adt_user: String::new(),

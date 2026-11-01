@@ -563,6 +563,7 @@ mod tests {
             pool_idle_validate: Duration::from_secs(30),
             api_key: None,
             request_timeout: Duration::from_secs(5),
+            drain_secs: 5,
             rate_limit_rps: None,
             adt_base_url: None,
             adt_user: String::new(),

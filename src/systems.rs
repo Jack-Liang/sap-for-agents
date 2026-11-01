@@ -393,7 +393,48 @@ pub struct SystemHandle {
     pub sap_info: tokio::sync::RwLock<Option<Arc<crate::connection::RemoteSystemInfo>>>,
 }
 
+/// 单系统的 reload 结果（`POST /api/admin/reload` 响应体）。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ReloadReport {
+    /// 系统名（URL 段）
+    pub system: String,
+    /// 换代时立刻关闭的空闲连接数（借出中的连接会在归还时关闭，不计入）
+    pub connections_closed: usize,
+    /// 清掉的函数元数据条数
+    pub func_metadata_cleared: usize,
+    /// 清掉的 DDIC 类型元数据条数
+    pub type_metadata_cleared: usize,
+}
+
 impl SystemHandle {
+    /// 让该系统"像刚重启过"：连接池换代 + 清空元数据缓存。
+    ///
+    /// 场景：SAP 端改了某 RFC 的参数（增删改）。两处缓存会让人以为"必须重启
+    /// 网关"——SDK 的函数描述符按**连接**缓存，网关自己的 [`MetadataCache`]
+    /// 又按**函数名**缓存。这里把两者一起作废，且**不需要重启进程**：
+    /// 监听端口不变、在途请求用旧连接跑完（归还时丢弃），新请求必然拿到
+    /// 新建连接、重新向 SAP 拉取签名。
+    ///
+    /// 注意：只影响运行时状态，不重读 `.env` / `sap_systems.toml`。
+    /// 改配置（监听地址、API key、连接参数）仍需进程重启。
+    pub fn reload(&self) -> ReloadReport {
+        let connections_closed = self.pool.reload();
+        let (func_metadata_cleared, type_metadata_cleared) = self.meta.clear_all();
+        tracing::info!(
+            system = %self.name,
+            connections_closed,
+            func_metadata_cleared,
+            type_metadata_cleared,
+            "系统已 reload：连接池换代 + 元数据清空（RFC 签名变更生效）"
+        );
+        ReloadReport {
+            system: self.name.clone(),
+            connections_closed,
+            func_metadata_cleared,
+            type_metadata_cleared,
+        }
+    }
+
     /// 已登记的 SYSID（未知时 None——系统尚未成功连过）。
     pub fn sysid(&self) -> Option<String> {
         self.sysid.get().cloned()
@@ -822,6 +863,7 @@ mod tests {
             pool_idle_validate: Duration::from_secs(30),
             api_key: None,
             request_timeout: Duration::from_secs(60),
+            drain_secs: 5,
             rate_limit_rps: None,
             adt_base_url: Some("http://h:50000".into()),
             adt_user: "U".into(),
