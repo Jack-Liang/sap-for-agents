@@ -124,7 +124,8 @@ curl http://127.0.0.1:3000/api/s/a4h/dumps/grouped
 curl http://127.0.0.1:3000/api/s/prd/ready                # that system's readiness
 ```
 
-- Start a session with `GET /api/systems` — it lists each system (`name`, whether `default`, `read_only`, `adt`, `sysid`, `quarantined`). On a single-system deployment it returns one entry and you can ignore scoping entirely.
+- Start a session with `GET /api/systems` — it lists each system (`name`, whether `default`, `read_only`, `adt`, `sysid`, `quarantined`, plus connection status `connected` / `connect_error` from the 60s probe). On a single-system deployment it returns one entry and you can ignore scoping entirely.
+- **The gateway always starts, even when SAP is unreachable** (v0.19: every system connects lazily — no startup fail-fast). Connection problems surface as degraded status instead of a dead process: `GET /api/systems` shows `connected:false` + `connect_error`, `/ready` returns 503 (strict, for load balancers), the home page shows an amber banner with the failing systems' errors, and business calls to an unreachable system return **503 `SYSTEM_UNREACHABLE`** with the original RFC detail. Recovery is automatic: the 60s probe flips status back, business calls retry on demand. Only real config-shape errors (toml syntax, missing default) still abort startup.
 - Unknown system name → `404 SYSTEM_UNKNOWN` (the error lists valid names). Compare objects across systems by calling the same read endpoint under two scopes (e.g. `/api/functions/ZFOO/source` on `a4h` vs `prd`) and diffing.
 - Flat delivery port `/api/invokes/{alias}` is **routed by the entry's recorded `system`** (aliases are global); an explicit scope that disagrees with the entry returns `409 SYSTEM_MISMATCH`. `GET /api/registry?system=prd` filters entries.
 - MCP tools accept an optional `system` argument (default = default system).

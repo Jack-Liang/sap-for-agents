@@ -186,6 +186,18 @@ tailwind.config = {
         </div>
     </div>
 
+    <!-- Connection banner: shown when the gateway is up but SAP system(s) are unreachable.
+         Gateway always starts (all systems connect lazily) — this is the degraded-state notice. -->
+    <div id="conn-banner" class="mb-gutter p-md rounded-xl border" style="display:none;background:rgba(255,171,0,0.08);border-color:#ffa000">
+        <div class="flex items-center gap-md">
+            <span class="material-symbols-outlined" style="color:#b26a00" aria-hidden="true">cloud_off</span>
+            <div class="min-w-0">
+                <div id="conn-banner-title" class="font-body-md text-body-md font-semibold" style="color:#8a5300">Gateway is running · SAP connection issue(s)</div>
+                <div id="conn-banner-body" class="font-body-sm text-body-sm mt-xs" style="color:#b26a00"></div>
+            </div>
+        </div>
+    </div>
+
     <div class="bento-grid">
 
         <!-- Agent Card -->
@@ -394,23 +406,56 @@ tailwind.config = {
 </footer>
 
 <script>
-// Dynamic status indicator: probes /ready to reflect real SAP reachability, refreshed every 30s
+// Dynamic status indicator: probes /ready (plus /api/systems for per-system detail),
+// refreshed every 30s. Three states: ready (green) / running-but-degraded (amber,
+// with the failing systems' connect_error) / probe failed (red, gateway itself down).
 async function refreshStatus() {
     const dot = document.getElementById('status-dot');
     const txt = document.getElementById('status-text');
+    const banner = document.getElementById('conn-banner');
     if (!dot || !txt) return;
+    const showBanner = (on, title, body) => {
+        if (!banner) return;
+        banner.style.display = on ? '' : 'none';
+        if (on && title) document.getElementById('conn-banner-title').textContent = title;
+        if (on && body !== undefined) document.getElementById('conn-banner-body').innerHTML = body;
+    };
     try {
         const r = await fetch('/ready');
         if (r.ok) {
             dot.className = 'w-2 h-2 rounded-full bg-green-500';
             txt.textContent = 'System Ready';
-        } else {
-            dot.className = 'w-2 h-2 rounded-full bg-red-500';
-            txt.textContent = 'SAP unreachable';
+            showBanner(false);
+            return;
         }
+        // Gateway is up (it answers) but SAP is not reachable — explain per system
+        dot.className = 'w-2 h-2 rounded-full bg-amber-500';
+        txt.textContent = 'SAP connection issue(s)';
+        let body = '';
+        try {
+            const sys = await (await fetch('/api/systems')).json();
+            if (!sys.count) {
+                showBanner(true, 'No SAP system configured', 'Open <a class="underline" href="/setup">/setup</a> for guided setup');
+                return;
+            }
+            const bad = (sys.systems || []).filter(s => !s.connected);
+            if (bad.length) {
+                body = bad.map(s => {
+                    const err = (s.connect_error || 'not connected yet').replace(/&/g, '&amp;').replace(/</g, '&lt;');
+                    const tag = s.default ? ' (default)' : '';
+                    return '<div class="truncate" title="' + err.replace(/"/g, '&quot;') + '">' + s.name + tag + ' — ' + err + '</div>';
+                }).join('');
+            } else {
+                body = 'Default system is not responding right now — see /api/systems for details';
+            }
+        } catch (_) {
+            body = 'Per-system status unavailable — see /api/systems';
+        }
+        showBanner(true, 'Gateway is running · SAP connection issue(s)', body);
     } catch (_) {
         dot.className = 'w-2 h-2 rounded-full bg-red-500';
         txt.textContent = 'Probe failed';
+        showBanner(false);
     }
 }
 refreshStatus();

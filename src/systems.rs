@@ -389,6 +389,10 @@ pub struct SystemHandle {
     sysid: OnceLock<String>,
     /// SYSID 与其他**后端**冲突 → 隔离（请求 503 SYSTEM_SYSID_CONFLICT）
     quarantined: AtomicBool,
+    /// 最近一次连接失败的原因（探测任务维护；None = 最近一轮探测成功或尚未探测过）。
+    /// 所有系统一律惰性连接，本字段就是「连接异常」状态的载体——`/api/systems`
+    /// 的 `connected` / `connect_error` 与首页状态区都从这里取数。
+    last_connect_error: std::sync::RwLock<Option<String>>,
     /// `/api/version` 的懒加载系统信息缓存（生命周期内不变，失败不缓存）
     pub sap_info: tokio::sync::RwLock<Option<Arc<crate::connection::RemoteSystemInfo>>>,
 }
@@ -486,6 +490,32 @@ impl SystemHandle {
     /// 是否因 SYSID 冲突被隔离。
     pub fn is_quarantined(&self) -> bool {
         self.quarantined.load(Ordering::SeqCst)
+    }
+
+    /// 最近一次连接失败的原因（探测任务维护；None = 最近一轮成功或尚未探测）。
+    pub fn connect_error(&self) -> Option<String> {
+        self.last_connect_error.read().ok()?.clone()
+    }
+
+    /// 写入/清除连接失败原因（探测任务与调用期上报共用）。超长截断到 300 字符，
+    /// 避免整段 RFC 栈回灌进状态面 JSON。
+    pub fn set_connect_error(&self, err: Option<String>) {
+        let truncated = err.map(|mut e| {
+            if e.len() > 300 {
+                e.truncate(300);
+                e.push('…');
+            }
+            e
+        });
+        if let Ok(mut slot) = self.last_connect_error.write() {
+            *slot = truncated;
+        }
+    }
+
+    /// 连接状态：最近一轮探测成功（从未连上过 → false）。
+    /// 探测间隔（60s）内的瞬时断连要等下一轮才反映——页面状态以此为准。
+    pub fn connected(&self) -> bool {
+        self.sysid().is_some() && self.connect_error().is_none()
     }
 
     /// 隔离检查：被隔离的系统拒绝服务（给出明确出路而非静默错数据）。
@@ -668,38 +698,22 @@ fn build_adt(spec: &SystemSpec, timeout: Duration) -> Option<crate::adt::AdtEndp
 }
 
 /// 组装单个系统运行句柄（启动装配与 setup 热加载共用）。
-/// `eager` = 立即建首连（仅启动期默认系统用，密码错启动即炸的 fail-fast）；
-/// 惰性池不触 FFI，不可达交给调用期重试。
-pub(crate) fn make_handle(
-    spec: &SystemSpec,
-    cfg: &AppConfig,
-    eager: bool,
-) -> Result<Arc<SystemHandle>, String> {
+/// 一律惰性池：不触 FFI、启动永不因 SAP 不可达而失败；可达性交给探测任务
+/// （写 [`SystemHandle::last_connect_error`] 供状态面展示）与调用期按需重试。
+pub(crate) fn make_handle(spec: &SystemSpec, cfg: &AppConfig) -> Arc<SystemHandle> {
     let pool_size = spec.pool_size.unwrap_or(cfg.pool_size);
     let idle_validate = spec.idle_validate.unwrap_or(cfg.pool_idle_validate);
     let request_timeout = spec.request_timeout.unwrap_or(cfg.request_timeout);
     let read_only = spec.read_only.unwrap_or(cfg.read_only);
 
-    let pool = if eager {
-        Arc::new(
-            RfcConnectionPool::with_max_size(spec.conn_params.clone(), pool_size, idle_validate)
-                .map_err(|e| {
-                    format!(
-                        "默认系统 {} 建立连接失败: {} ({})",
-                        spec.name, e.message, e.key
-                    )
-                })?,
-        )
-    } else {
-        Arc::new(RfcConnectionPool::lazy(
-            spec.conn_params.clone(),
-            pool_size,
-            idle_validate,
-        ))
-    };
+    let pool = Arc::new(RfcConnectionPool::lazy(
+        spec.conn_params.clone(),
+        pool_size,
+        idle_validate,
+    ));
     let adt = build_adt(spec, request_timeout);
 
-    Ok(Arc::new(SystemHandle {
+    Arc::new(SystemHandle {
         name: spec.name.clone(),
         pool,
         adt,
@@ -709,44 +723,26 @@ pub(crate) fn make_handle(
         backend: backend_key(&spec.conn_params),
         sysid: OnceLock::new(),
         quarantined: AtomicBool::new(false),
+        last_connect_error: std::sync::RwLock::new(None),
         sap_info: tokio::sync::RwLock::new(None),
-    }))
+    })
 }
 
-/// 组装运行态注册表。默认系统急切建首连（失败即返回错误——保留单系统部署
-/// "密码错启动即炸"的 fail-fast）；其余系统惰性，可达性交给探测任务。
+/// 组装运行态注册表。所有系统一律惰性池——**SAP 连不上也不阻止启动**，
+/// 可达性交给探测任务（`spawn_probe_loop`）与调用期按需建连。
 /// 空集合合法（未配置模式，default = None）。
-pub fn build_registry(specs: Vec<SystemSpec>, cfg: &AppConfig) -> Result<SystemRegistry, String> {
-    build_registry_inner(specs, cfg, true)
-}
-
-/// 全惰性组装（不触 FFI）：路由级单测在无 SAP SDK 环境下构造 app() 用。
-/// 生产路径走 [`build_registry`]（默认系统急切）。
-// 非 test 构建无调用方（测试代码在 cfg(test) 里，非测试编译看不到）
-#[cfg_attr(not(test), allow(dead_code))]
-pub fn build_registry_all_lazy(
-    specs: Vec<SystemSpec>,
-    cfg: &AppConfig,
-) -> Result<SystemRegistry, String> {
-    build_registry_inner(specs, cfg, false)
-}
-
-fn build_registry_inner(
-    specs: Vec<SystemSpec>,
-    cfg: &AppConfig,
-    eager_default: bool,
-) -> Result<SystemRegistry, String> {
+pub fn build_registry(specs: Vec<SystemSpec>, cfg: &AppConfig) -> SystemRegistry {
     let mut systems = HashMap::with_capacity(specs.len());
     let mut order = Vec::with_capacity(specs.len());
     let mut default = None;
 
     for spec in specs {
-        let handle = make_handle(&spec, cfg, spec.is_default && eager_default)?;
+        let handle = make_handle(&spec, cfg);
         tracing::info!(
             system = %spec.name,
             default = spec.is_default,
             read_only = spec.read_only.unwrap_or(cfg.read_only),
-            "系统已配置"
+            "系统已配置（惰性连接，可达性由探测任务与调用期上报）"
         );
         if spec.is_default {
             default = Some(Arc::clone(&handle));
@@ -758,18 +754,19 @@ fn build_registry_inner(
     // load_specs 校验保证非空集合恰有一个默认系统；空集合 = 未配置模式
     debug_assert!(default.is_some() || order.is_empty());
 
-    Ok(SystemRegistry {
+    SystemRegistry {
         inner: std::sync::RwLock::new(RegistryInner {
             systems,
             order,
             default,
         }),
         cfg: cfg.clone(),
-    })
+    }
 }
 
 /// 启动期探测任务：逐系统（并行）建连取 SYSID 并登记。
-/// 默认系统急切池里已有连接，这一步同时是「其余系统可达性」的首次体检；
+/// 所有系统均为惰性池，这一步是「可达性」的首次体检，结果写入
+/// [`SystemHandle::last_connect_error`]（`/api/systems` 与首页状态区取数）；
 /// 只 warn 不阻塞——探测失败留给调用期错误上报。
 pub async fn probe_all(registry: Arc<SystemRegistry>) {
     let probes: Vec<_> = registry
@@ -802,17 +799,23 @@ pub async fn probe_all(registry: Arc<SystemRegistry>) {
                                 "系统探测成功"
                             );
                         }
+                        sys.set_connect_error(None);
                     }
                     Ok(Ok(Err(e))) => {
                         tracing::warn!(
                             system = %sys.name,
                             msg = %e.message,
-                            "系统探测失败（不影响网关监听，调用期将重试建连）"
+                            "系统暂不可达（不影响网关监听；探测任务与调用期都会按需重试）"
                         );
+                        sys.set_connect_error(Some(e.message));
                     }
-                    Ok(Err(join)) => tracing::warn!(system = %sys.name, %join, "探测任务 join 失败"),
+                    Ok(Err(join)) => {
+                        tracing::warn!(system = %sys.name, %join, "探测任务 join 失败");
+                        sys.set_connect_error(Some(format!("探测任务失败: {join}")));
+                    }
                     Err(_) => {
-                        tracing::warn!(system = %sys.name, "系统探测超时（5s，不影响网关监听）")
+                        tracing::warn!(system = %sys.name, "系统探测超时（5s，不影响网关监听）");
+                        sys.set_connect_error(Some("连接超时（探测 5s 无响应）".into()));
                     }
                 }
             })
@@ -820,6 +823,16 @@ pub async fn probe_all(registry: Arc<SystemRegistry>) {
         .collect();
     for p in probes {
         let _ = p.await;
+    }
+}
+
+/// 周期探测循环：首轮立即，之后每轮间隔 `interval`（生产用 60s）重跑
+/// [`probe_all`]。连接状态（`connected` / `connect_error`、首页指示）靠它
+/// 自动翻新——SAP 恢复后的一个周期内页面就会转绿，无需任何手动操作。
+pub async fn probe_loop(registry: Arc<SystemRegistry>, interval: Duration) {
+    loop {
+        probe_all(Arc::clone(&registry)).await;
+        tokio::time::sleep(interval).await;
     }
 }
 
@@ -938,7 +951,7 @@ mod tests {
         let cfg = test_cfg(vec![]);
         let specs = load_specs(&cfg).unwrap();
         assert!(specs.is_empty(), "未配置模式应得到空系统集合");
-        let reg = build_registry_all_lazy(specs, &cfg).unwrap();
+        let reg = build_registry(specs, &cfg);
         assert!(reg.default().is_none(), "空注册表无默认系统");
         assert!(reg.names().is_empty());
 
@@ -946,7 +959,7 @@ mod tests {
         let file: SystemsFile = toml::from_str(toml).unwrap();
         let (name, raw) = file.systems.iter().next().unwrap();
         let spec = build_spec(name, raw).unwrap();
-        let handle = make_handle(&spec, &cfg, false).unwrap();
+        let handle = make_handle(&spec, &cfg);
         reg.add_system(handle, false); // 即便 make_default=false，无默认时也提升
         assert_eq!(reg.default().unwrap().name, "a4h");
         assert!(reg.resolve("a4h").is_some());
@@ -958,9 +971,38 @@ mod tests {
         let file2: SystemsFile = toml::from_str(toml2).unwrap();
         let (name2, raw2) = file2.systems.iter().next().unwrap();
         let spec2 = build_spec(name2, raw2).unwrap();
-        reg.add_system(make_handle(&spec2, &cfg, false).unwrap(), true);
+        reg.add_system(make_handle(&spec2, &cfg), true);
         assert_eq!(reg.default().unwrap().name, "prd");
         assert_eq!(reg.names().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn unreachable_system_starts_and_reports_connect_error() {
+        // 全惰性（v0.19）：连不上的系统照常组装注册表，探测失败写入
+        // connect_error（/api/systems 与首页状态区取数）——v0.16-0.18 的
+        // 「默认系统连不上 → 启动即退出」行为就此终结。
+        let cfg = test_cfg(vec![
+            ("ASHOST", "127.0.0.1".into()),
+            ("SYSNR", "00".into()),
+            ("CLIENT", "001".into()),
+            ("USER", "u".into()),
+            ("PASSWD", "p".into()),
+        ]);
+        let spec = synth_from_env(&cfg);
+        assert!(spec.is_default);
+        let reg = Arc::new(build_registry(vec![spec], &cfg));
+        let d = reg.default().unwrap().clone();
+        assert!(!d.connected(), "从未连上 → connected=false");
+
+        // 探测走真实 FFI 连接：127.0.0.1:3300 无监听 → 立即拒绝，不挂起
+        probe_all(Arc::clone(&reg)).await;
+        assert!(!d.connected());
+        let err = d.connect_error();
+        assert!(err.is_some(), "探测失败应留下 connect_error 供状态面展示");
+        assert!(
+            !err.unwrap().is_empty(),
+            "connect_error 应携带可读的失败原因"
+        );
     }
 
     #[test]
@@ -1135,6 +1177,7 @@ ashost = "h"
             backend: backend_key(&params),
             sysid: OnceLock::new(),
             quarantined: AtomicBool::new(false),
+            last_connect_error: std::sync::RwLock::new(None),
             sap_info: tokio::sync::RwLock::new(None),
         }
     }

@@ -138,8 +138,9 @@ impl RfcConnectionPool {
 
     /// 惰性创建池：不建立首连，首个 `acquire` 时按需新建。
     ///
-    /// 多系统场景下非默认系统用此构造——目标系统暂时不可达不应阻止网关
-    /// 启动监听；可达性交给启动探测任务与调用期错误上报。附带收益：
+    /// v0.19 起**所有系统**（含默认系统）都用此构造——SAP 连不上不阻止网关
+    /// 启动监听；可达性交给周期探测任务（写 `connect_error` 供状态面展示）
+    /// 与调用期按需建连（失败返回 503 SYSTEM_UNREACHABLE）。附带收益：
     /// 构造不触 FFI，路由级单测可在无 SAP SDK 的 CI stub 环境下构造 app()。
     pub fn lazy(
         params: Vec<(&'static str, String)>,
@@ -255,8 +256,18 @@ impl RfcConnectionPool {
     }
 
     /// 新建连接并计入总数（借出状态）。失败时计数不动（未建成就不存在）。
+    ///
+    /// 建连失败统一包装为 HTTP 503 + key `SYSTEM_UNREACHABLE`（对齐未配置模式的
+    /// `SYSTEM_NOT_CONFIGURED` 语义）：所有系统都是惰性连接，目标暂时不可达是
+    /// 预期内的降级态而非网关故障，调用方拿到可重试的状态码 + 原始 RFC 详情。
     fn create_and_count(&self) -> Result<RfcConnection, RfcError> {
-        let conn = self.create_connection()?;
+        let conn = self.create_connection().map_err(|e| RfcError {
+            code: e.code,
+            status: 503,
+            key: "SYSTEM_UNREACHABLE".into(),
+            message: format!("目标系统当前不可达，请稍后重试（连接失败: {}）", e.message),
+            ..Default::default()
+        })?;
         if let Ok(mut guard) = self.inner.lock() {
             guard.total += 1;
         }

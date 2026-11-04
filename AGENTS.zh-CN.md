@@ -124,7 +124,8 @@ curl http://127.0.0.1:3000/api/s/a4h/dumps/grouped
 curl http://127.0.0.1:3000/api/s/prd/ready                # 该系统的 readiness
 ```
 
-- 会话第一步 `GET /api/systems`：列出各系统（`name`、是否 `default`、`read_only`、`adt`、`sysid`、`quarantined`）。单系统部署只返回一条，忽略作用域即可。
+- 会话第一步 `GET /api/systems`：列出各系统（`name`、是否 `default`、`read_only`、`adt`、`sysid`、`quarantined`，以及连接状态 `connected`/`connect_error`——来自 60s 周期探测）。单系统部署只返回一条，忽略作用域即可。
+- **SAP 连不上网关照样启动**（v0.19：所有系统一律惰性连接，取消启动期 fail-fast）。连接问题以降级状态呈现而不是进程死亡：`GET /api/systems` 显示 `connected:false` + `connect_error`，`/ready` 返回 503（保持严格，供负载均衡摘流），首页显示琥珀色横幅并列出失败系统的错误，对不可达系统的业务调用返回 **503 `SYSTEM_UNREACHABLE`**（附原始 RFC 详情）。恢复全自动：60s 探测翻回状态，业务调用按需重试。只有真正的配置形状错误（toml 语法、缺默认系统）仍会让启动中止。
 - 未知系统名 → `404 SYSTEM_UNKNOWN`（错误里附可用清单）。**跨系统对比对象**：同一读取端点换两个作用域各调一次（如 `/api/functions/ZFOO/source` 分别在 a4h 与 prd 下），对结果做 diff。
 - 平坦交付端口 `/api/invokes/{alias}` **按条目记录的 system 路由**（别名是全局命名空间）；显式作用域与条目不符 → `409 SYSTEM_MISMATCH`。`GET /api/registry?system=prd` 按系统过滤。
 - MCP 工具接受可选 `system` 参数（缺省 = 默认系统）。

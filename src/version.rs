@@ -44,63 +44,77 @@ pub async fn gateway_info(state: &SharedState) -> Value {
     let mut out = local_info();
     // latest 与 SAP 块独立：任一不可用不影响另一个
     out["latest"] = latest_json().await;
-    match state.default() {
-        Some(default) => match fetch_cached_sap_info(&default).await {
-            Ok(info) => {
-                out["sap"] = sap_info_json(&info, SAP_CLIENT.get().cloned().unwrap_or_default());
-            }
-            Err(e) => {
-                out["sap"] = Value::Null;
-                out["sap_error"] = json!(e.message);
-            }
-        },
-        // 未配置模式：不是 SAP 故障，是还没有任何系统——指路 setup 引导
-        None => {
-            out["sap"] = Value::Null;
-            out["sap_error"] =
-                json!("网关未配置任何 SAP 系统（未配置模式）；引导式配置见 GET /api/setup");
+
+    // 默认系统的 sap 块与全量 systems 块**并行**取数：目标系统"握手挂起"型
+    // 不可达（VPN 半开等）会把每次取数拖满 10s 超时，串行要 20s——自描述
+    // 端点必须快，join 后整体仍 ≤10s。
+    let default_for_sap = state.default();
+    let default_for_list = state.default();
+    let sap_block = async {
+        match default_for_sap {
+            Some(default) => match fetch_cached_sap_info(&default).await {
+                Ok(info) => (
+                    sap_info_json(&info, SAP_CLIENT.get().cloned().unwrap_or_default()),
+                    Value::Null,
+                ),
+                Err(e) => (Value::Null, json!(e.message)),
+            },
+            // 未配置模式：不是 SAP 故障，是还没有任何系统——指路 setup 引导
+            None => (
+                Value::Null,
+                json!("网关未配置任何 SAP 系统（未配置模式）；引导式配置见 GET /api/setup"),
+            ),
         }
-    }
-    // 全量系统块：并行取各系统信息（每系统首取 ≤10s，并行后整体 ≤10s）
-    let handles = state.list();
-    let default = state.default();
-    let infos = futures_join_all(handles).await;
-    let mut systems = serde_json::Map::new();
-    for (sys, info) in infos {
-        let is_default = default.as_ref().is_some_and(|d| Arc::ptr_eq(&sys, d));
-        match info {
-            Ok(i) => {
-                systems.insert(
-                    sys.name.clone(),
-                    json!({
-                        "default": is_default,
-                        "read_only": sys.read_only,
-                        "adt": sys.adt.is_some(),
-                        "quarantined": sys.is_quarantined(),
-                        "sysid": i.sysid,
-                        "release": i.release,
-                        "host": i.host,
-                        "os": i.os,
-                        "destination": i.destination,
-                    }),
-                );
-            }
-            Err(e) => {
-                systems.insert(
-                    sys.name.clone(),
-                    json!({
-                        "default": is_default,
-                        "read_only": sys.read_only,
-                        "adt": sys.adt.is_some(),
-                        "quarantined": sys.is_quarantined(),
-                        "sysid": sys.sysid(),
-                        "sap_error": e.message,
-                    }),
-                );
+    };
+    let systems_block = async {
+        // 全量系统块：并行取各系统信息（每系统首取 ≤10s，并行后整体 ≤10s）
+        let handles = state.list();
+        let infos = futures_join_all(handles).await;
+        let mut systems = serde_json::Map::new();
+        for (sys, info) in infos {
+            let is_default = default_for_list
+                .as_ref()
+                .is_some_and(|d| Arc::ptr_eq(&sys, d));
+            match info {
+                Ok(i) => {
+                    systems.insert(
+                        sys.name.clone(),
+                        json!({
+                            "default": is_default,
+                            "read_only": sys.read_only,
+                            "adt": sys.adt.is_some(),
+                            "quarantined": sys.is_quarantined(),
+                            "sysid": i.sysid,
+                            "release": i.release,
+                            "host": i.host,
+                            "os": i.os,
+                            "destination": i.destination,
+                        }),
+                    );
+                }
+                Err(e) => {
+                    systems.insert(
+                        sys.name.clone(),
+                        json!({
+                            "default": is_default,
+                            "read_only": sys.read_only,
+                            "adt": sys.adt.is_some(),
+                            "quarantined": sys.is_quarantined(),
+                            "sysid": sys.sysid(),
+                            "sap_error": e.message,
+                        }),
+                    );
+                }
             }
         }
+        Value::Object(systems)
+    };
+    let ((sap_value, sap_error), systems) = tokio::join!(sap_block, systems_block);
+    out["sap"] = sap_value;
+    if !sap_error.is_null() {
+        out["sap_error"] = sap_error;
     }
-    out["systems"] = Value::Object(systems);
+    out["systems"] = systems;
     out
 }
 

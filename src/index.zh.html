@@ -187,6 +187,18 @@ tailwind.config = {
         </div>
     </div>
 
+    <!-- 连接横幅：网关已启动但 SAP 系统不可达时显示。
+         所有系统惰性连接、网关永远起得来——这里是降级状态的说明区。 -->
+    <div id="conn-banner" class="mb-gutter p-md rounded-xl border" style="display:none;background:rgba(255,171,0,0.08);border-color:#ffa000">
+        <div class="flex items-center gap-md">
+            <span class="material-symbols-outlined" style="color:#b26a00" aria-hidden="true">cloud_off</span>
+            <div class="min-w-0">
+                <div id="conn-banner-title" class="font-body-md text-body-md font-semibold" style="color:#8a5300">网关已启动 · SAP 连接异常</div>
+                <div id="conn-banner-body" class="font-body-sm text-body-sm mt-xs" style="color:#b26a00"></div>
+            </div>
+        </div>
+    </div>
+
     <div class="bento-grid">
 
         <!-- Agent Card -->
@@ -395,23 +407,56 @@ tailwind.config = {
 </footer>
 
 <script>
-// 动态状态指示：探活 /ready 真实反映 SAP 可达性，每 30s 刷新
+// 动态状态指示：探活 /ready（并取 /api/systems 逐系统明细），每 30s 刷新。
+// 三态：就绪（绿）/ 网关已启动但 SAP 连接异常（琥珀色，列出失败系统的
+// connect_error）/ 探针失败（红，网关自身不可达）。
 async function refreshStatus() {
     const dot = document.getElementById('status-dot');
     const txt = document.getElementById('status-text');
+    const banner = document.getElementById('conn-banner');
     if (!dot || !txt) return;
+    const showBanner = (on, title, body) => {
+        if (!banner) return;
+        banner.style.display = on ? '' : 'none';
+        if (on && title) document.getElementById('conn-banner-title').textContent = title;
+        if (on && body !== undefined) document.getElementById('conn-banner-body').innerHTML = body;
+    };
     try {
         const r = await fetch('/ready');
         if (r.ok) {
             dot.className = 'w-2 h-2 rounded-full bg-green-500';
-            txt.textContent = 'System Ready';
-        } else {
-            dot.className = 'w-2 h-2 rounded-full bg-red-500';
-            txt.textContent = 'SAP 不可达';
+            txt.textContent = '系统就绪';
+            showBanner(false);
+            return;
         }
+        // 网关在答话（说明进程活着）但 SAP 不可达——逐系统说明异常
+        dot.className = 'w-2 h-2 rounded-full bg-amber-500';
+        txt.textContent = 'SAP 连接异常';
+        let body = '';
+        try {
+            const sys = await (await fetch('/api/systems')).json();
+            if (!sys.count) {
+                showBanner(true, '尚未配置 SAP 系统', '打开 <a class="underline" href="/setup">/setup</a> 进行引导式配置');
+                return;
+            }
+            const bad = (sys.systems || []).filter(s => !s.connected);
+            if (bad.length) {
+                body = bad.map(s => {
+                    const err = (s.connect_error || '尚未连上').replace(/&/g, '&amp;').replace(/</g, '&lt;');
+                    const tag = s.default ? '（默认）' : '';
+                    return '<div class="truncate" title="' + err.replace(/"/g, '&quot;') + '">' + s.name + tag + ' — ' + err + '</div>';
+                }).join('');
+            } else {
+                body = '默认系统暂时无响应——详见 /api/systems';
+            }
+        } catch (_) {
+            body = '逐系统状态不可用——详见 /api/systems';
+        }
+        showBanner(true, '网关已启动 · SAP 连接异常', body);
     } catch (_) {
         dot.className = 'w-2 h-2 rounded-full bg-red-500';
         txt.textContent = '探针失败';
+        showBanner(false);
     }
 }
 refreshStatus();

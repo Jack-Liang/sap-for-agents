@@ -105,8 +105,9 @@ async fn run_client() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // 多系统组装（v0.16）：无 sap_systems.toml 时从环境变量合成单系统 default
-    //（行为与旧版逐字节一致）；默认系统急切建首连（fail-fast 保留），其余惰性。
-    // v0.17：连接配置全缺 → 未配置模式（空注册表照样监听，setup API 引导配置）。
+    //（行为与旧版逐字节一致）。v0.17：连接配置全缺 → 未配置模式（空注册表照样
+    // 监听，setup API 引导配置）。v0.19：全部系统惰性连接——SAP 连不上也照常
+    // 启动，可达性交给探测任务（写 connect_error 供状态面展示）与调用期按需建连。
     let specs = match systems::load_specs(&cfg) {
         Ok(s) => s,
         Err(e) => {
@@ -131,13 +132,7 @@ async fn run_client() -> Result<(), Box<dyn std::error::Error>> {
     // 排空窗口下发到 server 模块（信号处理与 restart handler 都从那里读）
     crate::server::set_drain_secs(cfg.drain_secs);
 
-    let registry = match systems::build_registry(specs, &cfg) {
-        Ok(r) => r,
-        Err(e) => {
-            print_config_guide(&e, false);
-            return Err(e.into());
-        }
-    };
+    let registry = systems::build_registry(specs, &cfg);
     let state: server::SharedState = Arc::new(registry);
     match state.default() {
         Some(d) => tracing::info!(
@@ -192,8 +187,13 @@ async fn run_client() -> Result<(), Box<dyn std::error::Error>> {
     // OpenAPI 目录的多系统注入（条目按 system 各自取接口）
     openapi::init_shared_state(Arc::clone(&state));
 
-    // SYSID 探测（并行；发现同 SYSID 系统会隔离——SDK 描述符缓存按 SYSID 分区）
-    tokio::spawn(systems::probe_all(Arc::clone(&state)));
+    // SYSID 探测（并行；发现同 SYSID 系统会隔离——SDK 描述符缓存按 SYSID 分区）。
+    // 周期循环：探测结果写各系统 connect_error（/api/systems 与首页状态取数），
+    // SAP 恢复后 60s 内状态自动翻绿，业务请求本身也按需重试建连。
+    tokio::spawn(systems::probe_loop(
+        Arc::clone(&state),
+        std::time::Duration::from_secs(60),
+    ));
     // 注册表服务目录预热（v0.13）：后台 watcher 维护 published 条目的类型化
     // operation 缓存，公开的 /openapi.json 只读缓存——不被 SAP 健康状况绑架
     tokio::spawn(openapi::registry_ops_watcher());

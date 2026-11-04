@@ -239,13 +239,8 @@ pub async fn add_handler(
         });
     }
 
-    // 3. 组装运行句柄（lazy 池，不触 FFI）+ 决定默认归属
-    let handle = crate::systems::make_handle(&spec, state.cfg(), false).map_err(|e| RfcError {
-        code: -1,
-        status: 500,
-        message: format!("系统句柄组装失败: {}", e),
-        key: "SETUP_INTERNAL".into(),
-    })?;
+    // 3. 组装运行句柄（lazy 池，不触 FFI，构造不可失败）+ 决定默认归属
+    let handle = crate::systems::make_handle(&spec, state.cfg());
     // 与 add_system 的提升规则保持一致：显式 default 或当前无默认
     let will_be_default = body.default.unwrap_or(false) || state.default().is_none();
     let had_default = state.default().is_some();

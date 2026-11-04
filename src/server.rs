@@ -642,6 +642,10 @@ async fn systems_handler(
                 "adt": s.adt.is_some(),
                 "sysid": s.sysid(),
                 "quarantined": s.is_quarantined(),
+                // 连接状态（探测任务维护，60s 刷新）：connected=false 时看
+                // connect_error——所有系统惰性连接，这里就是「异常说明」的出处
+                "connected": s.connected(),
+                "connect_error": s.connect_error(),
             })
         })
         .collect();
@@ -652,7 +656,7 @@ async fn systems_handler(
         "note": if systems.is_empty() {
             "网关未配置任何 SAP 系统（未配置模式）。引导式配置：GET /api/setup"
         } else {
-            "作用域前缀形态：/api/s/{系统名}/...（如 /api/s/prd/rfc）；无前缀 = 默认系统"
+            "作用域前缀形态：/api/s/{系统名}/...（如 /api/s/prd/rfc）；无前缀 = 默认系统；connected/connect_error 为最近一轮探测（60s 周期）的连接状态"
         },
     }))
 }
@@ -3229,7 +3233,7 @@ mod tests {
                 read_only: Some(true),
             },
         ];
-        let reg: SystemRegistry = crate::systems::build_registry_all_lazy(specs, &cfg).unwrap();
+        let reg: SystemRegistry = crate::systems::build_registry(specs, &cfg);
         Arc::new(reg)
     }
 
@@ -3380,10 +3384,7 @@ mod tests {
             setup_enabled: true,
             open_browser: false,
         };
-        Arc::new(
-            crate::systems::build_registry_all_lazy(vec![], &cfg)
-                .expect("空 specs 应组装出未配置注册表"),
-        )
+        Arc::new(crate::systems::build_registry(vec![], &cfg))
     }
 
     #[tokio::test]
