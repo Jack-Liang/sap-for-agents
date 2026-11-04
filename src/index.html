@@ -421,37 +421,51 @@ async function refreshStatus() {
         if (on && body !== undefined) document.getElementById('conn-banner-body').innerHTML = body;
     };
     try {
-        const r = await fetch('/ready');
-        if (r.ok) {
+        // /ready (live default-system probe) + /api/systems (60s-probed full
+        // connection state) fetched in parallel
+        const [r, sys] = await Promise.all([
+            fetch('/ready').then(x => x.ok).catch(() => false),
+            fetch('/api/systems').then(x => x.json()).catch(() => null),
+        ]);
+        const systems = (sys && sys.systems) || [];
+        const bad = systems.filter(s => !s.connected);
+        const ok = systems.filter(s => s.connected);
+
+        // Banner: shown whenever ANY system is down (non-default included),
+        // listing the FULL inventory — ✓ connected (with Sysid) / ✗ failed (reason)
+        if (sys && sys.count === 0) {
+            dot.className = 'w-2 h-2 rounded-full bg-amber-500';
+            txt.textContent = 'No SAP system configured';
+            showBanner(true, 'No SAP system configured', 'Open <a class="underline" href="/setup">/setup</a> for guided setup');
+            return;
+        }
+        if (bad.length) {
+            dot.className = 'w-2 h-2 rounded-full bg-amber-500';
+            txt.textContent = r ? 'Some SAP systems unreachable' : 'SAP connection issue(s)';
+            const esc = t => String(t).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;');
+            const lines = ok.map(s =>
+                '<div class="truncate" style="color:#2e7d32">✓ ' + esc(s.name) + (s.default ? ' (default)' : '') +
+                ' — connected' + (s.sysid ? ' (Sysid: ' + esc(s.sysid) + ')' : '') + '</div>'
+            ).concat(bad.map(s => {
+                const err = esc(s.connect_error || 'not connected yet');
+                return '<div class="truncate" title="' + err + '" style="color:#b26a00">✗ ' + esc(s.name) +
+                    (s.default ? ' (default)' : '') + ' — ' + err + '</div>';
+            }));
+            const title = r ? 'Gateway is running · some SAP systems unreachable' : 'Gateway is running · SAP connection issue(s)';
+            showBanner(true, title, lines.join(''));
+            return;
+        }
+        if (r) {
             dot.className = 'w-2 h-2 rounded-full bg-green-500';
             txt.textContent = 'System Ready';
             showBanner(false);
             return;
         }
-        // Gateway is up (it answers) but SAP is not reachable — explain per system
+        // /ready failed while the 60s probe still reports all-connected (staleness
+        // window) — trust the live probe
         dot.className = 'w-2 h-2 rounded-full bg-amber-500';
         txt.textContent = 'SAP connection issue(s)';
-        let body = '';
-        try {
-            const sys = await (await fetch('/api/systems')).json();
-            if (!sys.count) {
-                showBanner(true, 'No SAP system configured', 'Open <a class="underline" href="/setup">/setup</a> for guided setup');
-                return;
-            }
-            const bad = (sys.systems || []).filter(s => !s.connected);
-            if (bad.length) {
-                body = bad.map(s => {
-                    const err = (s.connect_error || 'not connected yet').replace(/&/g, '&amp;').replace(/</g, '&lt;');
-                    const tag = s.default ? ' (default)' : '';
-                    return '<div class="truncate" title="' + err.replace(/"/g, '&quot;') + '">' + s.name + tag + ' — ' + err + '</div>';
-                }).join('');
-            } else {
-                body = 'Default system is not responding right now — see /api/systems for details';
-            }
-        } catch (_) {
-            body = 'Per-system status unavailable — see /api/systems';
-        }
-        showBanner(true, 'Gateway is running · SAP connection issue(s)', body);
+        showBanner(true, 'Gateway is running · SAP connection issue(s)', 'Default system is not responding right now — see /api/systems');
     } catch (_) {
         dot.className = 'w-2 h-2 rounded-full bg-red-500';
         txt.textContent = 'Probe failed';

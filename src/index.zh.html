@@ -422,37 +422,49 @@ async function refreshStatus() {
         if (on && body !== undefined) document.getElementById('conn-banner-body').innerHTML = body;
     };
     try {
-        const r = await fetch('/ready');
-        if (r.ok) {
+        // /ready（默认系统实时探活）与 /api/systems（60s 探测的全量连接状态）并行取
+        const [r, sys] = await Promise.all([
+            fetch('/ready').then(x => x.ok).catch(() => false),
+            fetch('/api/systems').then(x => x.json()).catch(() => null),
+        ]);
+        const systems = (sys && sys.systems) || [];
+        const bad = systems.filter(s => !s.connected);
+        const ok = systems.filter(s => s.connected);
+
+        // 横幅：任何系统未连上（含非默认系统）都显示全量清单——
+        // ✓ 已连接（带 Sysid）/ ✗ 失败（带原因），成功与失败一目了然
+        if (sys && sys.count === 0) {
+            dot.className = 'w-2 h-2 rounded-full bg-amber-500';
+            txt.textContent = '尚未配置 SAP 系统';
+            showBanner(true, '尚未配置 SAP 系统', '打开 <a class="underline" href="/setup">/setup</a> 进行引导式配置');
+            return;
+        }
+        if (bad.length) {
+            dot.className = 'w-2 h-2 rounded-full bg-amber-500';
+            txt.textContent = r ? '部分系统连接异常' : 'SAP 连接异常';
+            const esc = t => String(t).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;');
+            const lines = ok.map(s =>
+                '<div class="truncate" style="color:#2e7d32">✓ ' + esc(s.name) + (s.default ? '（默认）' : '') +
+                ' — 已连接' + (s.sysid ? '（Sysid: ' + esc(s.sysid) + '）' : '') + '</div>'
+            ).concat(bad.map(s => {
+                const err = esc(s.connect_error || '尚未连上');
+                return '<div class="truncate" title="' + err + '" style="color:#b26a00">✗ ' + esc(s.name) +
+                    (s.default ? '（默认）' : '') + ' — ' + err + '</div>';
+            }));
+            const title = r ? '网关已启动 · 部分 SAP 系统连接异常' : '网关已启动 · SAP 连接异常';
+            showBanner(true, title, lines.join(''));
+            return;
+        }
+        if (r) {
             dot.className = 'w-2 h-2 rounded-full bg-green-500';
             txt.textContent = '系统就绪';
             showBanner(false);
             return;
         }
-        // 网关在答话（说明进程活着）但 SAP 不可达——逐系统说明异常
+        // /ready 失败但探测说全部已连上（60s 探测滞后）——以实时探活为准
         dot.className = 'w-2 h-2 rounded-full bg-amber-500';
         txt.textContent = 'SAP 连接异常';
-        let body = '';
-        try {
-            const sys = await (await fetch('/api/systems')).json();
-            if (!sys.count) {
-                showBanner(true, '尚未配置 SAP 系统', '打开 <a class="underline" href="/setup">/setup</a> 进行引导式配置');
-                return;
-            }
-            const bad = (sys.systems || []).filter(s => !s.connected);
-            if (bad.length) {
-                body = bad.map(s => {
-                    const err = (s.connect_error || '尚未连上').replace(/&/g, '&amp;').replace(/</g, '&lt;');
-                    const tag = s.default ? '（默认）' : '';
-                    return '<div class="truncate" title="' + err.replace(/"/g, '&quot;') + '">' + s.name + tag + ' — ' + err + '</div>';
-                }).join('');
-            } else {
-                body = '默认系统暂时无响应——详见 /api/systems';
-            }
-        } catch (_) {
-            body = '逐系统状态不可用——详见 /api/systems';
-        }
-        showBanner(true, '网关已启动 · SAP 连接异常', body);
+        showBanner(true, '网关已启动 · SAP 连接异常', '默认系统暂时无响应——详见 /api/systems');
     } catch (_) {
         dot.className = 'w-2 h-2 rounded-full bg-red-500';
         txt.textContent = '探针失败';
