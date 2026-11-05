@@ -168,13 +168,27 @@ tailwind.config = {
 <!-- Main Canvas -->
 <main id="top" class="flex-grow pt-24 pb-xl px-margin-mobile md:px-margin-desktop max-w-[1440px] mx-auto w-full">
 
-    <!-- Hero Section -->
-    <section class="mb-xl py-xl">
-        <h1 class="font-display-lg text-display-lg text-on-surface mb-sm">sap-for-agents</h1>
-        <p class="font-headline-md text-headline-md text-primary mb-md">SAP NWRFC → REST Gateway</p>
-        <p class="font-body-lg text-body-lg text-on-surface-variant max-w-2xl">
-            One endpoint invokes any BAPI; 15 metadata endpoints (incl. self-description, ST22 dumps & code editing) let AI explore autonomously
-        </p>
+    <!-- Hero Section: text left + connection status panel right (wraps below on narrow screens) -->
+    <section class="mb-xl py-xl flex flex-wrap items-start gap-gutter">
+        <div class="min-w-0 flex-1">
+            <h1 class="font-display-lg text-display-lg text-on-surface mb-sm">sap-for-agents</h1>
+            <p class="font-headline-md text-headline-md text-primary mb-md">SAP NWRFC → REST Gateway</p>
+            <p class="font-body-lg text-body-lg text-on-surface-variant max-w-2xl">
+                One endpoint invokes any BAPI; <span id="endpoint-count">30+</span> endpoints (incl. self-description, ST22 dumps &amp; code editing) let AI explore autonomously
+            </p>
+        </div>
+
+        <!-- Connection status panel: shown when the gateway is up but SAP system(s) are unreachable.
+             Gateway always starts (all systems connect lazily) — this is the degraded-state notice. -->
+        <div id="conn-banner" class="w-full md:w-[340px] md:shrink-0 p-md rounded-xl border" style="display:none;background:rgba(255,171,0,0.08);border-color:#ffa000">
+            <div class="flex items-center gap-md">
+                <span class="material-symbols-outlined" style="color:#b26a00" aria-hidden="true">cloud_off</span>
+                <div class="min-w-0">
+                    <div id="conn-banner-title" class="font-body-md text-body-md font-semibold" style="color:#8a5300">Gateway is running · SAP connection issue(s)</div>
+                    <div id="conn-banner-body" class="font-body-sm text-body-sm mt-xs" style="color:#b26a00"></div>
+                </div>
+            </div>
+        </div>
     </section>
 
     <!-- Auth banner: shown only when SAP_API_KEY is set (display injected by backend) -->
@@ -183,18 +197,6 @@ tailwind.config = {
         <div>
             <div class="font-body-md text-body-md font-semibold" style="color:#6900b3">API authentication is enabled on this service</div>
             <div class="font-body-sm text-body-sm" style="color:#8127cf">Calling <code class="font-code-sm">/api</code> endpoints requires an <code class="font-code-sm">Authorization: Bearer &lt;token&gt;</code> request header</div>
-        </div>
-    </div>
-
-    <!-- Connection banner: shown when the gateway is up but SAP system(s) are unreachable.
-         Gateway always starts (all systems connect lazily) — this is the degraded-state notice. -->
-    <div id="conn-banner" class="mb-gutter p-md rounded-xl border" style="display:none;background:rgba(255,171,0,0.08);border-color:#ffa000">
-        <div class="flex items-center gap-md">
-            <span class="material-symbols-outlined" style="color:#b26a00" aria-hidden="true">cloud_off</span>
-            <div class="min-w-0">
-                <div id="conn-banner-title" class="font-body-md text-body-md font-semibold" style="color:#8a5300">Gateway is running · SAP connection issue(s)</div>
-                <div id="conn-banner-body" class="font-body-sm text-body-sm mt-xs" style="color:#b26a00"></div>
-            </div>
         </div>
     </div>
 
@@ -474,6 +476,15 @@ async function refreshStatus() {
 }
 refreshStatus();
 setInterval(refreshStatus, 30000);
+
+// Endpoint count: injected live from openapi.json so the copy never rots (static fallback 30+)
+fetch('/openapi.json').then(r => r.json()).then(spec => {
+    const n = spec && spec.paths ? Object.keys(spec.paths).length : 0;
+    if (n > 0) {
+        const el = document.getElementById('endpoint-count');
+        if (el) el.textContent = String(n);
+    }
+}).catch(() => {});
 
 function copyLink(btn) {
     const url = document.getElementById('agent-link').textContent.trim();

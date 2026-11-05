@@ -169,13 +169,27 @@ tailwind.config = {
 <!-- Main Canvas -->
 <main id="top" class="flex-grow pt-24 pb-xl px-margin-mobile md:px-margin-desktop max-w-[1440px] mx-auto w-full">
 
-    <!-- Hero Section -->
-    <section class="mb-xl py-xl">
-        <h1 class="font-display-lg text-display-lg text-on-surface mb-sm">sap-for-agents</h1>
-        <p class="font-headline-md text-headline-md text-primary mb-md">SAP NWRFC → REST 网关服务</p>
-        <p class="font-body-lg text-body-lg text-on-surface-variant max-w-2xl">
-            一个端点调用任意 BAPI，15 个元数据端点（含版本自描述、ST22 短转储分析与代码修改）供 AI 自主探索
-        </p>
+    <!-- Hero Section：左文案 + 右连接状态栏（窄屏折行，状态栏回到文案下方全宽） -->
+    <section class="mb-xl py-xl flex flex-wrap items-start gap-gutter">
+        <div class="min-w-0 flex-1">
+            <h1 class="font-display-lg text-display-lg text-on-surface mb-sm">sap-for-agents</h1>
+            <p class="font-headline-md text-headline-md text-primary mb-md">SAP NWRFC → REST 网关服务</p>
+            <p class="font-body-lg text-body-lg text-on-surface-variant max-w-2xl">
+                一个端点调用任意 BAPI，<span id="endpoint-count">30+</span> 个端点（含版本自描述、ST22 短转储分析与代码修改）供 AI 自主探索
+            </p>
+        </div>
+
+        <!-- 连接状态栏：网关已启动但 SAP 系统不可达时显示。
+             所有系统惰性连接、网关永远起得来——这里是降级状态的说明区。 -->
+        <div id="conn-banner" class="w-full md:w-[340px] md:shrink-0 p-md rounded-xl border" style="display:none;background:rgba(255,171,0,0.08);border-color:#ffa000">
+            <div class="flex items-center gap-md">
+                <span class="material-symbols-outlined" style="color:#b26a00" aria-hidden="true">cloud_off</span>
+                <div class="min-w-0">
+                    <div id="conn-banner-title" class="font-body-md text-body-md font-semibold" style="color:#8a5300">网关已启动 · SAP 连接异常</div>
+                    <div id="conn-banner-body" class="font-body-sm text-body-sm mt-xs" style="color:#b26a00"></div>
+                </div>
+            </div>
+        </div>
     </section>
 
     <!-- 认证提示：仅 SAP_API_KEY 设置时显示（后端注入 display） -->
@@ -184,18 +198,6 @@ tailwind.config = {
         <div>
             <div class="font-body-md text-body-md font-semibold" style="color:#6900b3">本服务已启用 API 认证</div>
             <div class="font-body-sm text-body-sm" style="color:#8127cf">调用 <code class="font-code-sm">/api</code> 端点需在请求头携带 <code class="font-code-sm">Authorization: Bearer &lt;token&gt;</code></div>
-        </div>
-    </div>
-
-    <!-- 连接横幅：网关已启动但 SAP 系统不可达时显示。
-         所有系统惰性连接、网关永远起得来——这里是降级状态的说明区。 -->
-    <div id="conn-banner" class="mb-gutter p-md rounded-xl border" style="display:none;background:rgba(255,171,0,0.08);border-color:#ffa000">
-        <div class="flex items-center gap-md">
-            <span class="material-symbols-outlined" style="color:#b26a00" aria-hidden="true">cloud_off</span>
-            <div class="min-w-0">
-                <div id="conn-banner-title" class="font-body-md text-body-md font-semibold" style="color:#8a5300">网关已启动 · SAP 连接异常</div>
-                <div id="conn-banner-body" class="font-body-sm text-body-sm mt-xs" style="color:#b26a00"></div>
-            </div>
         </div>
     </div>
 
@@ -473,6 +475,15 @@ async function refreshStatus() {
 }
 refreshStatus();
 setInterval(refreshStatus, 30000);
+
+// 端点计数：以 openapi.json 为准动态注入，文案不再随版本腐化（静态兜底 30+）
+fetch('/openapi.json').then(r => r.json()).then(spec => {
+    const n = spec && spec.paths ? Object.keys(spec.paths).length : 0;
+    if (n > 0) {
+        const el = document.getElementById('endpoint-count');
+        if (el) el.textContent = String(n);
+    }
+}).catch(() => {});
 
 function copyLink(btn) {
     const url = document.getElementById('agent-link').textContent.trim();
