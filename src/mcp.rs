@@ -11,9 +11,9 @@
 //! - 版本协商：回显客户端请求的 protocolVersion（未知则回本服支持版本）
 //!
 //! 工具面 = 网关既有能力的薄封装（读元数据 + 读源码 + 读转储 + 通用调用 +
-//! 语法检查），全部复用 server/discovery/executor 的内部入口，行为与 REST
-//! 端点完全一致（含超时、连接池重试、审计）。写编排（objects 写端点）刻意
-//! 不进 v1 工具面——Agent 需要改代码时让它走 REST（见 AGENTS.md）。
+//! 语法检查 + 写编排 write_source/edit_code/create_object），全部复用
+//! server/discovery/objects 的内部入口，行为与 REST 端点完全一致（含超时、
+//! 连接池重试、审计环与 rc 指标——invoke_rfc 与 /api/rfc 共用同一路径）。
 //!
 //! 挂在 api 路由上：与 /api/* 同一套鉴权（SAP_API_KEY）与限流。
 
@@ -415,20 +415,18 @@ async fn call_tool(state: SharedState, name: &str, args: Value) -> Result<Value,
                 })?;
             req.func_name = req.func_name.to_uppercase();
             crate::api::validate_func_name(&req.func_name)?;
-            // per-request 超时与 /api/rfc 同一 clamp 规则
-            const MAX_TIMEOUT_SECS: u64 = 1800;
-            let timeout = std::time::Duration::from_secs(
-                req.timeout_secs
-                    .filter(|&s| s >= 1)
-                    .map(|s| s.min(MAX_TIMEOUT_SECS))
-                    .unwrap_or(60),
-            );
-            let exec_sys = std::sync::Arc::clone(&sys);
-            let out = crate::server::run_blocking_with_timeout(sys, timeout, move |conn| {
-                crate::executor::execute_collect(&exec_sys, conn, &req)
-            })
+            // 与 /api/rfc 共用「执行 + 审计环 + rc 指标 + 签名漂移提示」路径
+            // （此前绕过审计与指标、自带一份 timeout clamp 复制品，2026-11-05
+            // 审计 P1）。MCP 无 per-IP 语义，审计 caller 记为 "mcp"。
+            let out = crate::server::run_invoke_and_log(
+                sys,
+                "mcp".to_string(),
+                req,
+                "mcp",
+                None,
+            )
             .await?;
-            serde_json::to_value(out).map_err(|e| RfcError {
+            serde_json::to_value(out.0).map_err(|e| RfcError {
                 code: -1,
                 status: 500,
                 message: format!("serialize invoke result: {e}"),

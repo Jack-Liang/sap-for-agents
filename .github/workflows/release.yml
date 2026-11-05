@@ -25,7 +25,7 @@ on:
       - 'v*.*.*'
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   # 发版一致性闸门：tag 名（去 v 前缀）必须等于 Cargo.toml 的 version。
@@ -35,7 +35,7 @@ jobs:
     name: Verify tag matches Cargo.toml version
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: tag == Cargo.toml version
         run: |
           TAG="${GITHUB_REF_NAME#v}"
@@ -46,8 +46,47 @@ jobs:
             exit 1
           fi
 
+  # 测试闸门（2026-11-05 审计 P2：此前 tag 构建不跑测试，坏 tag 直接发出二进制）。
+  # stub SDK 环境跑 clippy + 全部单测；集成测试仍 #[ignore]（CI 无真 SAP）。
+  test:
+    name: Test (stub SDK)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          components: clippy
+      - name: Cache cargo
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+      - name: Prepare stub SAP SDK
+        run: |
+          STUB=nwrfcsdk/lib/linux-x86_64
+          mkdir -p "$STUB"
+          grep -hoE 'pub fn Rfc[A-Za-z0-9_]+' src/ffi.rs \
+            | awk '{print "void " $3 "(void) {}"}' > /tmp/stub.c
+          echo "int sapnwrfc_stub;" >> /tmp/stub.c
+          cc -shared -fPIC -o "$STUB/libsapnwrfc.so" /tmp/stub.c
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Test
+        env:
+          LD_LIBRARY_PATH: ${{ github.workspace }}/nwrfcsdk/lib/linux-x86_64
+        run: cargo test
+
   build:
-    needs: check-version
+    needs: [check-version, test]
+    # 上传 Release 产物需要写权限（顶层是 contents: read，这里按 job 提升）
+    permissions:
+      contents: write
     name: Build (${{ matrix.target }})
     strategy:
       fail-fast: false
@@ -103,10 +142,10 @@ jobs:
     runs-on: ${{ matrix.runner }}
 
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           targets: ${{ matrix.target }}
 
@@ -114,7 +153,7 @@ jobs:
       # lib.exe 不会默认在 PATH 里，必须先激活（vsdevcmd）才能在 stub 步骤调用。
       - name: Set up MSVC dev environment (Windows only)
         if: runner.os == 'Windows'
-        uses: ilammy/msvc-dev-cmd@v1
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1
 
       # 安装 Linux aarch64 交叉编译工具链（gcc + linker）
       - name: Install aarch64 cross-toolchain (Linux only)
@@ -127,12 +166,13 @@ jobs:
             libc6-dev-arm64-cross
 
       - name: Cache cargo
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-          key: ${{ runner.os }}-cargo-${{ matrix.target }}-${{ hashFiles('Cargo.lock') }}
+            target
+          key: ${{ runner.os }}-${{ matrix.target }}-release-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-${{ matrix.target }}-
 
@@ -218,7 +258,7 @@ jobs:
           fi
 
       - name: Upload to Release
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@5113cdc90fd4d541c801c55356214017bf5ae34b # v3
         with:
           files: sap-for-agents-${{ matrix.target }}.${{ matrix.archive }}
           generate_release_notes: true

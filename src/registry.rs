@@ -490,7 +490,8 @@ fn with_store<R>(f: impl FnOnce(&mut Store) -> Result<R, RfcError>) -> Result<R,
 fn persist(store: &Store) -> Result<(), RfcError> {
     let state = REGISTRY.get().ok_or_else(disabled_err)?;
     let tmp = state.path.with_extension("json.tmp");
-    std::fs::write(&tmp, store.to_json()).map_err(|e| RfcError {
+    // 0600：注册表含 example/凭据类内容，不留给同机其他用户（审计 P1）
+    crate::config::write_private_file(&tmp, &store.to_json()).map_err(|e| RfcError {
         code: -1,
         status: 500,
         message: format!("注册表写入失败（{}）: {}", state.path.display(), e),

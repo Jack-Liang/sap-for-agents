@@ -58,6 +58,10 @@ pub struct SystemSpec {
     pub adt_passwd: Option<String>,
     /// 只读覆盖（None = 用全局 `SAP_READ_ONLY`）。
     pub read_only: Option<bool>,
+    /// 落盘时的密码引用形态（如 `${SAP_PASSWD}`）：env 合成系统的 conn_params
+    /// 持有**解密后**的密码，直接落 toml 会把 `${VAR}` 约定打穿成明文
+    /// （2026-11-05 审计 P1）。带引用时 `spec_to_table` 用引用代替解析值。
+    pub passwd_ref: Option<String>,
 }
 
 /// `sap_systems.toml` 原始形态（serde 反序列化用；setup API 的请求体
@@ -228,6 +232,7 @@ pub(crate) fn build_spec(name: &str, raw: &RawSystem) -> Result<SystemSpec, Stri
         adt_user: raw.adt_user.clone(),
         adt_passwd: raw.adt_passwd.clone(),
         read_only: raw.read_only,
+        passwd_ref: None,
     })
 }
 
@@ -247,6 +252,8 @@ fn synth_from_env(cfg: &AppConfig) -> SystemSpec {
         adt_user: Some(cfg.adt_user.clone()),
         adt_passwd: Some(cfg.adt_passwd.clone()),
         read_only: None,
+        // 落盘引用形态：env 密码来自 SAP_PASSWD，落 toml 时保留 ${VAR} 引用
+        passwd_ref: Some("${SAP_PASSWD}".into()),
     }
 }
 
@@ -395,6 +402,11 @@ pub struct SystemHandle {
     last_connect_error: std::sync::RwLock<Option<String>>,
     /// `/api/version` 的懒加载系统信息缓存（生命周期内不变，失败不缓存）
     pub sap_info: tokio::sync::RwLock<Option<Arc<crate::connection::RemoteSystemInfo>>>,
+    /// sap_info 的**负缓存**：(记录时刻, 错误消息)。失败后 60s 内直接回这个
+    /// 错误不再真连——否则"握手挂起"型不可达系统（VPN 半开等）让每次
+    /// `/api/version` 都拖满 10s 超时。状态面的 connected/connect_error 由
+    /// 探测任务维护，与此互不依赖。
+    sap_info_err: tokio::sync::RwLock<Option<(std::time::Instant, String)>>,
 }
 
 /// 单系统的 reload 结果（`POST /api/admin/reload` 响应体）。
@@ -516,6 +528,20 @@ impl SystemHandle {
     /// 探测间隔（60s）内的瞬时断连要等下一轮才反映——页面状态以此为准。
     pub fn connected(&self) -> bool {
         self.sysid().is_some() && self.connect_error().is_none()
+    }
+
+    /// sap_info 负缓存读取（fresh 与否由调用方按 TTL 判断）。
+    pub async fn sap_info_negative(&self) -> Option<(std::time::Instant, String)> {
+        self.sap_info_err.read().await.clone()
+    }
+
+    /// 写入/清除 sap_info 负缓存（version 模块取数失败/成功时调用）。
+    pub async fn set_sap_info_negative(&self, err: Option<String>) {
+        let slot = match err {
+            Some(msg) => Some((std::time::Instant::now(), msg)),
+            None => None,
+        };
+        *self.sap_info_err.write().await = slot;
     }
 
     /// 隔离检查：被隔离的系统拒绝服务（给出明确出路而非静默错数据）。
@@ -725,6 +751,7 @@ pub(crate) fn make_handle(spec: &SystemSpec, cfg: &AppConfig) -> Arc<SystemHandl
         quarantined: AtomicBool::new(false),
         last_connect_error: std::sync::RwLock::new(None),
         sap_info: tokio::sync::RwLock::new(None),
+        sap_info_err: tokio::sync::RwLock::new(None),
     })
 }
 
@@ -930,6 +957,7 @@ mod tests {
             update_check: false,
             systems_file: "no-such-file.toml".into(),
             setup_enabled: true,
+            setup_force: false,
             open_browser: false,
         }
     }
@@ -1179,6 +1207,7 @@ ashost = "h"
             quarantined: AtomicBool::new(false),
             last_connect_error: std::sync::RwLock::new(None),
             sap_info: tokio::sync::RwLock::new(None),
+            sap_info_err: tokio::sync::RwLock::new(None),
         }
     }
 
@@ -1271,6 +1300,7 @@ ashost = "h"
             adt_user: None,
             adt_passwd: None,
             read_only: None,
+            passwd_ref: None,
         };
         assert!(build_adt(&direct, Duration::from_secs(5)).is_some());
         // 显式空串 → 禁用
@@ -1293,6 +1323,7 @@ ashost = "h"
             adt_user: None,
             adt_passwd: None,
             read_only: None,
+            passwd_ref: None,
         };
         assert!(build_adt(&lb, Duration::from_secs(5)).is_none());
     }

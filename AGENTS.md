@@ -96,7 +96,7 @@ curl http://127.0.0.1:3000/api/systems
 - Human handoff: an unconfigured desktop run auto-opens `/setup` in the user's browser; the page offers a copy-paste message describing exactly this flow (address filled in). If the user pastes it to you, just execute the steps above.
 - The connection is **tested before anything is persisted** — wrong host/credentials return `502 SETUP_CONNECT_FAILED` (or `502 SETUP_CONNECT_TIMEOUT`) and nothing is written. `test:false` skips the check for offline pre-provisioning.
 - Success = persisted to `sap_systems.toml` **and hot-loaded**. The first system always becomes the default; add more systems later the same way (`default:true` switches the default). If the process had been running on env-var config, that system is persisted into the file too, so a restart changes nothing.
-- `409 SETUP_NAME_EXISTS` → pick another name; `409 SYSTEM_SYSID_CONFLICT` → two backends share a SYSID (see "Multiple systems"); `403 SETUP_DISABLED` → the deployer set `SAP_SETUP=off`, edit the file manually instead.
+- `409 SETUP_NAME_EXISTS` → pick another name; `409 SYSTEM_SYSID_CONFLICT` → two backends share a SYSID (see "Multiple systems"); `403 SETUP_DISABLED` → the deployer set `SAP_SETUP=off`; `403 SETUP_LOCKED` → the gateway is already configured and guided writes are locked (anti-abuse on unauthenticated deployments: no credential-relay / internal probing via fake systems) — edit the file manually, or set `SAP_SETUP=force` to keep guided writes open
 
 ## Standard workflow
 
@@ -273,6 +273,7 @@ Request body fields:
 - `struct_outputs`: top-level structure outputs → field list (same rules as `table_outputs`)
 - `read_return`: whether to automatically read the BAPI's RETURN message table
 - `timeout_secs`: timeout in seconds for this call (optional, ≥1). Omit to use the global default of 60s; relax it for slow endpoints (batch BAPIs, large table queries). On timeout returns 504
+- `retry`: whether communication-class errors auto-retry on a fresh connection (optional, default `true`, up to 3 rounds). ⚠️ A retry can re-execute a call whose response was lost — pass `false` for posting-type write BAPIs to prevent double execution (retries observable via the `rfc_call_retries_total` metric). The flat port takes `?retry=false`
 
 Response body:
 - `scalars`: scalar outputs (parameter name → value; value type depends on the read method)

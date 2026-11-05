@@ -52,13 +52,50 @@ pub struct AppConfig {
     /// 存在 → 系统集合完全由该文件定义（见 systems.rs）。
     pub systems_file: std::path::PathBuf,
     /// 引导式配置（`SAP_SETUP`，默认开启；off/false/0/no 关闭）：
-    /// 未配置任何系统时允许 `POST /api/setup/system` 写入 sap_systems.toml
-    /// 并热加载（见 setup.rs）。锁定部署可关闭。
+    /// 仅在**未配置任何系统**时允许 `POST /api/setup/system` 写入
+    /// sap_systems.toml 并热加载（见 setup.rs）。配置完成后端点自动锁定——
+    /// 防止无鉴权部署上被添加恶意"系统"做凭据中继/内网探测；
+    /// 确需运行期加系统设 `SAP_SETUP=force`（此时 force=true）。
     pub setup_enabled: bool,
+    /// `SAP_SETUP=force`：跳过"配置后锁定"，任何时刻都允许引导写入
+    pub setup_force: bool,
     /// 未配置模式下是否自动在浏览器打开引导页 `/setup`
     /// （`SAP_OPEN_BROWSER`，默认开启；off/false/0/no 关闭——服务器/无头
     /// 部署防打扰）。已配置的部署从不自动打开。
     pub open_browser: bool,
+}
+
+/// 敏感文件落盘（unix 0600；已存在文件重写时一并收紧权限）。
+/// `.env` / `sap_systems.toml` / `registry.json` 都持明文凭据，0644 会让同机
+/// 其他用户可读（2026-11-05 审计 P1）。Windows 无 POSIX 权限模型——保持默认
+/// ACL（配置位于用户目录时本就仅本人可读）。
+pub(crate) fn write_private_file(path: &std::path::Path, content: &str) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path)
+            .map_err(|e| format!("写文件失败 ({}): {}", path.display(), e))?;
+        f.write_all(content.as_bytes())
+            .map_err(|e| format!("写文件失败 ({}): {}", path.display(), e))?;
+        use std::os::unix::fs::PermissionsExt;
+        let mut perm = f
+            .metadata()
+            .map_err(|e| format!("读元数据失败 ({}): {}", path.display(), e))?
+            .permissions();
+        perm.set_mode(0o600);
+        f.set_permissions(perm)
+            .map_err(|e| format!("收紧权限失败 ({}): {}", path.display(), e))?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, content).map_err(|e| format!("写文件失败 ({}): {}", path.display(), e))?;
+        Ok(())
+    }
 }
 
 fn required(key: &str) -> Result<String, String> {
@@ -178,7 +215,7 @@ pub fn load() -> Result<AppConfig, String> {
             )
         })
         .unwrap_or(true);
-    // 引导式配置开关（默认开启）
+    // 引导式配置开关（默认开启；force = 已配置后仍允许运行期加系统）
     let setup_enabled = env::var("SAP_SETUP")
         .map(|v| {
             !matches!(
@@ -187,6 +224,9 @@ pub fn load() -> Result<AppConfig, String> {
             )
         })
         .unwrap_or(true);
+    let setup_force = env::var("SAP_SETUP")
+        .map(|v| v.trim().eq_ignore_ascii_case("force"))
+        .unwrap_or(false);
     // 未配置模式自动打开引导页浏览器（默认开启；仅未配置时生效）
     let open_browser = env::var("SAP_OPEN_BROWSER")
         .map(|v| {
@@ -233,6 +273,7 @@ pub fn load() -> Result<AppConfig, String> {
         update_check,
         systems_file,
         setup_enabled,
+        setup_force,
         open_browser,
     })
 }

@@ -96,7 +96,7 @@ curl http://127.0.0.1:3000/api/systems
 - 人类交接：桌面机器上未配置启动会自动在浏览器打开 `/setup` 引导页，页面提供一段复制即用的交接文字（描述的就是本流程，地址已填好）。用户把那段话粘给你时，直接按上面的步骤执行即可。
 - **落盘前先真实试连**——主机/账号/密码不对返回 `502 SETUP_CONNECT_FAILED`（或 `SETUP_CONNECT_TIMEOUT`），什么都不会写入。`test:false` 跳过试连（离线预配置场景，自担风险）。
 - 成功 = 写入 `sap_systems.toml` **并热加载**。首个系统无条件成为默认系统；之后可用同样方式追加系统（`default:true` 可切换默认）。若网关此前跑在环境变量配置上，该系统也会一并写入文件——重启后系统集合不变。
-- `409 SETUP_NAME_EXISTS` → 换个名字；`409 SYSTEM_SYSID_CONFLICT` → 两个后端共用 SYSID（见「多系统」节）；`403 SETUP_DISABLED` → 部署方设了 `SAP_SETUP=off`，请改手工编辑文件。
+- `409 SETUP_NAME_EXISTS` → 换个名字；`409 SYSTEM_SYSID_CONFLICT` → 两个后端共用 SYSID（见「多系统」节）；`403 SETUP_DISABLED` → 部署方设了 `SAP_SETUP=off`；`403 SETUP_LOCKED` → 网关已配置、引导写入已锁定（无鉴权部署的防滥用措施：防凭据中继/内网探测）——请改手工编辑文件，确需保持引导写入可设 `SAP_SETUP=force`
 
 ## 标准操作流程
 
@@ -273,6 +273,7 @@ curl -X POST http://127.0.0.1:3000/api/rfc \
 - `struct_outputs`：顶层结构体输出 → 字段列表（规则同 `table_outputs`）
 - `read_return`：是否自动读 BAPI 的 RETURN 消息表
 - `timeout_secs`：本次调用超时秒数（可选，≥1）。不传用全局默认 60s；慢接口（批量 BAPI、大表查询）可自主放宽。超时返回 504
+- `retry`：通信类错误是否自动换新连接重试（可选，默认 `true`，最多 3 轮）。⚠️ 重试发生在「函数可能已执行、响应丢失」的场景——过账类写 BAPI 传 `false` 防双执行（重试发生与否看 `rfc_call_retries_total` 指标）。扁平端口用 `?retry=false`
 
 响应体：
 - `scalars`：标量输出（参数名 → 值，值类型由读取方式决定）

@@ -174,7 +174,20 @@ impl RfcConnectionPool {
     /// 重试绝不从空闲栈取连接：SAP 端批量断开后栈里可能全是死连接，
     /// pop 到死连接会让重试白费、错误直接漏给调用方（用户反馈的
     /// 「有时候 curl 返回句柄失效」即此路径）。
-    pub fn with_connection<R, F>(&self, mut f: F) -> Result<R, RfcError>
+    pub fn with_connection<R, F>(&self, f: F) -> Result<R, RfcError>
+    where
+        F: FnMut(&RfcConnection) -> Result<R, RfcError>,
+    {
+        self.with_connection_opts(true, f)
+    }
+
+    /// [`Self::with_connection`] 的可配重试版：`retry_enabled=false` 时只尝试
+    /// 一轮（取连接失败直接上抛、执行失败不再重建连接）。
+    ///
+    /// 为什么需要关重试：重试发生在「函数可能已执行、响应丢失」的场景——
+    /// 过账类写 BAPI 被重跑就是双执行（2026-11-05 审计 P0）。调用方（写操作）
+    /// 应传 false；重试是否发生由 `rfc_call_retries_total` 指标 + warn 日志观察。
+    pub fn with_connection_opts<R, F>(&self, retry_enabled: bool, mut f: F) -> Result<R, RfcError>
     where
         F: FnMut(&RfcConnection) -> Result<R, RfcError>,
     {
@@ -182,13 +195,14 @@ impl RfcConnectionPool {
         const RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(300);
         /// 总尝试轮数上限（每轮 = 一次取连接 + 一次执行）
         const MAX_ATTEMPTS: u8 = 3;
+        let max_attempts = if retry_enabled { MAX_ATTEMPTS } else { 1 };
 
         // None = 本轮需要取连接（首轮 acquire 复用池，重试轮 create 保证新鲜）
         let mut conn: Option<RfcConnection> = None;
         // 手上连接所属的池代次：若期间发生 reload（换代），归还时直接丢弃，
         // 避免旧连接（带旧函数描述符）重新入池污染后续调用。
         let mut conn_epoch: u64 = 0;
-        for attempt in 1..=MAX_ATTEMPTS {
+        for attempt in 1..=max_attempts {
             // 1) 确保手上有连接
             let c = match conn.take() {
                 Some(c) => c,
@@ -207,9 +221,10 @@ impl RfcConnectionPool {
                                 code = e.code, key = %e.key, attempt,
                                 "SAP 取/建连接失败（可重试类），退避后重试"
                             );
-                            if attempt == MAX_ATTEMPTS {
+                            if attempt == max_attempts {
                                 return Err(e);
                             }
+                            metrics::counter!("rfc_call_retries_total").increment(1);
                             std::thread::sleep(RETRY_BACKOFF);
                             continue;
                         }
@@ -230,10 +245,11 @@ impl RfcConnectionPool {
                     );
                     drop(c); // 触发 RfcCloseConnection；计数在下方减回
                     self.dec_total_and_notify();
-                    if attempt == MAX_ATTEMPTS {
+                    if attempt == max_attempts {
                         tracing::warn!(attempts = attempt, "SAP 重试均失败，错误上抛");
                         return Err(e);
                     }
+                    metrics::counter!("rfc_call_retries_total").increment(1);
                     std::thread::sleep(RETRY_BACKOFF);
                     // conn 保持 None → 下轮新建
                 }
@@ -405,7 +421,7 @@ impl RfcConnectionPool {
             Err(_) => return 0,
         };
         let n = dropped.len();
-        drop(dropped); // 显式 drop 触发连接关闭
+        close_detached(dropped);
         tracing::info!(
             epoch = new_epoch,
             closed = n,
@@ -433,8 +449,8 @@ impl RfcConnectionPool {
             Err(_) => return 0,
         };
         let n = dropped.len();
-        // 显式 drop 触发连接关闭（RfcConnection Drop 释放 RFC 句柄）
-        drop(dropped);
+        // 显式丢弃触发连接关闭（RfcConnection Drop 释放 RFC 句柄）
+        close_detached(dropped);
         if n > 0 {
             tracing::debug!(conns = n, "写后排干空闲 RFC 连接（下次调用重建）");
         }
@@ -463,6 +479,23 @@ impl RfcConnectionPool {
                 max: self.max_size,
             },
         }
+    }
+}
+
+/// 批量关闭一批被丢弃的连接：`RfcConnection` 的 Drop 即 `RfcCloseConnection`
+/// （CPIC 网络操作）。reload/drain_idle 从 async 上下文调用，直接 drop 会把
+/// 网络关闭卡在 tokio worker 上（SAP 不可达时要等 CPIC 超时，2026-11-05 审计
+/// P1）——挪到阻塞线程执行，fire-and-forget（丢弃型关闭无结果可用）。
+/// 无 tokio 运行时（纯单测环境）退回同步关闭。
+fn close_detached(conns: Vec<IdleConn>) {
+    if conns.is_empty() {
+        return;
+    }
+    match tokio::runtime::Handle::try_current() {
+        Ok(_) => {
+            let _detached = tokio::task::spawn_blocking(move || drop(conns));
+        }
+        Err(_) => drop(conns),
     }
 }
 

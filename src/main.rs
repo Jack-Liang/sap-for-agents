@@ -166,7 +166,7 @@ async fn run_client() -> Result<(), Box<dyn std::error::Error>> {
     // 未配置模式为 false（setup 首个默认系统热加载时会翻转）
     adt::init_capability_adt(state.default().is_some_and(|d| d.adt.is_some()));
     // 引导式配置开关（SAP_SETUP=off 禁用 POST /api/setup/system；GET 状态仍公开）
-    setup::init(cfg.setup_enabled);
+    setup::init(cfg.setup_enabled, cfg.setup_force);
     if !cfg.setup_enabled {
         tracing::info!("引导式配置已禁用（SAP_SETUP=off）：POST /api/setup/system 返回 403");
     }

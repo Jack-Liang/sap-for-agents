@@ -42,6 +42,10 @@ const SAP_INFO_TIMEOUT: Duration = Duration::from_secs(10);
 /// 附 `<name>_error` 字段）。端点整体仍 200——SAP 宕机时恰恰最需要这份自描述。
 pub async fn gateway_info(state: &SharedState) -> Value {
     let mut out = local_info();
+    // capabilities.setup 最终值按真实系统集合覆写：已配置部署默认锁定
+    // 引导写入（防凭据中继/内网探测），SAP_SETUP=force 豁免
+    out["capabilities"]["setup"] =
+        json!(crate::setup::writable_for_configured(!state.names().is_empty()));
     // latest 与 SAP 块独立：任一不可用不影响另一个
     out["latest"] = latest_json().await;
 
@@ -148,11 +152,19 @@ async fn futures_join_all(
     futures_join(futs).await
 }
 
-/// 极简 join（不引 futures crate）：轮询完成顺序输出。
-async fn futures_join<F: std::future::Future>(futs: Vec<F>) -> Vec<F::Output> {
-    let mut results = Vec::with_capacity(futs.len());
-    for f in futs {
-        results.push(f.await);
+/// 真·并行 join（不引 futures crate）：每个 future 一个 tokio 任务同时跑，
+/// 全部完成后按原顺序输出结果。⚠️ 不能写成 `for f in futs { f.await }`——
+/// 那是顺序轮询，N 个"握手挂起"型不可达系统会把总耗时拖成 N×超时
+/// （2026-11-05 审计发现，此前注释声称并行是错的）。
+async fn futures_join<F>(futs: Vec<F>) -> Vec<F::Output>
+where
+    F: std::future::Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    let joins: Vec<_> = futs.into_iter().map(tokio::spawn).collect();
+    let mut results = Vec::with_capacity(joins.len());
+    for j in joins {
+        results.push(j.await.expect("探测任务不应 panic（内部已捕获错误）"));
     }
     results
 }
@@ -175,7 +187,8 @@ pub fn local_info() -> Value {
             "adt": crate::adt::capabilities_adt_enabled(),
             // true = API 注册表已启用（GET /api/registry；Agent 跨会话记忆）
             "registry": crate::registry::is_enabled(),
-            // true = 引导式配置可写（POST /api/setup/system；SAP_SETUP=off 关闭）
+            // 基础开关（SAP_SETUP=off → false）；「已配置后锁定」的最终值由
+            // gateway_info 按真实系统集合覆写（见下）
             "setup": crate::setup::is_enabled(),
             // 按 IP 每秒请求上限；null = 不限流
             "rate_limit_rps": crate::server::rate_limit_rps(),
@@ -183,20 +196,44 @@ pub fn local_info() -> Value {
     })
 }
 
+/// sap_info 负缓存 TTL：失败后 60s 内直接返回缓存错误，不再真连。
+/// "握手挂起"型不可达（VPN 半开等）单次取数拖满 10s 超时，无负缓存时
+/// 每次 /api/version 都要付一遍（agent 会话开头就调它）。
+const SAP_INFO_NEG_TTL: Duration = Duration::from_secs(60);
+
 /// 取某系统缓存的 SAP 信息；未缓存时借连接调一次 `RFC_SYSTEM_INFO`。
-/// 成功 → 写缓存永久复用；失败 → 不缓存，调用方拿到错误（下次重试）。
+/// 成功 → 写缓存永久复用并清负缓存；失败 → 写 60s 负缓存（期间快速失败）。
 async fn fetch_cached_sap_info(
     sys: &Arc<SystemHandle>,
 ) -> Result<Arc<RemoteSystemInfo>, crate::error::RfcError> {
     if let Some(cached) = sys.sap_info.read().await.clone() {
         return Ok(cached);
     }
+    // 负缓存新鲜 → 快速失败（不占池、不占阻塞线程）
+    if let Some((at, msg)) = sys.sap_info_negative().await {
+        if at.elapsed() < SAP_INFO_NEG_TTL {
+            return Err(crate::error::RfcError {
+                code: -1,
+                status: 503,
+                message: msg,
+                key: "SYSTEM_UNREACHABLE".into(),
+            });
+        }
+    }
     // 未缓存：取一次（并发首批请求可能重复取，无害——池有多条连接，结果幂等）
     let fetched =
-        crate::server::run_blocking_with_timeout(Arc::clone(sys), SAP_INFO_TIMEOUT, |conn| {
+        match crate::server::run_blocking_with_timeout(Arc::clone(sys), SAP_INFO_TIMEOUT, |conn| {
             conn.system_info()
         })
-        .await?;
+        .await
+        {
+            Ok(info) => info,
+            Err(e) => {
+                sys.set_sap_info_negative(Some(e.message.clone())).await;
+                return Err(e);
+            }
+        };
+    sys.set_sap_info_negative(None).await;
     let info = Arc::new(fetched);
     *sys.sap_info.write().await = Some(Arc::clone(&info));
     tracing::info!(

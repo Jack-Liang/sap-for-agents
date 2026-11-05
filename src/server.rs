@@ -290,6 +290,16 @@ where
             r
         })
     });
+    finish_blocking_join(join, timeout).await
+}
+
+/// spawn_blocking JoinHandle 收尾：到时返回 504。FFI 不可取消（NWRFC 固有
+/// 限制），任务会在 SAP 真正响应后自行结束并归还连接——这里只负责及时返回，
+/// 不等待；记告警以便运维监控慢调用堆积。
+async fn finish_blocking_join<R: Send + 'static>(
+    join: tokio::task::JoinHandle<Result<R, RfcError>>,
+    timeout: Duration,
+) -> Result<R, RfcError> {
     match tokio::time::timeout(timeout, join).await {
         Ok(inner) => inner.map_err(|e| RfcError {
             code: -1,
@@ -298,8 +308,6 @@ where
             ..Default::default()
         })?,
         Err(_elapsed) => {
-            // 超时：spawn_blocking 任务无法取消（NWRFC 固有限制），它会在 SAP 真正响应后
-            // 自行结束并归还连接。这里只负责及时返回 504；记告警以便运维监控慢调用堆积。
             tracing::warn!(
                 ?timeout,
                 "SAP 调用超时，阻塞任务将在 SAP 响应后自行归还连接"
@@ -317,6 +325,58 @@ where
 {
     let timeout = sys.request_timeout;
     run_blocking_with_timeout(sys, timeout, f).await
+}
+
+/// [`run_blocking_with_timeout`] 的可配重试版：`retry_enabled` 透传给连接池——
+/// 业务调用方（写 BAPI）传 false 防"响应丢失后双执行"（见 api.rs InvokeRequest.retry）。
+pub(crate) async fn run_blocking_with_timeout_opts<F, R>(
+    sys: Arc<SystemHandle>,
+    timeout: Duration,
+    retry_enabled: bool,
+    f: F,
+) -> Result<R, RfcError>
+where
+    F: FnMut(&RfcConnection) -> Result<R, RfcError> + Send + 'static,
+    R: Send + 'static,
+{
+    sys.check_available()?;
+    let pool = Arc::clone(&sys.pool);
+    let hook_sys = Arc::clone(&sys);
+    let mut f = f;
+    let join = tokio::task::spawn_blocking(move || {
+        // 阻塞任务在途数：SDK 无连接超时参数（头文件证实），"握手挂起"型调用
+        // 无法从外面取消——堆积只能靠这个 gauge 暴露（tokio 阻塞池 512 线程
+        // 耗尽 = 全部 RFC 工作冻结，含 /ready 与探测）
+        gauge!("sap_blocking_tasks_current", "system" => hook_sys.name.clone()).increment(1);
+        let r = pool.with_connection_opts(retry_enabled, |conn| {
+            let r = f(conn);
+            if r.is_ok() && hook_sys.sysid().is_none() {
+                match conn.system_info() {
+                    Ok(info) => {
+                        if let Err(owner) = hook_sys.record_sysid(&info.sysid) {
+                            tracing::error!(
+                                system = %hook_sys.name,
+                                conflict_with = %owner,
+                                sysid = %info.sysid,
+                                "SYSID 冲突，系统已隔离（SDK 描述符缓存按 SYSID 分区）"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::debug!(
+                            system = %hook_sys.name,
+                            msg = %e.message,
+                            "连接属性读取失败，SYSID 登记推迟到下次调用"
+                        );
+                    }
+                }
+            }
+            r
+        });
+        gauge!("sap_blocking_tasks_current", "system" => hook_sys.name.clone()).decrement(1);
+        r
+    });
+    finish_blocking_join(join, timeout).await
 }
 
 /// 仅静态路由（不依赖 SAP 连接池）：首页 / Agent 文档 / 健康检查。
@@ -354,7 +414,7 @@ pub fn app(state: SharedState) -> Router {
         // 动态 OpenAPI 规范：?functions=A,B 按接口元数据生成类型化 operation
         .route("/api/openapi", axum::routing::get(openapi_dynamic_handler))
         // MCP 服务器（JSON-RPC over Streamable HTTP，无状态模式）：
-        // 与 /api/* 同一套鉴权/限流；写编排刻意不进工具面（见 mcp.rs 模块注释）
+        // 与 /api/* 同一套鉴权/限流；工具面含写编排（见 mcp.rs 模块注释）
         .route("/mcp", axum::routing::post(crate::mcp::mcp_handler))
         // 函数名可能带 /NS/ 命名空间前缀（如 /SDF/X），路径参数无法匹配多段路径，
         // 统一用通配路由捕获后按尾部 /doc、/source 分发（见 function_route_dispatcher）。
@@ -1217,10 +1277,12 @@ pub(crate) async fn run_invoke_and_log(
         .filter(|&s| s >= 1)
         .map(|s| Duration::from_secs(s.min(MAX_TIMEOUT_SECS)))
         .unwrap_or(sys.request_timeout);
-    // 通过 with_connection 执行：遇通信类错误自动丢弃并新建连接重试。
+    // 通过 with_connection 执行：遇通信类错误自动丢弃并新建连接重试；
+    // 调用方可传 retry:false 关闭（写 BAPI 防响应丢失双执行）。
     // 元数据解析（resolve_meta）用该系统自己的缓存实例。
+    let retry_enabled = req.retry.unwrap_or(true);
     let exec_sys = Arc::clone(&sys);
-    let result = run_blocking_with_timeout(sys, timeout, move |conn| {
+    let result = run_blocking_with_timeout_opts(sys, timeout, retry_enabled, move |conn| {
         execute_collect(&exec_sys, conn, &req)
     })
     .await;
@@ -3196,6 +3258,7 @@ mod tests {
             update_check: false,
             systems_file: "no-such.toml".into(),
             setup_enabled: true,
+            setup_force: false,
             open_browser: false,
         };
         let direct = || {
@@ -3219,6 +3282,7 @@ mod tests {
                 adt_user: None,
                 adt_passwd: None,
                 read_only: None,
+                passwd_ref: None,
             },
             SystemSpec {
                 name: "prd".into(),
@@ -3231,10 +3295,56 @@ mod tests {
                 adt_user: None,
                 adt_passwd: None,
                 read_only: Some(true),
+                passwd_ref: None,
             },
         ];
         let reg: SystemRegistry = crate::systems::build_registry(specs, &cfg);
         Arc::new(reg)
+    }
+
+    #[tokio::test]
+    async fn setup_locked_after_configured() {
+        // v0.19.1 安全修复：已配置部署的 POST /api/setup/system 默认锁定
+        // （防无鉴权部署上的凭据中继/内网探测），SAP_SETUP=force 豁免
+        crate::setup::init(true, false); // 开关开、未 force
+        let resp = app(test_state())
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/setup/system")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        r#"{"name":"x1","ashost":"h","sysnr":"00","client":"001","user":"u","passwd":"p"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::FORBIDDEN, "已配置应锁定");
+        let body = body_string(resp.into_body()).await;
+        assert!(body.contains("SETUP_LOCKED"), "错误键应为 SETUP_LOCKED: {body}");
+
+        // force 豁免：锁定解除（试连 test:false 免真实连接；后续流程同未配置路径）
+        crate::setup::init(true, true);
+        let resp = app(test_state())
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/setup/system")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        r#"{"name":"x2","ashost":"h","sysnr":"00","client":"001","user":"u","passwd":"p","test":false}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            resp.status().is_success(),
+            "force 后应放行: {}",
+            resp.status()
+        );
+        crate::setup::init(true, false); // 还原默认，避免污染并行测试
     }
 
     #[tokio::test]
@@ -3382,6 +3492,7 @@ mod tests {
             update_check: false,
             systems_file: toml_path.to_path_buf(),
             setup_enabled: true,
+            setup_force: false,
             open_browser: false,
         };
         Arc::new(crate::systems::build_registry(vec![], &cfg))

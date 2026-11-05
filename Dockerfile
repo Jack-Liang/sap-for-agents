@@ -39,11 +39,12 @@ RUN touch src/main.rs && cargo build --release
 # ============ 运行阶段 ============
 FROM debian:bookworm-slim AS runtime
 
-# 运行期依赖：libssl + ca-certificates（HTTPS）
+# 运行期依赖：libssl + ca-certificates（HTTPS）+ curl（docker-compose 健康检查）
 # 注意：不安装 SAP SDK，由运行时挂载提供
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libssl3 \
     ca-certificates \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

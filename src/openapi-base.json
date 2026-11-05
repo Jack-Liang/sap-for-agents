@@ -1,0 +1,3138 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "sap-for-agents — SAP NWRFC → REST gateway",
+    "description": "Expose SAP RFC/BAPI function modules as HTTP endpoints. Any language or AI agent that can POST JSON can call SAP through this gateway, without installing an SAP client or NWRFC SDK. Machine-readable contract for AI self-service: search → inspect interface → read docs → invoke.",
+    "version": "0.0.0"
+  },
+  "servers": [
+    {
+      "url": "REPLACE_BASE"
+    }
+  ],
+  "tags": [
+    {
+      "name": "invoke",
+      "description": "Generic RFC/BAPI invocation"
+    },
+    {
+      "name": "discovery",
+      "description": "AI-facing metadata endpoints (search / interface / docs / DDIC)"
+    },
+    {
+      "name": "source",
+      "description": "ABAP source code readers"
+    },
+    {
+      "name": "objects",
+      "description": "ABAP object writes (lock → write → unlock → activate orchestrated)"
+    },
+    {
+      "name": "dumps",
+      "description": "ABAP short-dump (ST22) structured reads"
+    },
+    {
+      "name": "adt",
+      "description": "ADT REST proxy (Eclipse tooling API pass-through)"
+    },
+    {
+      "name": "table",
+      "description": "Transparent table data reader"
+    },
+    {
+      "name": "registry",
+      "description": "API registry — cross-session memory of agent-built interfaces (gateway-local, survives restarts)"
+    },
+    {
+      "name": "ops",
+      "description": "Health probes and metrics (unauthenticated)"
+    }
+  ],
+  "paths": {
+    "/health": {
+      "get": {
+        "tags": [
+          "ops"
+        ],
+        "summary": "Liveness probe (does not touch SAP)",
+        "responses": {
+          "200": {
+            "description": "Process is alive",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HealthStatus"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/ready": {
+      "get": {
+        "tags": [
+          "ops"
+        ],
+        "summary": "Readiness probe (pings SAP via RFC_PING, 5s timeout)",
+        "description": "Verifies SAP reachability through the connection pool. Returns 503 when SAP is unreachable or times out — orchestrators should remove this instance from load balancing, not restart it.",
+        "responses": {
+          "200": {
+            "description": "SAP reachable",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReadyStatus"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "SAP unreachable / timed out",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReadyStatus"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/metrics": {
+      "get": {
+        "tags": [
+          "ops"
+        ],
+        "summary": "Prometheus metrics (connection pool + RFC call counters/latency)",
+        "responses": {
+          "200": {
+            "description": "Prometheus text exposition format",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/agents.md": {
+      "get": {
+        "tags": [
+          "ops"
+        ],
+        "summary": "Agent documentation (AGENTS.md, markdown)",
+        "description": "Human/AI-readable guide for using this gateway. Start here if you don't know which endpoint fits your task.",
+        "responses": {
+          "200": {
+            "description": "Markdown document",
+            "content": {
+              "text/markdown": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/version": {
+      "get": {
+        "tags": [
+          "ops"
+        ],
+        "summary": "Gateway version + capability self-description (public, does not fail on SAP outage)",
+        "description": "Gateway version/git commit, capability switches (auth, read_only, adt, rate_limit_rps) and SAP system info (sysid, release, host, os, client). Call this first in a new session instead of probing 401/403/503/429 by trial. SAP info is fetched lazily on first call and cached for the process lifetime; when SAP is unreachable, `sap` is null and `sap_error` carries the reason (still HTTP 200).",
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "Version and capabilities (sap block may be null)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/VersionInfo"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/systems": {
+      "get": {
+        "tags": [
+          "ops"
+        ],
+        "summary": "List connected SAP systems (multi-system, public)",
+        "description": "v0.16: the gateway can connect to several SAP systems at once (sap_systems.toml). This endpoint lists them — name, whether default, read_only, adt enabled, sysid (once connected), quarantined. Every /api/* endpoint also has a scoped form: /api/s/{system}/... (e.g. POST /api/s/prd/rfc) targets that system; unprefixed paths hit the default. Single-system deployments list one entry.",
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "System inventory"
+          }
+        }
+      }
+    },
+    "/api/setup": {
+      "get": {
+        "tags": [
+          "ops"
+        ],
+        "summary": "Guided-setup status and field checklist (public)",
+        "description": "v0.17: first-run onboarding for agents. When the gateway starts with no sap_systems.toml and no SAP_* connection env vars, it still listens (unconfigured mode): business endpoints return 503 SYSTEM_NOT_CONFIGURED and this endpoint tells an agent how to proceed — whether a config is in place, where the config file lives, whether setup writes are allowed (SAP_SETUP=off disables), and a `fields` checklist (name/ashost/sysnr/client/user/passwd/...) to interview the user with. POST /api/setup/system then validates, optionally test-connects, persists sap_systems.toml and hot-loads the system without a restart.",
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "Setup status + interview field schema"
+          }
+        }
+      }
+    },
+    "/api/setup/system": {
+      "post": {
+        "tags": [
+          "ops"
+        ],
+        "summary": "Add an SAP system (guided setup: validate → test-connect → persist → hot-load)",
+        "description": "v0.17: agent-guided configuration write. Body fields mirror one [systems.{name}] table of sap_systems.toml (unknown keys are rejected). Flow: build_spec validation (same rules as startup parsing, incl. ${VAR} interpolation) → real test connection (RFC open + system info; skipped with `test:false`) → SYSID conflict check → persist to sap_systems.toml (existing entries preserved; env-synthesized default system persisted on first write) → hot-load into the running gateway. The first system always becomes the default. 400 SETUP_PARAM_INVALID / 409 SETUP_NAME_EXISTS or SYSTEM_SYSID_CONFLICT / 403 SETUP_DISABLED (SAP_SETUP=off) / 502 SETUP_CONNECT_FAILED (nothing persisted).",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "name"
+                ],
+                "properties": {
+                  "name": {
+                    "type": "string",
+                    "description": "System name (URL segment /api/s/{name}/...): 1-32 chars, lowercase/digits/-/_"
+                  },
+                  "ashost": {
+                    "type": "string",
+                    "description": "Application server host (direct form; or use conn.MSHOST for load balancing)"
+                  },
+                  "sysnr": {
+                    "type": "string",
+                    "description": "System number (two digits, e.g. 00) — required with ashost"
+                  },
+                  "client": {
+                    "type": "string",
+                    "description": "Logon client (three digits)"
+                  },
+                  "user": {
+                    "type": "string",
+                    "description": "SAP logon user (required)"
+                  },
+                  "passwd": {
+                    "type": "string",
+                    "description": "SAP password; supports ${VAR} env-var indirection (recommended)"
+                  },
+                  "lang": {
+                    "type": "string",
+                    "description": "Logon language (default EN)"
+                  },
+                  "default": {
+                    "type": "boolean",
+                    "description": "Make this the default system (the first system always becomes default)"
+                  },
+                  "test": {
+                    "type": "boolean",
+                    "description": "Test-connect before persisting (default true; false = offline pre-provisioning, unverified)"
+                  },
+                  "conn": {
+                    "type": "object",
+                    "additionalProperties": {
+                      "type": "string"
+                    },
+                    "description": "Free-form SDK connection params (upper-cased, passed through): MSHOST/R3NAME/GROUP for load-balanced connections"
+                  },
+                  "read_only": {
+                    "type": "boolean"
+                  },
+                  "pool_size": {
+                    "type": "integer"
+                  },
+                  "idle_validate_secs": {
+                    "type": "integer"
+                  },
+                  "request_timeout_secs": {
+                    "type": "integer"
+                  },
+                  "adt_base_url": {
+                    "type": "string"
+                  },
+                  "adt_user": {
+                    "type": "string"
+                  },
+                  "adt_passwd": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Saved + hot-loaded (connection block carries sysid/release when tested)"
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          },
+          "502": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/admin/reload": {
+      "post": {
+        "tags": [
+          "ops"
+        ],
+        "summary": "Reload a system's runtime state (pool generation + metadata cache)",
+        "description": "v0.18: makes a system behave as if the gateway had just been restarted — without restarting the process. The listener stays up and in-flight requests finish on their old connection. Two caches go stale when an SAP-side RFC interface changes (parameters added/removed/retyped): the SDK's per-connection function-descriptor cache and the gateway's per-function metadata cache. This endpoint bumps the connection-pool generation (idle connections closed immediately, borrowed ones dropped on return) and clears the function/DDIC metadata cache, so the next call reconnects and re-reads the signature from SAP. Call it after changing an RFC in SE37/SE80 and before trusting /api/functions or /api/rfc. Scoped form: POST /api/s/{system}/admin/reload. It does NOT re-read .env or sap_systems.toml — config changes still need a process restart (adding systems hot-loads via POST /api/setup/system). Safe on read_only systems: it only resets local caches.",
+        "responses": {
+          "200": {
+            "description": "Reloaded: system, connections_closed, func_metadata_cleared, type_metadata_cleared"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/admin/restart": {
+      "post": {
+        "tags": [
+          "ops"
+        ],
+        "summary": "Gracefully restart the gateway process (drain then exit)",
+        "description": "v0.18: the only correct way to apply changes that live outside a system's runtime state — .env values (SAP_API_KEY, SAP_LISTEN_ADDR, SAP_POOL_SIZE, SAP_REQUEST_TIMEOUT_SECS) or a different binary. Returns 202 immediately; the restart happens asynchronously. Sequence: /ready starts returning 503 with Retry-After for SAP_DRAIN_SECS seconds (default 5) while the listener keeps serving in-flight requests, then the process exits with code 0. The process only comes back if a supervisor restarts it (`start.sh` guard loop, launchd KeepAlive, systemd Restart=always, docker --restart). Started as a bare exec, it stays down — check the `warning` field in the response. For RFC signature changes use POST /api/admin/reload instead: it needs no restart and keeps the listener up. Scoped form: POST /api/s/{system}/admin/restart (the system segment is ignored — restart is process-wide).",
+        "responses": {
+          "202": {
+            "description": "Accepted: status=restarting, drain_secs, warning about supervisor requirement"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/rfc": {
+      "post": {
+        "tags": [
+          "invoke"
+        ],
+        "summary": "Invoke any SAP RFC/BAPI function module",
+        "description": "Generic invocation: fill `func_name` plus the parameters you care about; outputs you request are returned as JSON. For write BAPIs (CREATE/UPDATE/DELETE) you must call BAPI_TRANSACTION_COMMIT afterwards or the changes won't take effect. Check the RETURN table (read_return: true) for TYPE=E rows instead of relying on HTTP status.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/InvokeRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Function executed (may still carry SAP-side errors in return_table)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InvokeResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "429": {
+            "$ref": "#/components/responses/Error"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error"
+          },
+          "502": {
+            "$ref": "#/components/responses/Error"
+          },
+          "504": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/functions/search": {
+      "post": {
+        "tags": [
+          "discovery"
+        ],
+        "summary": "Search function modules by wildcard",
+        "description": "`*` matches anything, e.g. `BAPI_USER_*`, `RFC_*`. Returns 200 with an empty list when nothing matches (not an error). At least one of pattern / group must be non-empty.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SearchRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Search result",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SearchResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "429": {
+            "$ref": "#/components/responses/Error"
+          },
+          "502": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/functions/{name}": {
+      "get": {
+        "tags": [
+          "discovery"
+        ],
+        "summary": "Inspect a function's interface (all parameters)",
+        "description": "Returns parameter names (case-sensitive, always UPPERCASE), types (CHAR/INT/TABLE/...), directions (IMPORT/EXPORT/TABLES), lengths and nested fields. Inspect this before invoking to avoid 90% of parameter mistakes.",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "description": "Function module name, e.g. BAPI_USER_GETLIST. Namespaced names (containing /) are supported via the raw or percent-encoded form.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Function interface",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FunctionInterface"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "502": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/functions/{name}/doc": {
+      "get": {
+        "tags": [
+          "discovery"
+        ],
+        "summary": "Read a function's documentation (SE37)",
+        "description": "Returns short_text, long_text (full SE37 documentation, may be empty) and per-parameter docs. Empty long_text is normal — read parameter_docs instead.",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "lang",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": "EN"
+            },
+            "description": "Documentation language (e.g. EN, DE, ZH). Defaults to SAP_LANG env."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Function documentation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FunctionDocResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "502": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/functions/{name}/source": {
+      "get": {
+        "tags": [
+          "source"
+        ],
+        "summary": "Read a function module's ABAP source",
+        "description": "Reads via RPY_FUNCTIONMODULE_READ; on non-404 failures it falls back to the ADT channel automatically (response `source_via` tells you which path served the lines: \"rfc\" or \"adt\"). `?prologue=true` appends a `prologue` section: signatures of the function's CALL FUNCTION dependencies.",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "prologue",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "true",
+                "1"
+              ]
+            },
+            "description": "true = include dependency-signature prologue"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "ABAP source lines",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SourceResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "502": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/programs/{name}/source": {
+      "get": {
+        "tags": [
+          "source"
+        ],
+        "summary": "Read an ABAP program/report/include's source",
+        "description": "Reads via RPY_PROGRAM_READ; falls back to the ADT channel on failure. The `source_via` field tells which path served the lines (\"rfc\" or \"adt\").",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "ABAP source lines",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SourceResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "502": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/ddic/type/{name}": {
+      "get": {
+        "tags": [
+          "discovery"
+        ],
+        "summary": "Inspect DDIC structure/table field definitions",
+        "description": "Widely available for structures (e.g. BAPIRET2); for transparent tables (e.g. MARA) it depends on the target system's DDIC configuration — some systems return NOT_FOUND.",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Type definition",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DdicTypeResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "502": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/ddic/field/{table}/{field}": {
+      "get": {
+        "tags": [
+          "discovery"
+        ],
+        "summary": "Inspect a field's semantics (data element / domain / fixed values)",
+        "description": "Especially useful for status-code / type fields: fixed_values tells you which values are legal.",
+        "parameters": [
+          {
+            "name": "table",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "field",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "lang",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": "EN"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Field semantics",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FieldSemanticsResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "502": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/table/read": {
+      "post": {
+        "tags": [
+          "table"
+        ],
+        "summary": "Read transparent table data (no RFC_READ_TABLE plumbing)",
+        "description": "Wraps RFC_READ_TABLE with ET_DATA (avoids the 512-byte truncation). rowcount defaults to 1000, max 10000. WHERE clauses are ABAP Open SQL fragments, one per array element.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TableReadRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Table rows",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TableReadResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "502": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/registry": {
+      "get": {
+        "tags": [
+          "registry"
+        ],
+        "summary": "List registered APIs (agent cross-session memory)",
+        "description": "Every remote-enabled function module successfully written through this gateway is auto-registered here as a draft entry; entries carry intent / pitfalls / example invocations and survive restarts. Check this first in a new session before searching SAP. Tombstoned entries (their FM was deleted) are hidden unless include_deleted=true.",
+        "parameters": [
+          {
+            "name": "q",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Substring filter on alias / func_name / intent (case-insensitive)"
+          },
+          {
+            "name": "include_deleted",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": false
+            },
+            "description": "Also list tombstoned entries"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Registry entries (alias-sorted)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "count",
+                    "version",
+                    "entries"
+                  ],
+                  "properties": {
+                    "count": {
+                      "type": "integer"
+                    },
+                    "version": {
+                      "type": "integer",
+                      "description": "Storage schema version"
+                    },
+                    "entries": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/RegistryEntry"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/registry/{alias}": {
+      "get": {
+        "tags": [
+          "registry"
+        ],
+        "summary": "Read one registry entry",
+        "parameters": [
+          {
+            "name": "alias",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^[a-z0-9_/-]{1,60}$"
+            },
+            "description": "Unique lowercase id (team/name prefixes allowed)"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The entry",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RegistryEntry"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "registry"
+        ],
+        "summary": "Create/fully replace a registry entry",
+        "description": "PUT is a FULL replace (GET first, merge, PUT back). Auto-registered drafts keep their origin. status accepts draft/published only (deletion goes through DELETE).",
+        "parameters": [
+          {
+            "name": "alias",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^[a-z0-9_/-]{1,60}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RegistryPutRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Entry after write + created flag",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "created": {
+                      "type": "boolean"
+                    },
+                    "entry": {
+                      "$ref": "#/components/schemas/RegistryEntry"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "registry"
+        ],
+        "summary": "Tombstone (default) or physically remove an entry",
+        "parameters": [
+          {
+            "name": "alias",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "purge",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": false
+            },
+            "description": "true = physical removal (default tombstones for the record)"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "deleted / purged",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "alias": {
+                      "type": "string"
+                    },
+                    "status": {
+                      "type": "string",
+                      "enum": [
+                        "deleted",
+                        "purged"
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/invokes/audit": {
+      "get": {
+        "tags": [
+          "registry"
+        ],
+        "summary": "Recent invoke audit trail (last ~500, newest first)",
+        "description": "Ring buffer of the most recent calls across /api/rfc, typed invokes and flat invokes: timestamp, source endpoint (via), registry alias when applicable, function name, ok/status, duration in ms, caller IP. For quick troubleshooting without log access.",
+        "responses": {
+          "200": {
+            "description": "Audit records",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "count": {
+                      "type": "integer"
+                    },
+                    "records": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "at": { "type": "string", "description": "RFC3339 UTC" },
+                          "via": { "type": "string", "enum": ["rfc", "functions-invoke", "invokes-alias"] },
+                          "alias": { "type": "string", "nullable": true },
+                          "func": { "type": "string" },
+                          "ok": { "type": "boolean" },
+                          "status": { "type": "integer" },
+                          "ms": { "type": "integer" },
+                          "ip": { "type": "string" }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/invokes/{alias}": {
+      "post": {
+        "tags": [
+          "registry"
+        ],
+        "summary": "Flat invoke of a registered API (consumer-facing delivery port)",
+        "description": "Flat JSON in / flat JSON out — no SAP dialect needed. The contract is derived from the function's live interface metadata: input keys map to parameters (case-insensitive; structures are objects, tables are arrays of row objects), all outputs are returned by true type, output tables are row-capped (?limit= overrides; default 100, entry max_rows overrides the default). Response carries \"_truncated\" listing capped tables when truncation occurred. Unknown body keys are rejected with 400 (allowed keys listed). Alias comes from GET /api/registry; published entries also appear as fully typed operations in this spec.",
+        "parameters": [
+          {
+            "name": "alias",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Registry alias (unique lowercase id)"
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "default": 100,
+              "maximum": 10000
+            },
+            "description": "Row cap for output tables"
+          },
+          {
+            "name": "timeout_secs",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "description": "Per-call timeout override in seconds"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "description": "Flat body: parameter name → value"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Flat result: output parameter name → value",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "502": {
+            "$ref": "#/components/responses/Error"
+          },
+          "504": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/dumps": {
+      "get": {
+        "tags": [
+          "dumps"
+        ],
+        "summary": "Structured short-dump list (parsed from the ADT Atom feed)",
+        "description": "ST22 entries newest-first, parsed into structured items (no 45KB–1MB raw text). Each item's `key` plugs into /api/dumps/{key}/detail.",
+        "parameters": [
+          {
+            "name": "from",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "pattern": "^[0-9]{14}$"
+            },
+            "description": "Start time, UTC yyyyMMddHHmmss (server-side paging in ADT)"
+          },
+          {
+            "name": "to",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "pattern": "^[0-9]{14}$"
+            },
+            "description": "End time, same format"
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "default": 100,
+              "minimum": 1,
+              "maximum": 1000
+            },
+            "description": "Max entries processed"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Dump list",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "count",
+                    "dumps"
+                  ],
+                  "properties": {
+                    "count": {
+                      "type": "integer"
+                    },
+                    "dumps": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/DumpEntry"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "502": {
+            "$ref": "#/components/responses/Error"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/dumps/grouped": {
+      "get": {
+        "tags": [
+          "dumps"
+        ],
+        "summary": "Dumps grouped by (error type, terminated program)",
+        "description": "Answers \"what keeps failing\". Groups sorted by count desc; `latest_key` plugs straight into the detail endpoint.",
+        "parameters": [
+          {
+            "name": "from",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "pattern": "^[0-9]{14}$"
+            }
+          },
+          {
+            "name": "to",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "pattern": "^[0-9]{14}$"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "default": 100,
+              "minimum": 1,
+              "maximum": 1000
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Grouped dumps",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "count",
+                    "groups"
+                  ],
+                  "properties": {
+                    "count": {
+                      "type": "integer"
+                    },
+                    "groups": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/DumpGroup"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "502": {
+            "$ref": "#/components/responses/Error"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/dumps/{key}/detail": {
+      "get": {
+        "tags": [
+          "dumps"
+        ],
+        "summary": "One dump's structured detail (header / termination point / call stack)",
+        "description": "Take `key` from the list endpoint's items. Raw %20-encoded or decoded keys both work. Note: OpenAPI cannot express a multi-segment path parameter — {key} may contain slashes.",
+        "parameters": [
+          {
+            "name": "key",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Dump detail",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DumpDetail"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "502": {
+            "$ref": "#/components/responses/Error"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/objects/{type}/{name}/source": {
+      "get": {
+        "tags": [
+          "objects"
+        ],
+        "summary": "Read an object's source (ADT channel, original casing)",
+        "description": "type ∈ prog|incl|class|intf|func|fugr|cds|tabl (package has no source; tabl returns the DDIC table DDL 'define table ...' form; stru the structure DDL 'define structure ...'). For func the group is auto-resolved when not given. Returns lines[] plus the joined source string.",
+        "parameters": [
+          {
+            "name": "type",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "prog",
+                "incl",
+                "class",
+                "intf",
+                "func",
+                "fugr",
+                "cds",
+                "tabl",
+                "stru"
+              ]
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Source lines",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "type": { "type": "string" },
+                    "name": { "type": "string" },
+                    "lines": { "type": "array", "items": { "type": "string" } },
+                    "source": { "type": "string" },
+                    "source_via": { "type": "string", "enum": ["adt"] }
+                  }
+                }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/Error" },
+          "401": { "$ref": "#/components/responses/Error" },
+          "404": { "$ref": "#/components/responses/Error" },
+          "502": { "$ref": "#/components/responses/Error" }
+        }
+      },
+      "put": {
+        "tags": [
+          "objects"
+        ],
+        "summary": "Write an object's full source (lock → put → unlock → activate, orchestrated)",
+        "description": "type ∈ prog|incl|class|intf|func|fugr|cds|tabl (tabl/stru = DDIC table/structure DDL sources, written lock-free with etag optimistic concurrency); name may contain / (namespaced objects, e.g. /UI5/CL_X — OpenAPI cannot express multi-segment path params). Activation failure is a logical result (HTTP 200 + activated.messages), not a transport error. For func objects the function group is auto-resolved when not given; FM parameter signatures are part of the source (inline in the FUNCTION statement; classic *\" comment blocks are converted automatically); rfc_enabled:true additionally marks the module remote-enabled.",
+        "parameters": [
+          {
+            "name": "type",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "prog",
+                "incl",
+                "class",
+                "intf",
+                "func",
+                "fugr",
+                "cds",
+                "tabl",
+                "stru"
+              ]
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ObjectWriteBody"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Write outcome (check activated.success / activated.messages)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WriteOutcome"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "502": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/objects/{type}/{name}/replace": {
+      "post": {
+        "tags": [
+          "objects"
+        ],
+        "summary": "AI-style unique find-and-replace + activate",
+        "description": "Reads the current source, replaces `old_string` with `new_string` (must match exactly once and change the content), then runs the same write orchestration as PUT /source.",
+        "parameters": [
+          {
+            "name": "type",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "prog",
+                "incl",
+                "class",
+                "intf",
+                "func",
+                "fugr",
+                "cds",
+                "tabl",
+                "stru"
+              ]
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ObjectReplaceBody"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Write outcome (replaced=true)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WriteOutcome"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "502": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/objects/{type}/{name}/syntax": {
+      "post": {
+        "tags": [
+          "objects"
+        ],
+        "summary": "Syntax-check source without writing it",
+        "description": "Submits the given source for a syntax check (nothing is persisted).",
+        "parameters": [
+          {
+            "name": "type",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "prog",
+                "incl",
+                "class",
+                "intf",
+                "func",
+                "fugr",
+                "cds",
+                "tabl",
+                "stru"
+              ]
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "source"
+                ],
+                "properties": {
+                  "source": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Syntax issues (empty list = clean)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "type",
+                    "name",
+                    "count",
+                    "issues"
+                  ],
+                  "properties": {
+                    "type": {
+                      "type": "string"
+                    },
+                    "name": {
+                      "type": "string"
+                    },
+                    "count": {
+                      "type": "integer"
+                    },
+                    "issues": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/SyntaxIssue"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "502": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/objects/{type}/{name}/create": {
+      "post": {
+        "tags": [
+          "objects"
+        ],
+        "summary": "Create an object shell (ADT-first; prog/func fall back to RFC)",
+        "description": "type ∈ prog|incl|class|intf|func|fugr|cds|tabl|stru|package. Creates the object via the standard ADT objectcreation XML (Eclipse/vsp/abapfs contract); prog/func fall back to the RFC RPY insert path when ADT fails. func auto-creates its function group when missing. package: devclass = parent package, software_component optional (candidates ZLOCAL→LOCAL→HOME). Optional `source` writes+activates the first version in one call; rfc_enabled marks a func remote-enabled.",
+        "parameters": [
+          {
+            "name": "type",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "prog",
+                "incl",
+                "class",
+                "intf",
+                "func",
+                "fugr",
+                "cds",
+                "tabl",
+                "stru",
+                "package"
+              ]
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "description"
+                ],
+                "properties": {
+                  "description": {
+                    "type": "string",
+                    "description": "Object title / short text (required by SAP)"
+                  },
+                  "devclass": {
+                    "type": "string",
+                    "description": "Package (default $TMP); for package type: parent package"
+                  },
+                  "transport": {
+                    "type": "string"
+                  },
+                  "software_component": {
+                    "type": "string",
+                    "description": "package only: software component"
+                  },
+                  "source": {
+                    "type": "string",
+                    "description": "Optional first source (written + activated in one call)"
+                  },
+                  "activate": {
+                    "type": "boolean",
+                    "default": true
+                  },
+                  "rfc_enabled": {
+                    "type": "boolean",
+                    "description": "func only: mark remote-enabled after the first write"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "created=true (+write when source given)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "created": { "type": "boolean" },
+                    "type": { "type": "string" },
+                    "name": { "type": "string" },
+                    "write": { "$ref": "#/components/schemas/WriteOutcome" }
+                  }
+                }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/Error" },
+          "401": { "$ref": "#/components/responses/Error" },
+          "409": { "$ref": "#/components/responses/Error" },
+          "502": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/api/objects/{type}/{name}": {
+      "delete": {
+        "tags": [
+          "objects"
+        ],
+        "summary": "Delete an object (lock → DELETE → done)",
+        "description": "type ∈ prog|incl|class|intf|func|fugr|cds|tabl|stru|package. Deleting a fugr removes its function modules too. Query params: group (func only), transport. Irreversible.",
+        "parameters": [
+          {
+            "name": "type",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "prog",
+                "incl",
+                "class",
+                "intf",
+                "func",
+                "fugr",
+                "cds",
+                "tabl",
+                "stru",
+                "package"
+              ]
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "group",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Function group (func only; auto-resolved when omitted)"
+          },
+          {
+            "name": "transport",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "deleted=true",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "type": { "type": "string" },
+                    "name": { "type": "string" },
+                    "deleted": { "type": "boolean" }
+                  }
+                }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/Error" },
+          "401": { "$ref": "#/components/responses/Error" },
+          "409": { "$ref": "#/components/responses/Error" },
+          "502": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/api/adt/{path}": {
+      "get": {
+        "tags": [
+          "adt"
+        ],
+        "summary": "ADT REST proxy (any method: GET/POST/PUT/DELETE/PATCH)",
+        "description": "Transparently proxies the SAP system's ADT REST API (/sap/bc/adt/** on ICF — the same API Eclipse uses). The URL after /api/adt/ maps 1:1 to the ADT path; Accept/Content-Type/If-Match headers and body are forwarded, responses passed through verbatim (mostly XML). Write methods get X-CSRF-Token + session handling automatically (retries once on 403). Gateway-side failures use the JSON error contract (400 ADT_PATH_INVALID / 502 ADT_UNREACHABLE / 503 ADT_DISABLED / 504 ADT_TIMEOUT); other statuses come from ADT itself. Note: OpenAPI cannot express a multi-segment path parameter — {path} here may contain slashes (e.g. runtime/dumps).",
+        "parameters": [
+          {
+            "name": "path",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "ADT sub-path, e.g. runtime/dumps or oo/classes/CL_RUNTIME_ERROR/source/main"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "ADT response passed through verbatim"
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "502": {
+            "$ref": "#/components/responses/Error"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error"
+          },
+          "504": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "HealthStatus": {
+        "type": "object",
+        "properties": {
+          "status": {
+            "type": "string",
+            "example": "ok"
+          },
+          "version": {
+            "type": "string",
+            "description": "Gateway version (same as /api/version, convenience for pollers)"
+          }
+        }
+      },
+      "VersionInfo": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "example": "sap-for-agents"
+          },
+          "version": {
+            "type": "string",
+            "example": "0.10.0"
+          },
+          "commit": {
+            "type": "string",
+            "description": "Git short commit the binary was built from; '-dirty' suffix when the working tree had uncommitted changes, 'unknown' when built without git",
+            "example": "0fa6d6b"
+          },
+          "capabilities": {
+            "type": "object",
+            "description": "Deployment switches that change agent behavior",
+            "properties": {
+              "auth": {
+                "type": "boolean",
+                "description": "true = SAP_API_KEY is set; /api/* requires Bearer token (this endpoint excepted)"
+              },
+              "read_only": {
+                "type": "boolean",
+                "description": "true = SAP_READ_ONLY; gateway write endpoints return 403 READ_ONLY"
+              },
+              "adt": {
+                "type": "boolean",
+                "description": "true = ADT proxy (/api/adt/**, /api/dumps*) enabled"
+              },
+              "rate_limit_rps": {
+                "type": "integer",
+                "nullable": true,
+                "description": "Per-IP requests/second cap; null = unlimited"
+              }
+            }
+          },
+          "latest": {
+            "nullable": true,
+            "type": "object",
+            "description": "Latest GitHub release, from a background check (startup + every 24h, one anonymous GET — disable with SAP_UPDATE_CHECK=off). null when not fetched / disabled / unreachable; never blocks the response",
+            "properties": {
+              "version": {
+                "type": "string",
+                "example": "0.11.0"
+              },
+              "url": {
+                "type": "string",
+                "description": "Release page URL"
+              },
+              "update_available": {
+                "type": "boolean",
+                "description": "true = the running version is older than this release"
+              }
+            }
+          },
+          "sap": {
+            "nullable": true,
+            "type": "object",
+            "description": "Target SAP system info, cached from the first successful fetch; null when SAP is currently unreachable",
+            "properties": {
+              "sysid": {
+                "type": "string",
+                "example": "A4H"
+              },
+              "release": {
+                "type": "string",
+                "description": "SAP release (RFCSI SAPRL, e.g. 753/816). Reflects the kernel/Basis level only — to distinguish ECC vs S/4HANA, check the CVERS table for the S4CORE component (POST /api/table/read)",
+                "example": "816"
+              },
+              "host": {
+                "type": "string",
+                "description": "Application server hostname"
+              },
+              "os": {
+                "type": "string",
+                "example": "Linux"
+              },
+              "destination": {
+                "type": "string",
+                "description": "RFC destination name (e.g. vhcala4hci_A4H_00)"
+              },
+              "client": {
+                "type": "string",
+                "description": "Login client (SAP_CLIENT config)",
+                "example": "001"
+              }
+            }
+          },
+          "sap_error": {
+            "type": "string",
+            "description": "Present when sap is null: why the SAP info fetch failed (retryable on next call)"
+          }
+        }
+      },
+      "ReadyStatus": {
+        "type": "object",
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": [
+              "ready",
+              "unavailable",
+              "timeout"
+            ]
+          },
+          "sap": {
+            "type": "string",
+            "description": "Present (\"ok\") on success"
+          },
+          "code": {
+            "type": "integer",
+            "description": "SAP error code on failure"
+          },
+          "message": {
+            "type": "string"
+          },
+          "timeout_ms": {
+            "type": "integer",
+            "description": "Present on probe timeout"
+          }
+        }
+      },
+      "ScalarValue": {
+        "description": "Scalar parameter value. Implicit dispatch by JSON type: string → CHAR/NUM/DATE/TIME/BCD-as-string, integer → INT, float → FLOAT. Explicit type markers for BCD/INT8/binary: {\"type\":\"BCD\",\"value\":\"123.45\"}, {\"type\":\"INT8\",\"value\":123}, {\"type\":\"BYTES\",\"value\":\"<base64>\"}.",
+        "oneOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "integer",
+            "format": "int32"
+          },
+          {
+            "type": "integer",
+            "format": "int64"
+          },
+          {
+            "type": "number",
+            "format": "double"
+          },
+          {
+            "$ref": "#/components/schemas/TypedScalar"
+          }
+        ]
+      },
+      "TypedScalar": {
+        "type": "object",
+        "required": [
+          "type",
+          "value"
+        ],
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "BCD",
+              "INT8",
+              "BYTES"
+            ]
+          },
+          "value": {
+            "description": "BCD → numeric string; INT8 → integer; BYTES → Base64 string",
+            "oneOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "integer",
+                "format": "int64"
+              }
+            ]
+          }
+        }
+      },
+      "MaxLen": {
+        "description": "String-output max length. Legacy form: plain integer. Detailed form: {\"max_len\": 255} (null = auto-discover from metadata).",
+        "oneOf": [
+          {
+            "type": "integer",
+            "minimum": 0
+          },
+          {
+            "type": "object",
+            "properties": {
+              "max_len": {
+                "type": "integer",
+                "nullable": true,
+                "minimum": 0
+              }
+            }
+          }
+        ]
+      },
+      "FieldSpec": {
+        "type": "object",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Field name (uppercase)"
+          },
+          "max_len": {
+            "type": "integer",
+            "nullable": true,
+            "description": "Omit for auto-discovery from metadata"
+          },
+          "auto": {
+            "type": "boolean",
+            "default": false,
+            "description": "true = read by the field's true DDIC type (INT→integer, FLOAT→float, INT8→i64, BYTE/XSTRING→Base64), false (default) = string"
+          }
+        }
+      },
+      "FieldDef": {
+        "type": "object",
+        "description": "Nested field definition (recursive for structures/tables)",
+        "required": [
+          "name",
+          "type",
+          "length"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "type": {
+            "type": "string",
+            "enum": [
+              "CHAR",
+              "DATE",
+              "BCD",
+              "TIME",
+              "BYTE",
+              "TABLE",
+              "NUM",
+              "FLOAT",
+              "INT",
+              "INT2",
+              "INT1",
+              "STRUCTURE",
+              "STRING",
+              "XSTRING",
+              "INT8",
+              "UNKNOWN"
+            ]
+          },
+          "length": {
+            "type": "integer"
+          },
+          "decimals": {
+            "type": "integer"
+          },
+          "description": {
+            "type": "string"
+          },
+          "fields": {
+            "type": "array",
+            "nullable": true,
+            "items": {
+              "$ref": "#/components/schemas/FieldDef"
+            }
+          }
+        }
+      },
+      "InvokeRequest": {
+        "type": "object",
+        "required": [
+          "func_name"
+        ],
+        "properties": {
+          "func_name": {
+            "type": "string",
+            "description": "RFC function module name, UPPERCASE, e.g. BAPI_USER_GETLIST. Max 30 chars, [A-Za-z0-9_], optional /NS/ namespace prefix."
+          },
+          "inputs": {
+            "type": "object",
+            "description": "Scalar IMPORT/CHANGING parameters: name → value",
+            "additionalProperties": {
+              "$ref": "#/components/schemas/ScalarValue"
+            }
+          },
+          "table_inputs": {
+            "type": "object",
+            "description": "TABLES input parameters: name → array of rows; each row is {field: value}. Max 100000 rows per table.",
+            "additionalProperties": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": {
+                  "$ref": "#/components/schemas/ScalarValue"
+                }
+              }
+            }
+          },
+          "struct_inputs": {
+            "type": "object",
+            "description": "Top-level IMPORTING structure parameters: name → {field: value}, e.g. BAPI_USER_CREATE.ADDRESS",
+            "additionalProperties": {
+              "type": "object",
+              "additionalProperties": {
+                "$ref": "#/components/schemas/ScalarValue"
+              }
+            }
+          },
+          "int_outputs": {
+            "type": "array",
+            "description": "EXPORT integer parameter names to read",
+            "items": {
+              "type": "string"
+            }
+          },
+          "string_outputs": {
+            "type": "object",
+            "description": "EXPORT string parameter names to read → max length. A STRUCTURE-typed parameter is read into structs by its sub-fields automatically.",
+            "additionalProperties": {
+              "$ref": "#/components/schemas/MaxLen"
+            }
+          },
+          "auto_outputs": {
+            "type": "array",
+            "description": "EXPORT scalar parameter names to read by their true metadata type (INT→integer, FLOAT→float, INT8→i64, BCD→string, BYTE/XSTRING→Base64)",
+            "items": {
+              "type": "string"
+            }
+          },
+          "table_outputs": {
+            "type": "object",
+            "description": "EXPORT/TABLES tables to traverse: name → field list. Output rows are capped at 10000 (use /api/table/read for pagination).",
+            "additionalProperties": {
+              "type": "array",
+              "items": {
+                "$ref": "#/components/schemas/FieldSpec"
+              }
+            }
+          },
+          "struct_outputs": {
+            "type": "object",
+            "description": "Top-level structure outputs: name → field list (same rules as table_outputs)",
+            "additionalProperties": {
+              "type": "array",
+              "items": {
+                "$ref": "#/components/schemas/FieldSpec"
+              }
+            }
+          },
+          "read_return": {
+            "type": "boolean",
+            "default": false,
+            "description": "Automatically read the BAPI RETURN message table (rows with TYPE=E indicate errors)"
+          },
+          "timeout_secs": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 1800,
+            "description": "Per-call timeout in seconds. Omit to use the global default (60s); relax it for slow endpoints (batch BAPIs, large tables). 504 on timeout."
+          }
+        }
+      },
+      "InvokeResponse": {
+        "type": "object",
+        "required": [
+          "func",
+          "scalars",
+          "tables"
+        ],
+        "properties": {
+          "func": {
+            "type": "string",
+            "description": "Echoed function name"
+          },
+          "scalars": {
+            "type": "object",
+            "description": "Scalar outputs; value type depends on the read method",
+            "additionalProperties": {
+              "$ref": "#/components/schemas/ScalarValue"
+            }
+          },
+          "tables": {
+            "type": "object",
+            "description": "Table outputs: name → array of rows ({field: value}); auto:true fields keep native types, others are strings",
+            "additionalProperties": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": {
+                  "$ref": "#/components/schemas/ScalarValue"
+                }
+              }
+            }
+          },
+          "structs": {
+            "type": "object",
+            "description": "Top-level structure outputs (same value-type rules as tables)",
+            "additionalProperties": {
+              "type": "object",
+              "additionalProperties": {
+                "$ref": "#/components/schemas/ScalarValue"
+              }
+            }
+          },
+          "return_table": {
+            "type": "array",
+            "nullable": true,
+            "description": "RETURN messages (when read_return=true and the table exists). TYPE=E rows are errors.",
+            "items": {
+              "type": "object",
+              "properties": {
+                "TYPE": {
+                  "type": "string"
+                },
+                "ID": {
+                  "type": "string"
+                },
+                "NUMBER": {
+                  "type": "string"
+                },
+                "MESSAGE": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      },
+      "SearchRequest": {
+        "type": "object",
+        "properties": {
+          "pattern": {
+            "type": "string",
+            "description": "Function name wildcard, * matches anything, e.g. BAPI_USER_*"
+          },
+          "group": {
+            "type": "string",
+            "description": "Function group filter (optional)"
+          },
+          "max_results": {
+            "type": "integer",
+            "default": 50,
+            "maximum": 500,
+            "description": "Max entries returned (default 50, cap 500)"
+          }
+        }
+      },
+      "SearchResponse": {
+        "type": "object",
+        "required": [
+          "pattern",
+          "count",
+          "functions"
+        ],
+        "properties": {
+          "pattern": {
+            "type": "string"
+          },
+          "count": {
+            "type": "integer"
+          },
+          "functions": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SearchFunctionEntry"
+            }
+          }
+        }
+      },
+      "SearchFunctionEntry": {
+        "type": "object",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "group": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          }
+        }
+      },
+      "FunctionParam": {
+        "type": "object",
+        "required": [
+          "name",
+          "type",
+          "direction",
+          "length",
+          "optional"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Use this exact UPPERCASE name when invoking"
+          },
+          "type": {
+            "type": "string",
+            "enum": [
+              "CHAR",
+              "DATE",
+              "BCD",
+              "TIME",
+              "BYTE",
+              "TABLE",
+              "NUM",
+              "FLOAT",
+              "INT",
+              "INT2",
+              "INT1",
+              "STRUCTURE",
+              "STRING",
+              "XSTRING",
+              "INT8",
+              "UNKNOWN"
+            ]
+          },
+          "direction": {
+            "type": "string",
+            "enum": [
+              "IMPORT",
+              "EXPORT",
+              "CHANGING",
+              "TABLES",
+              "UNKNOWN"
+            ]
+          },
+          "length": {
+            "type": "integer"
+          },
+          "decimals": {
+            "type": "integer"
+          },
+          "optional": {
+            "type": "boolean"
+          },
+          "default": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          },
+          "fields": {
+            "type": "array",
+            "nullable": true,
+            "items": {
+              "$ref": "#/components/schemas/FieldDef"
+            }
+          }
+        }
+      },
+      "FunctionInterface": {
+        "type": "object",
+        "required": [
+          "name",
+          "params"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "params": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/FunctionParam"
+            }
+          },
+          "interface_via": {
+            "type": "string",
+            "enum": ["fii", "sdk"],
+            "description": "Which channel served the interface: fii = live server-side read (always fresh, default), sdk = SDK descriptor cache (fallback when FII is unavailable)"
+          }
+        }
+      },
+      "ParamDoc": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "text": {
+            "type": "string"
+          }
+        }
+      },
+      "FunctionDocResponse": {
+        "type": "object",
+        "required": [
+          "name",
+          "parameter_docs"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "short_text": {
+            "type": "string"
+          },
+          "long_text": {
+            "type": "string",
+            "description": "Full SE37 documentation; may be empty (normal)"
+          },
+          "warning": {
+            "type": "string",
+            "nullable": true,
+            "description": "Present when documentation could not be read"
+          },
+          "parameter_docs": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ParamDoc"
+            }
+          }
+        }
+      },
+      "SourceResponse": {
+        "type": "object",
+        "required": [
+          "name",
+          "count",
+          "lines",
+          "source_via"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "count": {
+            "type": "integer",
+            "description": "Number of source lines"
+          },
+          "lines": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "source_via": {
+            "type": "string",
+            "enum": [
+              "rfc",
+              "adt"
+            ],
+            "description": "Which channel served the lines: rfc (RPY_*_READ) or adt (fallback after RPY failure)"
+          },
+          "prologue": {
+            "description": "Only with /api/functions/{name}/source?prologue=true: signatures of the function's CALL FUNCTION dependencies",
+            "nullable": true
+          }
+        }
+      },
+      "DdicTypeResponse": {
+        "type": "object",
+        "required": [
+          "name",
+          "fields"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "fields": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/FieldDef"
+            }
+          }
+        }
+      },
+      "FixedValueDto": {
+        "type": "object",
+        "properties": {
+          "value": {
+            "type": "string"
+          },
+          "text": {
+            "type": "string"
+          }
+        }
+      },
+      "FieldSemanticsResponse": {
+        "type": "object",
+        "required": [
+          "table",
+          "field"
+        ],
+        "properties": {
+          "table": {
+            "type": "string"
+          },
+          "field": {
+            "type": "string"
+          },
+          "data_element": {
+            "type": "string"
+          },
+          "domain": {
+            "type": "string"
+          },
+          "check_table": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          },
+          "medium_label": {
+            "type": "string"
+          },
+          "fixed_values": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/FixedValueDto"
+            }
+          }
+        }
+      },
+      "TableReadRequest": {
+        "type": "object",
+        "required": [
+          "table",
+          "fields"
+        ],
+        "properties": {
+          "table": {
+            "type": "string",
+            "description": "Transparent table name, e.g. T000, USR01"
+          },
+          "fields": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Fields to select (determines column order and field-name mapping)"
+          },
+          "where": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "WHERE conditions (ABAP Open SQL fragments, one per element; empty = no filter)"
+          },
+          "rowcount": {
+            "type": "integer",
+            "default": 1000,
+            "maximum": 10000,
+            "description": "Max rows returned"
+          },
+          "delimiter": {
+            "type": "string",
+            "description": "Field delimiter for parsing (default \\u0001; change only if values contain it)"
+          }
+        }
+      },
+      "RegistryEntry": {
+        "type": "object",
+        "required": [
+          "alias",
+          "func_name",
+          "status",
+          "origin",
+          "created_at",
+          "updated_at"
+        ],
+        "properties": {
+          "alias": {
+            "type": "string",
+            "description": "Unique lowercase URL-safe id (team/name prefixes allowed)"
+          },
+          "func_name": {
+            "type": "string",
+            "description": "SAP function module name (uppercase, remote-enabled)"
+          },
+          "group": {
+            "type": "string",
+            "description": "Function group (informational)"
+          },
+          "intent": {
+            "type": "string",
+            "description": "What this API is for, who consumes it (agent-written)"
+          },
+          "notes": {
+            "type": "string",
+            "description": "Pitfalls / know-how from previous sessions (agent-written)"
+          },
+          "doc": {
+            "type": "string",
+            "description": "Consumer-facing Markdown documentation; rendered in the OpenAPI catalog's operation description"
+          },
+          "example": {
+            "type": "object",
+            "description": "Sample invoke body for POST /api/functions/{func_name}/invoke"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "draft",
+              "published",
+              "deleted"
+            ],
+            "description": "deleted = tombstone (FM was deleted; record kept)"
+          },
+          "origin": {
+            "type": "string",
+            "enum": [
+              "auto",
+              "manual"
+            ],
+            "description": "auto = created by the write hook on rfc_enabled FM writes"
+          },
+          "created_at": {
+            "type": "string",
+            "description": "RFC3339 UTC"
+          },
+          "updated_at": {
+            "type": "string",
+            "description": "RFC3339 UTC"
+          }
+        }
+      },
+      "RegistryPutRequest": {
+        "type": "object",
+        "required": [
+          "func_name"
+        ],
+        "properties": {
+          "func_name": {
+            "type": "string",
+            "description": "SAP function module name (uppercase)"
+          },
+          "group": {
+            "type": "string",
+            "description": "Function group (optional)"
+          },
+          "intent": {
+            "type": "string",
+            "description": "What this API is for (default empty)"
+          },
+          "notes": {
+            "type": "string",
+            "description": "Pitfalls / usage notes (default empty)"
+          },
+          "doc": {
+            "type": "string",
+            "description": "Consumer-facing Markdown documentation (default empty)"
+          },
+          "example": {
+            "type": "object",
+            "description": "Sample invoke body (default null = cleared)"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "draft",
+              "published"
+            ],
+            "default": "draft"
+          }
+        }
+      },
+      "TableReadResponse": {
+        "type": "object",
+        "required": [
+          "table",
+          "fields",
+          "count",
+          "rows"
+        ],
+        "properties": {
+          "table": {
+            "type": "string"
+          },
+          "fields": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "count": {
+            "type": "integer"
+          },
+          "rows": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "description": "Field name → value (all values are strings)",
+              "additionalProperties": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "DumpEntry": {
+        "type": "object",
+        "required": [
+          "key",
+          "at"
+        ],
+        "properties": {
+          "key": {
+            "type": "string",
+            "description": "Plug into /api/dumps/{key}/detail"
+          },
+          "at": {
+            "type": "string",
+            "description": "Timestamp"
+          },
+          "user": {
+            "type": "string",
+            "nullable": true
+          },
+          "error_type": {
+            "type": "string",
+            "nullable": true
+          },
+          "program": {
+            "type": "string",
+            "nullable": true
+          },
+          "message": {
+            "type": "string",
+            "nullable": true
+          },
+          "id": {
+            "type": "string",
+            "nullable": true
+          },
+          "at_secs": {
+            "type": "integer",
+            "nullable": true,
+            "description": "Unix seconds, when available"
+          }
+        }
+      },
+      "DumpGroup": {
+        "type": "object",
+        "required": [
+          "error_type",
+          "program",
+          "count",
+          "first",
+          "last",
+          "users",
+          "latest_key",
+          "latest_message"
+        ],
+        "properties": {
+          "error_type": {
+            "type": "string"
+          },
+          "program": {
+            "type": "string"
+          },
+          "count": {
+            "type": "integer"
+          },
+          "first": {
+            "type": "string"
+          },
+          "last": {
+            "type": "string"
+          },
+          "users": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "latest_key": {
+            "type": "string"
+          },
+          "latest_message": {
+            "type": "string"
+          }
+        }
+      },
+      "DumpFrame": {
+        "type": "object",
+        "properties": {
+          "position": {
+            "type": "integer"
+          },
+          "type_name": {
+            "type": "string"
+          },
+          "program": {
+            "type": "string"
+          },
+          "include": {
+            "type": "string"
+          },
+          "line": {
+            "type": "integer"
+          },
+          "name": {
+            "type": "string"
+          }
+        }
+      },
+      "DumpDetail": {
+        "type": "object",
+        "required": [
+          "key",
+          "error_type",
+          "exception",
+          "program",
+          "component",
+          "include",
+          "line",
+          "procedure",
+          "main_program",
+          "stack",
+          "header"
+        ],
+        "properties": {
+          "key": {
+            "type": "string"
+          },
+          "error_type": {
+            "type": "string"
+          },
+          "exception": {
+            "type": "string"
+          },
+          "program": {
+            "type": "string"
+          },
+          "component": {
+            "type": "string"
+          },
+          "include": {
+            "type": "string"
+          },
+          "line": {
+            "type": "integer"
+          },
+          "procedure": {
+            "type": "string"
+          },
+          "main_program": {
+            "type": "string"
+          },
+          "stack": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DumpFrame"
+            }
+          },
+          "header": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "Full ST22 header table (field → value)"
+          }
+        }
+      },
+      "ObjectWriteBody": {
+        "type": "object",
+        "required": [
+          "source"
+        ],
+        "properties": {
+          "source": {
+            "type": "string",
+            "description": "Full source text"
+          },
+          "transport": {
+            "type": "string",
+            "nullable": true,
+            "description": "Transport request number; omitted = reuse the object's bound request"
+          },
+          "activate": {
+            "type": "boolean",
+            "default": true
+          },
+          "group": {
+            "type": "string",
+            "nullable": true,
+            "description": "Function group (func objects only); omitted = auto-resolved via RFC_FUNCTION_SEARCH"
+          },
+          "rfc_enabled": {
+            "type": "boolean",
+            "default": false,
+            "description": "func only: mark the function module remote-enabled (processingType=rfc) under the same lock"
+          }
+        }
+      },
+      "ObjectReplaceBody": {
+        "type": "object",
+        "required": [
+          "old_string",
+          "new_string"
+        ],
+        "properties": {
+          "old_string": {
+            "type": "string",
+            "description": "Must match exactly once in the current source"
+          },
+          "new_string": {
+            "type": "string"
+          },
+          "transport": {
+            "type": "string",
+            "nullable": true
+          },
+          "activate": {
+            "type": "boolean",
+            "default": true
+          },
+          "group": {
+            "type": "string",
+            "nullable": true,
+            "description": "Function group hint (func objects only)"
+          },
+          "rfc_enabled": {
+            "type": "boolean",
+            "default": false,
+            "description": "func only: mark remote-enabled after the write"
+          }
+        }
+      },
+      "ActivationMessage": {
+        "type": "object",
+        "properties": {
+          "severity": {
+            "type": "string"
+          },
+          "line": {
+            "type": "integer"
+          },
+          "text": {
+            "type": "string"
+          }
+        }
+      },
+      "ActivationOutcome": {
+        "type": "object",
+        "properties": {
+          "success": {
+            "type": "boolean"
+          },
+          "activation_executed": {
+            "type": "boolean"
+          },
+          "messages": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ActivationMessage"
+            }
+          },
+          "inactive": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "problems": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "WriteOutcome": {
+        "type": "object",
+        "required": [
+          "obj_type",
+          "name",
+          "source_url",
+          "written",
+          "warnings"
+        ],
+        "properties": {
+          "obj_type": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "group": {
+            "type": "string",
+            "nullable": true
+          },
+          "source_url": {
+            "type": "string",
+            "description": "ADT source URL of the object"
+          },
+          "written": {
+            "type": "boolean"
+          },
+          "transport_used": {
+            "type": "string",
+            "nullable": true
+          },
+          "activated": {
+            "$ref": "#/components/schemas/ActivationOutcome"
+          },
+          "warnings": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "SyntaxIssue": {
+        "type": "object",
+        "properties": {
+          "severity": {
+            "type": "string"
+          },
+          "line": {
+            "type": "integer"
+          },
+          "offset": {
+            "type": "integer"
+          },
+          "text": {
+            "type": "string"
+          }
+        }
+      },
+      "ErrorBody": {
+        "type": "object",
+        "properties": {
+          "error": {
+            "type": "object",
+            "required": [
+              "code",
+              "message"
+            ],
+            "properties": {
+              "code": {
+                "type": "integer",
+                "description": "Equals the HTTP status code"
+              },
+              "message": {
+                "type": "string"
+              },
+              "key": {
+                "type": "string",
+                "description": "Machine-readable code, e.g. FU_NOT_FOUND / AUTH_INVALID / RATE_LIMITED / JSON_INVALID"
+              }
+            }
+          }
+        }
+      }
+    },
+    "responses": {
+      "Error": {
+        "description": "Error (4xx = caller-side, 5xx = SAP/network). Branch on error.code (HTTP status) and error.key (machine code).",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorBody"
+            }
+          }
+        }
+      }
+    }
+  }
+}

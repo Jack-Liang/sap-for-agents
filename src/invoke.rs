@@ -336,7 +336,7 @@ pub fn flatten_response(resp: &InvokeResponse, table_cap: usize) -> Value {
 // HTTP handler
 // ========================================================================
 
-/// `POST /api/invokes/{alias}?limit=&timeout_secs=` 的查询参数。
+/// `POST /api/invokes/{alias}?limit=&timeout_secs=&retry=` 的查询参数。
 #[derive(serde::Deserialize)]
 struct InvokeQuery {
     /// 输出表行数封顶（覆盖条目 max_rows 与默认值；上限 10000）
@@ -345,6 +345,9 @@ struct InvokeQuery {
     /// 本次调用超时秒数（同 /api/rfc 的 timeout_secs）
     #[serde(default)]
     timeout_secs: Option<u64>,
+    /// 通信类错误是否自动重试（同 /api/rfc 的 retry；写操作传 false 防双执行）
+    #[serde(default)]
+    retry: Option<bool>,
 }
 
 /// 有效封顶：`?limit=` > 条目 `max_rows` > 默认 100，clamp 到 [1, 10000]。
@@ -443,6 +446,7 @@ async fn flat_invoke_handler(
     }
 
     let mut req = classify_body(&contract, &entry.func_name, &body, q.timeout_secs)?;
+    req.retry = q.retry;
     apply_output_specs(&contract, &mut req);
 
     // 漂移守卫（v0.15）：契约（FII 实时）触碰的参数不在 SDK 描述符视图里

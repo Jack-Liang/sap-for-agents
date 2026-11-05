@@ -223,6 +223,12 @@ pub struct InvokeRequest {
     /// 让调用方对已知慢接口（批量 BAPI、大表查询）自主放宽超时；超时返回 504。
     #[serde(default)]
     pub timeout_secs: Option<u64>,
+
+    /// 通信类错误是否自动重试（默认 true，最多 3 轮新建连接）。
+    /// ⚠️ 重试发生在"函数可能已执行、响应丢失"的场景下——写 BAPI（过账类）
+    /// 传 `false` 防止双执行；重试是否发生可由 `rfc_call_retries_total` 指标观察。
+    #[serde(default)]
+    pub retry: Option<bool>,
 }
 
 /// 为 discovery 模块的程序化构造提供便利：func_name 默认空（调用方必须覆盖），
@@ -241,6 +247,7 @@ impl Default for InvokeRequest {
             struct_outputs: HashMap::new(),
             read_return: false,
             timeout_secs: None,
+            retry: None,
         }
     }
 }

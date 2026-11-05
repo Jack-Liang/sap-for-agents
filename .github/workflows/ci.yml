@@ -11,6 +11,10 @@ on:
   push:
   pull_request:
 
+# 最小权限（2026-11-05 审计：无 permissions 块会继承仓库默认 token 范围）
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -18,15 +22,18 @@ jobs:
   clippy-test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      # actions 按 commit SHA 固定（可变 tag 是供应链风险）；SHA 对应 v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Install Rust toolchain (stable + clippy)
-        uses: dtolnay/rust-toolchain@stable
+        # SHA 对应 stable（dtolnay/rust-toolchain 按分支滚动，SHA 锁定快照）
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           components: clippy
 
       - name: Cache cargo
-        uses: actions/cache@v6
+        # SHA 对应 v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: |
             ~/.cargo/registry

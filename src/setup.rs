@@ -38,20 +38,38 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 /// setup 写入开关（main 启动期从 `SAP_SETUP` 写入；默认开）。
-static SETUP_ENABLED: OnceLock<bool> = OnceLock::new();
+/// AtomicBool 而非 OnceLock：路由级测试需要按用例翻转（OnceLock 一次即定）。
+static SETUP_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// `SAP_SETUP=force`：跳过"配置完成后锁定"，任何时刻都允许引导写入。
+static SETUP_FORCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// 未配置模式下是否自动在浏览器打开引导页 `/setup`（main 启动期写入：
 /// 未配置 && `SAP_OPEN_BROWSER` 未关；server::run 监听成功后触发一次）。
 static AUTO_OPEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// 启动期写入开关（main 调一次）。
-pub fn init(enabled: bool) {
-    let _ = SETUP_ENABLED.set(enabled);
+pub fn init(enabled: bool, force: bool) {
+    SETUP_ENABLED.store(enabled, std::sync::atomic::Ordering::SeqCst);
+    SETUP_FORCE.store(force, std::sync::atomic::Ordering::SeqCst);
 }
 
 /// setup 写入当前是否允许（`/api/version` capabilities.setup 同源）。
 pub fn is_enabled() -> bool {
-    *SETUP_ENABLED.get().unwrap_or(&true)
+    SETUP_ENABLED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// `SAP_SETUP=force` 是否生效（跳过配置后锁定）。
+pub fn is_forced() -> bool {
+    SETUP_FORCE.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// setup 写入对**当前系统集合**是否可用：开关开着，且（未配置 || force）。
+/// 已配置部署默认锁定 `POST /api/setup/system`——无鉴权部署上，开放的引导
+/// 写入等于允许任何人添加恶意"系统"（网关会拿配置的凭据 Basic-auth 进去，
+/// 构成凭据中继）并把试连当内网探针。
+pub fn writable_for_configured(configured: bool) -> bool {
+    is_enabled() && (is_forced() || !configured)
 }
 
 /// 启动期写入「自动打开引导页」开关（main 调一次）。
@@ -82,6 +100,7 @@ pub async fn status_handler(
     let names = state.names();
     let cfg = state.cfg();
     let enabled = is_enabled();
+    let writable = writable_for_configured(!names.is_empty());
     Json(serde_json::json!({
         "configured": !names.is_empty(),
         "default": state.default().map(|d| d.name.clone()),
@@ -91,8 +110,14 @@ pub async fn status_handler(
         "config_file_exists": cfg.systems_file.exists(),
         // 环境变量合成路径提示：toml 首写时 env 系统会一并写入（见模块注释）
         "env_synth_will_be_persisted": crate::systems::synth_env_spec(cfg).is_some(),
-        "writable": enabled,
-        "disabled_reason": if enabled { None } else { Some("SAP_SETUP=off") },
+        "writable": writable,
+        "disabled_reason": if writable {
+            None
+        } else if !enabled {
+            Some("SAP_SETUP=off")
+        } else {
+            Some("网关已配置且 SAP_SETUP≠force（引导写入已锁定）")
+        },
         "fields": field_schema(),
         "connection_forms": {
             "direct": "ashost + sysnr（+ client）——直连单个应用服务器",
@@ -212,6 +237,21 @@ pub async fn add_handler(
             status: 403,
             message: "引导式配置已禁用（SAP_SETUP=off）：请手工编辑 sap_systems.toml 后重启".into(),
             key: "SETUP_DISABLED".into(),
+        });
+    }
+    // 配置后锁定（v0.19.1 安全修复）：已有系统的部署不再接受引导写入——
+    // 无鉴权部署上这等于允许任何人做凭据中继/内网探测。force 可豁免。
+    if !is_forced() && !state.names().is_empty() {
+        return Err(RfcError {
+            code: -1,
+            status: 403,
+            message: format!(
+                "网关已配置（系统: {}），引导写入已锁定——这是无鉴权部署的防滥用措施。\
+                 运行期加系统：手工编辑 {} 后重启；确需保持引导写入可设 SAP_SETUP=force",
+                state.names().join(", "),
+                state.cfg().systems_file.display()
+            ),
+            key: "SETUP_LOCKED".into(),
         });
     }
 
@@ -437,7 +477,7 @@ fn write_system_to_toml(
     }
     let body = toml::to_string_pretty(&root).map_err(|e| format!("序列化失败: {}", e))?;
     out.push_str(&body);
-    std::fs::write(path, out).map_err(|e| format!("写文件失败: {}", e))?;
+    crate::config::write_private_file(path, &out)?;
     Ok(persisted_env)
 }
 
@@ -501,12 +541,16 @@ fn spec_to_table(spec: &SystemSpec, is_default: bool) -> toml::Value {
         ("sysnr", "SYSNR"),
         ("client", "CLIENT"),
         ("user", "USER"),
-        ("passwd", "PASSWD"),
         ("lang", "LANG"),
     ] {
         if let Some(v) = get(sdk_key) {
             t.insert(key.into(), toml::Value::from(v));
         }
+    }
+    // 密码：env 合成系统带 ${VAR} 引用形态（passwd_ref）——引用优先于解析值，
+    // 避免 "${VAR} 不落明文" 的约定被打穿（2026-11-05 审计 P1）
+    if let Some(v) = spec.passwd_ref.clone().or_else(|| get("PASSWD")) {
+        t.insert("passwd".into(), toml::Value::from(v));
     }
     // adt_base_url 语义：None=按 ashost 推导（不写）、Some("")=禁用（写空串）、
     // Some(url)=显式（写 url）。env 合成路径禁用时是 Some("")，推导时不写。
@@ -569,6 +613,7 @@ mod tests {
             update_check: false,
             systems_file: systems_file.into(),
             setup_enabled: true,
+            setup_force: false,
             open_browser: false,
         }
     }
