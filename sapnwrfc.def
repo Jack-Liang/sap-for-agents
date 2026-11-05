@@ -1,58 +1,65 @@
-; SAP NWRFC SDK 导入库定义文件
+; SAP NWRFC SDK import library definition file
 ;
-; 用途：CI 上无法分发受版权保护的 sapnwrfc.dll，但 MSVC link.exe 在链接期
-; 必须解析所有符号（不像 Linux/macOS 能运行时再查）。本文件列出 ffi.rs 中
-; extern "system" 声明的全部导出函数，用 lib.exe 生成一个「空壳」导入库
-; sapnwrfc.lib，让链接期通过；运行期由用户挂载真实 sapnwrfc.dll 解析符号。
+; Purpose: CI cannot ship the copyrighted sapnwrfc.dll, but MSVC link.exe
+; must resolve every symbol at link time (unlike Linux/macOS, which can
+; defer to runtime). This file lists every function declared in ffi.rs
+; under `extern "system"`, so `lib.exe` can produce a hollow import
+; library; users mount the real sapnwrfc.dll at runtime.
 ;
-; 生成命令（Windows MSVC 环境）：
+; Regenerate (Windows MSVC environment):
 ;   lib /def:sapnwrfc.def /machine:x64 /out:sapnwrfc.lib
 ;
-; x64 MSVC 无名称修饰（不像 x86 的 stdcall 有 @N 后缀），函数名原样列出。
-; 若未来新增 FFI 符号，需同步追加到此文件。
+; x64 MSVC has no name decoration (unlike x86 stdcall's @N suffix);
+; function names are listed verbatim. When adding FFI symbols, append
+; them here as well.
+;
+; WARNING: keep ALL comments ASCII-only. lib.exe parses this file with
+; the system ANSI codepage; UTF-8 CJK comments make a GBK-codepage
+; (Chinese Windows) lib.exe swallow the newline and silently DROP the
+; symbol on the next line (verified: 3 symbols lost that way).
 
 LIBRARY sapnwrfc.dll
 EXPORTS
-    ; 连接管理
+    ; connection management
     RfcOpenConnection
     RfcCloseConnection
-    ; 函数元数据与实例
+    ; function metadata & instances
     RfcGetFunctionDesc
     RfcCreateFunction
     RfcDestroyFunction
-    ; 字符串 / 整数读写
+    ; string / integer accessors
     RfcSetString
     RfcGetString
     RfcSetInt
     RfcGetInt
-    ; 浮点
+    ; floating point
     RfcSetFloat
     RfcGetFloat
-    ; 8 字节整数
+    ; 8-byte integers
     RfcSetInt8
     RfcGetInt8
-    ; 二进制变长 (XSTRING)
+    ; binary variable-length (XSTRING)
     RfcSetXString
     RfcGetXString
-    ; 执行远程调用
+    ; remote call execution
     RfcInvoke
-    ; 表操作
+    ; table operations
     RfcGetTable
-    ; 结构体
+    ; structures
     RfcGetStructure
     RfcGetRowCount
     RfcMoveTo
     RfcGetCurrentRow
     RfcAppendNewRow
-    ; 函数元数据
+    ; function parameter metadata
     RfcGetParameterCount
     RfcGetParameterDescByIndex
-    ; 结构体字段元数据
+    ; structure field metadata
     RfcGetFieldDescByIndex
     RfcGetFieldCount
-    ; DDIC 类型描述符（按精确名查结构/表，用于查数据字典字段）
+    ; DDIC type descriptor (lookup structure/table by exact name)
     RfcGetTypeDesc
-    ; Server 端 API
+    ; server-side API
     RfcRegisterServer
     RfcListenAndDispatch
     RfcInstallServerFunction
@@ -61,3 +68,9 @@ EXPORTS
     RfcDestroyFunctionDesc
     RfcGetFunctionName
     RfcDescribeFunction
+    ; repository descriptor cache management
+    ; (post-write invalidation: GetCached to probe, then Remove)
+    RfcGetCachedFunctionDesc
+    RfcRemoveFunctionDesc
+    RfcGetCachedTypeDesc
+    RfcRemoveTypeDesc
