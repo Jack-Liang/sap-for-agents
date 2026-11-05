@@ -1906,9 +1906,12 @@ pub async fn write_object_source_in(
     let mut registered_alias = None;
     if obj_type == ObjectType::Function && rfc_result == Some(true) {
         let doc = doc.filter(|d| !d.trim().is_empty());
+        // ⚠️ 参数顺序：auto_register_func(func_name, system, ...)——2026-11-05
+        // A4H 实测发现 v0.15 起两个实参传反（别名成了系统名 a4h-2/a4h-3、
+        // func_name 字段成了 "A4H"，交付端口对这些条目全部失效）
         match crate::registry::auto_register_func(
-            &sys.name,
             &name_upper,
+            &sys.name,
             (!group.trim().is_empty()).then(|| group.trim()),
             doc,
         ) {
