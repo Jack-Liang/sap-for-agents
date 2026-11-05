@@ -34,7 +34,7 @@ use crate::systems::{RawSystem, SystemSpec};
 use axum::Json;
 use serde::Deserialize;
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// setup 写入开关（main 启动期从 `SAP_SETUP` 写入；默认开）。

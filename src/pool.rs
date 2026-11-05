@@ -282,7 +282,6 @@ impl RfcConnectionPool {
             status: 503,
             key: "SYSTEM_UNREACHABLE".into(),
             message: format!("目标系统当前不可达，请稍后重试（连接失败: {}）", e.message),
-            ..Default::default()
         })?;
         if let Ok(mut guard) = self.inner.lock() {
             guard.total += 1;

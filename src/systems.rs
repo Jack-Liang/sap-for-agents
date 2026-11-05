@@ -537,11 +537,7 @@ impl SystemHandle {
 
     /// 写入/清除 sap_info 负缓存（version 模块取数失败/成功时调用）。
     pub async fn set_sap_info_negative(&self, err: Option<String>) {
-        let slot = match err {
-            Some(msg) => Some((std::time::Instant::now(), msg)),
-            None => None,
-        };
-        *self.sap_info_err.write().await = slot;
+        *self.sap_info_err.write().await = err.map(|msg| (std::time::Instant::now(), msg));
     }
 
     /// 隔离检查：被隔离的系统拒绝服务（给出明确出路而非静默错数据）。
