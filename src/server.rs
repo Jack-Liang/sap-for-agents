@@ -3256,7 +3256,9 @@ mod tests {
             registry_file: "test-registry.json".into(),
             runtime_mode: false,
             update_check: false,
-            systems_file: "no-such.toml".into(),
+            // 临时目录：setup POST（test:false）会把系统落盘到这里，
+            // 不能指向仓库相对路径污染工作区（曾把 no-such.toml 扫进过 git）
+            systems_file: std::env::temp_dir().join("sap-for-agents-test-systems.toml"),
             setup_enabled: true,
             setup_force: false,
             open_browser: false,
