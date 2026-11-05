@@ -1,8 +1,0 @@
-# 此目录存放 Linux x86_64 的 SAP NWRFC SDK 库。
-#
-# 需放入（从 SAP 下载的 Linux on x86_64 NWRFC SDK 取得）：
-#   libsapnwrfc.so
-#   libsapucum.so
-#
-# 这些 .so 文件会被 git 忽略（见根目录 .gitignore），仅本地使用。
-# 获取与放置步骤详见上级目录 README.md。

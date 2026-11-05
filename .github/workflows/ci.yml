@@ -55,7 +55,7 @@ jobs:
           STUB=nwrfcsdk/lib/linux-x86_64
           mkdir -p "$STUB"
           grep -hoE 'pub fn Rfc[A-Za-z0-9_]+' src/ffi.rs \
-            | awk '{print "void " $3 "(void) {}"}' > /tmp/stub.c
+            | awk '{print "void* " $3 "(void) { return 0; }"}' > /tmp/stub.c
           echo "int sapnwrfc_stub;" >> /tmp/stub.c
           echo "stub symbols: $(grep -c '^void Rfc' /tmp/stub.c)"
           cc -shared -fPIC -o "$STUB/libsapnwrfc.so" /tmp/stub.c
