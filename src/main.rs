@@ -19,6 +19,7 @@ mod registry;
 mod server;
 mod server_config;
 mod server_rfc;
+mod settings;
 mod setup;
 mod string_utils;
 mod systems;
@@ -129,8 +130,10 @@ async fn run_client() -> Result<(), Box<dyn std::error::Error>> {
         version::init_sap_client(client);
     }
 
-    // 排空窗口下发到 server 模块（信号处理与 restart handler 都从那里读）
-    crate::server::set_drain_secs(cfg.drain_secs);
+    // 热设置初始化（v0.20）：cfg（已含 sap_gateway.toml 覆盖）→ 热态，
+    // 并同步各消费点快照（auth key / 限流器 / 排空窗口）。此后网关设置
+    // 由 PUT /api/settings 运行期维护，无需重启。
+    crate::settings::init(&cfg);
 
     let registry = systems::build_registry(specs, &cfg);
     let state: server::SharedState = Arc::new(registry);
@@ -149,19 +152,15 @@ async fn run_client() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // 认证：未设 SAP_API_KEY → None（免鉴权）；设置后 /api/* 要求 Bearer token
+    //（settings::init 已写入生效 key——此处仅打日志）
     let auth_enabled = cfg.api_key.is_some();
-    auth::init(cfg.api_key);
     tracing::info!(auth_enabled, "API 认证配置");
-    // 只读模式（SAP_READ_ONLY）：capabilities 自描述的进程级视角
-    //（真实拦截按系统：sap_systems.toml 的 read_only 覆盖，见 read_only_guard）
-    server::init_read_only(cfg.read_only);
+    // 只读模式（SAP_READ_ONLY）：生效值在 settings 热态（PUT /api/settings 可切换）
     if cfg.read_only {
         tracing::warn!("🔒 只读模式已启用（SAP_READ_ONLY）：/api/objects 写端点与 /api/adt 写方法返回 403；/api/rfc 不受影响");
     }
     // Prometheus 指标（GET /metrics）
     server::init_metrics();
-    // 可选限流（按 IP；未设 SAP_RATE_LIMIT_RPS 则不限流）
-    server::init_rate_limiter(cfg.rate_limit_rps);
     // ADT 能力自描述按默认系统视角（每系统真实开关看 /api/version 的 systems 块）；
     // 未配置模式为 false（setup 首个默认系统热加载时会翻转）
     adt::init_capability_adt(state.default().is_some_and(|d| d.adt.is_some()));
@@ -198,12 +197,9 @@ async fn run_client() -> Result<(), Box<dyn std::error::Error>> {
     // operation 缓存，公开的 /openapi.json 只读缓存——不被 SAP 健康状况绑架
     tokio::spawn(openapi::registry_ops_watcher());
 
-    // 新版本检查（GitHub Releases，后台任务：启动即查 + 每 24h；失败静默）
-    if cfg.update_check {
-        tokio::spawn(version::update_checker_loop());
-    } else {
-        tracing::info!("新版本检查已禁用（SAP_UPDATE_CHECK=off）");
-    }
+    // 新版本检查（GitHub Releases，后台任务：启动即查 + 每 24h；失败静默）。
+    // 循环内每轮读热设置——SAP_UPDATE_CHECK / PUT /api/settings 关闭后空转跳过
+    tokio::spawn(version::update_checker_loop());
 
     server::run(state, &cfg.listen_addr, wait_shutdown_signal()).await?;
     Ok(())

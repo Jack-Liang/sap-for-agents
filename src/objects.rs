@@ -490,10 +490,19 @@ async fn lock_object(
     // include 上报 400 accessMode 转换失败 → 依次试 EXCLUSIVE、无 accessMode
     let mut resp = None;
     for (query, hdrs) in [
-        (&[("_action", "LOCK"), ("accessMode", "MODIFY")][..], STATEFUL),
-        (&[("_action", "LOCK"), ("accessMode", "EXCLUSIVE")][..], STATEFUL),
+        (
+            &[("_action", "LOCK"), ("accessMode", "MODIFY")][..],
+            STATEFUL,
+        ),
+        (
+            &[("_action", "LOCK"), ("accessMode", "EXCLUSIVE")][..],
+            STATEFUL,
+        ),
         (&[("_action", "LOCK")][..], STATEFUL),
-        (&[("_action", "LOCK"), ("accessMode", "MODIFY")][..], &[][..]),
+        (
+            &[("_action", "LOCK"), ("accessMode", "MODIFY")][..],
+            &[][..],
+        ),
     ] {
         let r = adt
             .request_raw(
@@ -510,8 +519,7 @@ async fn lock_object(
             .await?;
         sess.absorb(&r);
         if r.status == 200
-            || !(r.status == 400
-                && String::from_utf8_lossy(&r.body).contains("accessMode"))
+            || !(r.status == 400 && String::from_utf8_lossy(&r.body).contains("accessMode"))
         {
             resp = Some(r);
             break;
@@ -1641,7 +1649,16 @@ pub async fn write_object_source(
     doc: Option<&str>,
 ) -> Result<WriteOutcome, RfcError> {
     write_object_source_in(
-        sys, obj_type, name, group, source, transport, activate, rfc_enabled, doc, None,
+        sys,
+        obj_type,
+        name,
+        group,
+        source,
+        transport,
+        activate,
+        rfc_enabled,
+        doc,
+        None,
     )
     .await
 }
@@ -1774,7 +1791,8 @@ pub async fn write_object_source_in(
     // ② PUT 源码；失败先解锁再报错（不留孤儿锁）
     // testclasses 首写：POST 创建语义 + version=inactive + 不带 corrNr
     //（include 尚未进入传输请求对象清单，ED1 实证带 corrNr 时保存报 SaveFailure）
-    let mut put_query: Vec<(String, String)> = vec![("lockHandle".into(), lock.lock_handle.clone())];
+    let mut put_query: Vec<(String, String)> =
+        vec![("lockHandle".into(), lock.lock_handle.clone())];
     if is_test_incl {
         put_query.push(("version".into(), "inactive".into()));
     }

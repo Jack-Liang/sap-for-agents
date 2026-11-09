@@ -30,6 +30,8 @@ curl -H "Authorization: Bearer <SAP_API_KEY>" http://127.0.0.1:3000/api/function
 | 目标 | 用哪个端点 |
 |------|-----------|
 | 网关还没配置过（首次启动）→ **引导式配置**：拿「该问用户什么」清单，采集后写入并热加载 | `GET /api/setup`（公开）→ `POST /api/setup/system` |
+| 运行期配置管理：**读 / 改 / 删单个系统、切默认**（全部热生效，无需重启、不用碰文件） | `GET`·`PUT`·`DELETE /api/setup/system/{name}`、`PUT /api/setup/default` |
+| 想运行期改**网关设置**（超时 / 限流 / 只读 / API Key / 语言…），不重启 | `GET`·`PUT /api/settings` |
 | 新会话先**列系统清单**（多系统部署；单系统只返回一条——见下文「多系统」节） | `GET /api/systems`（公开） |
 | 你（或人在 SE37）**改了某个 RFC 的参数**，网关还在报旧签名 → 重载该系统运行态（不重启） | `POST /api/admin/reload`（或 `POST /api/s/{system}/admin/reload`） |
 | **改了 `.env` 或换了二进制**，需要进程真的重启（先排空再退出，由 supervisor 拉起） | `POST /api/admin/restart`（202；轮询 `/ready` 等它 503 → 200） |
@@ -93,10 +95,57 @@ curl http://127.0.0.1:3000/api/systems
 ```
 
 - 请求体字段与 `sap_systems.toml` 的 `[systems.{name}]` 表一一对应（未知键 → 422 拦拼写错误）；负载均衡连接不用 ashost/sysnr，改传 `conn: {"MSHOST": "...", "R3NAME": "...", "GROUP": "..."}`。
-- 人类交接：桌面机器上未配置启动会自动在浏览器打开 `/setup` 引导页，页面提供一段复制即用的交接文字（描述的就是本流程，地址已填好）。用户把那段话粘给你时，直接按上面的步骤执行即可。
+- 人类交接：桌面机器上未配置启动会自动在浏览器打开 `/setup` 引导页，页面提供一段复制即用的交接文字（描述的就是本流程，地址已填好）。用户把那段话粘给你时，直接按上面的步骤执行即可。配置完成后同一页面就是完整**配置台**（浏览器里增删改系统/切默认）。
 - **落盘前先真实试连**——主机/账号/密码不对返回 `502 SETUP_CONNECT_FAILED`（或 `SETUP_CONNECT_TIMEOUT`），什么都不会写入。`test:false` 跳过试连（离线预配置场景，自担风险）。
 - 成功 = 写入 `sap_systems.toml` **并热加载**。首个系统无条件成为默认系统；之后可用同样方式追加系统（`default:true` 可切换默认）。若网关此前跑在环境变量配置上，该系统也会一并写入文件——重启后系统集合不变。
-- `409 SETUP_NAME_EXISTS` → 换个名字；`409 SYSTEM_SYSID_CONFLICT` → 两个后端共用 SYSID（见「多系统」节）；`403 SETUP_DISABLED` → 部署方设了 `SAP_SETUP=off`；`403 SETUP_LOCKED` → 网关已配置、引导写入已锁定（无鉴权部署的防滥用措施：防凭据中继/内网探测）——请改手工编辑文件，确需保持引导写入可设 `SAP_SETUP=force`
+- `409 SETUP_NAME_EXISTS` → 换个名字；`409 SYSTEM_SYSID_CONFLICT` → 两个后端共用 SYSID（见「多系统」节）；`403 SETUP_DISABLED` → 部署方设了 `SAP_SETUP=off`；`403 SETUP_LOCKED` → **绑定非回环地址且未鉴权**的部署拒绝配置写入（防滥用：防凭据中继/内网探测/DNS rebinding 改配置）——出路在部署侧：设 `SAP_API_KEY` 走鉴权远程访问，或 `SAP_SETUP=force` 显式放开
+
+### 运行期系统管理（v0.20：无需重启、不用碰文件）
+
+四个管理动词共用同一道写入门（见上）与同一套"先试连后落盘"纪律：
+
+```bash
+# 读单个系统的配置（密码永不回显——只给 ${VAR} 引用形态或"已设置"标志）
+curl http://127.0.0.1:3000/api/setup/system/a4h
+# → {"name":"a4h","default":true,"ashost":"vhcala4h","sysnr":"00",...,"passwd":{"ref":"${SAP_A4H_PASSWD}"},"source":"toml"}
+
+# 编辑（半更新：未提供的字段保持原值——只改密码就只传 passwd）
+curl -X PUT http://127.0.0.1:3000/api/setup/system/a4h -H "Content-Type: application/json" -d '{"passwd":"${SAP_A4H_PASSWD2}"}'
+# → 校验 → 试连（"test":false 可跳过）→ toml 条目原地替换 → 热替换句柄（旧池由在途请求自然排空）
+
+# 删除（热卸载；删的是默认系统时自动提升剩余第一个为新默认）
+curl -X DELETE http://127.0.0.1:3000/api/setup/system/a4h
+# 删最后一个系统要求 ?force=true（显式确认回到未配置模式：503 SYSTEM_NOT_CONFIGURED）
+
+# 切默认系统（此后无前缀路径打到它）——热切换
+curl -X PUT http://127.0.0.1:3000/api/setup/default -H "Content-Type: application/json" -d '{"name":"a4h"}'
+```
+
+- **不支持改名**（名字是 URL 段 + toml 键 + 审计/注册表引用的三重标识）——删除后重建。
+- 每次写入同时原地更新 `sap_systems.toml`，重启网关系统集合不变（文件始终是唯一事实源）。
+
+### 运行期网关设置（v0.20：热生效，落盘 `sap_gateway.toml`）
+
+三层，`GET /api/settings` 如实标注（每项带 `source`：`default` / `env` / `file`）：
+
+- **hot** —— 下一个请求即生效并落盘：`request_timeout_secs`、`rate_limit_rps`（0 = 不限流）、`read_only`（全局；与各系统自己的开关取 OR）、`api_key`（值永不回显；`""` 关闭鉴权）、`drain_secs`、`update_check`、`lang`。
+- **apply_on_system_rebuild** —— 烤在系统句柄里的全局默认（`pool_size`、`pool_idle_validate_secs`、`adt_base_url`）：只影响之后新建/编辑的系统；改**运行中**系统用 `PUT /api/setup/system/{name}`。
+- **apply_on_restart** —— `listen_addr`、`mode`、`systems_file`、`registry_file`：改 `.env` 后重启（`/setup` 配置台有一键重启按钮）。
+
+```bash
+curl http://127.0.0.1:3000/api/settings
+# → {"hot":{"request_timeout_secs":{"value":60,"source":"default"},...},
+#    "apply_on_system_rebuild":{...},"apply_on_restart":{...},"file":"sap_gateway.toml"}
+
+curl -X PUT http://127.0.0.1:3000/api/settings -H "Content-Type: application/json" \
+  -d '{"request_timeout_secs":120,"rate_limit_rps":10,"read_only":true}'
+# → {"saved":true,"applied":["request_timeout_secs","rate_limit_rps","read_only"],...}
+#    立即生效（下一个请求就按新值），同时落盘。
+```
+
+- 写路径与系统配置同一道安全门（未鉴权 → 仅本机回环可写）。
+- 持久化在独立文件 `sap_gateway.toml`（`SAP_GATEWAY_FILE`，0600——存 API key 明文，与 `.env` 同信任级）；优先级 **文件 > env > 默认**；删掉文件里的键即回落 env。
+- 改 API key 立即生效——**下一个请求**（包括你自己的）就要带新 Bearer token。小心把自己锁在外面。
 
 ## 标准操作流程
 
@@ -129,9 +178,10 @@ curl http://127.0.0.1:3000/api/s/prd/ready                # 该系统的 readine
 - 未知系统名 → `404 SYSTEM_UNKNOWN`（错误里附可用清单）。**跨系统对比对象**：同一读取端点换两个作用域各调一次（如 `/api/functions/ZFOO/source` 分别在 a4h 与 prd 下），对结果做 diff。
 - 平坦交付端口 `/api/invokes/{alias}` **按条目记录的 system 路由**（别名是全局命名空间）；显式作用域与条目不符 → `409 SYSTEM_MISMATCH`。`GET /api/registry?system=prd` 按系统过滤。
 - MCP 工具接受可选 `system` 参数（缺省 = 默认系统）。
-- 系统也可以**运行期追加**：`POST /api/setup/system` 校验 → 试连 → 追加进 `sap_systems.toml` → 热加载（见「首次启动引导」节）。无需重启；移除系统仍需编辑文件后重启。
+- 系统也可以**运行期管理**：`POST /api/setup/system` 新增，`PUT/DELETE /api/setup/system/{name}` 编辑/删除，`PUT /api/setup/default` 切默认——全部先试连再落盘 `sap_systems.toml` 并热生效（见「首次启动引导」节）。任一操作都无需重启。
 - SAP 端**改了 RFC 接口**（SE37 里增删改参数）会被缓存三层——SAP 侧函数组加载按**连接**缓存、SDK 的函数/类型描述符按 **SYSID 进程级**缓存（sapnwrfc.h 明言 "cache for every R/3 System ID"——**换连接刷不掉这一层**）、网关按**函数名**缓存元数据。`POST /api/admin/reload` 把三层一起作废：连接池换代（空闲连接立刻关闭，借出中的归还即弃）+ 清空函数/DDIC 元数据缓存 + 按 `RfcRemoveFunctionDesc` **点名移除** SDK 缓存条目。可选请求体 `{"func_names":["Z_FOO"]}`——显式点名移除"调用过但从未自省过"的函数。**Agent 或前端要做"重启"就调这个**——它不重启进程，也不重读 `.env` / `sap_systems.toml`。作用域形态 `POST /api/s/{system}/admin/reload`。响应：`system`、`connections_closed`、`func_metadata_cleared`、`type_metadata_cleared`、`sdk_desc_removed`、`sdk_type_removed`。
 - 当改动落在系统运行态**之外**（`.env` 里的值、换了二进制）时，需要 `POST /api/admin/restart`。它**立刻返回 202**，重启异步发生：`/ready` 在 `SAP_DRAIN_SECS`（默认 5 秒）窗口内一律 **503 + `Retry-After`**，监听继续把在途请求跑完，窗口结束进程 `exit(0)`。**必须有 supervisor 才能自动恢复**（`start.sh` 守护循环 / launchd `KeepAlive` / systemd `Restart=always` / docker `--restart`）；裸 `exec` 启动的进程退出后不会回来。调用方的正确串法：POST → 收 202 → 轮询 `/ready` → 见 503（此时别发新业务）→ 见 200 → 恢复。`SIGTERM`/`SIGINT` 走同一条排空路径，所以普通 `kill` 也不会再甩给调用方 `ECONNREFUSED`，而是可重试的 503。
+- `/api/admin/reload` 与 `/api/admin/restart` 与配置写**同一道安全门**（v0.20）：未鉴权部署仅本机回环可调（Host 头也须回环——防 DNS rebinding）；远程调用设 `SAP_API_KEY` 走 Bearer。`/setup` 配置台自带一键重启按钮。
 - **同一系统不同 client**（同 ashost/sysnr、不同 `client`）完全支持：SAP 仓库对象跨 client、签名必然一致，各条目仍有独立的池 / ADT / 注册表命名空间。
 - 硬性限制：**不同后端**共用同一 SYSID（如经不同主机访问的克隆开发容器）会被隔离（`503 SYSTEM_SYSID_CONFLICT`）——SDK 描述符缓存按 SYSID 分区，跨后端的 SYSID 孪生会静默共享错误签名。
 

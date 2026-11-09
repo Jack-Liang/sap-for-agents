@@ -214,7 +214,10 @@ if command -v ss >/dev/null 2>&1 && ss -tln 2>/dev/null | grep -q ":$LISTEN_PORT
         fuser "$LISTEN_PORT/tcp" 2>&1 || true
     fi
     exit 1
-elif command -v netstat >/dev/null 2>&1 && netstat -tln 2>/dev/null | grep -q ":$LISTEN_PORT\b"; then
+elif command -v lsof >/dev/null 2>&1 && lsof -iTCP:"$LISTEN_PORT" -sTCP:LISTEN >/dev/null 2>&1; then
+    err "端口 $LISTEN_PORT 已被占用（lsof 检测）"
+    exit 1
+elif [ "$(uname -s)" = "Linux" ] && command -v netstat >/dev/null 2>&1 && netstat -tln 2>/dev/null | grep -q ":$LISTEN_PORT\b"; then
     err "端口 $LISTEN_PORT 已被占用（netstat 检测）"
     exit 1
 else

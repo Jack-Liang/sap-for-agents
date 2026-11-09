@@ -9,25 +9,25 @@
 
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
-use std::sync::OnceLock;
+use std::sync::RwLock;
 
-/// 启动期写入的 API key（`None` = 未配置 = 免鉴权）。
-static CONFIGURED_KEY: OnceLock<Option<String>> = OnceLock::new();
+/// 当前生效的 API key（`None` = 未配置 = 免鉴权）。
+/// v0.20 起运行期可热改（PUT /api/settings）——RwLock 而非 OnceLock；
+/// 每请求读一把锁（无争用路径），换 key 原子生效，无需重启。
+static CONFIGURED_KEY: RwLock<Option<String>> = RwLock::new(None);
 
-/// 启动期初始化（main 调一次）。重复调用忽略后续值（保留首次）。
-pub fn init(key: Option<String>) {
-    let _ = CONFIGURED_KEY.set(key);
-}
-
-/// 当前配置的 key。`None` 表示免鉴权模式（未设置 `SAP_API_KEY`）。
-/// 返回 `&'static str`：值借自启动期写入的 `static OnceLock`，存活整个进程。
-fn configured_key() -> Option<&'static str> {
-    CONFIGURED_KEY.get().and_then(|opt| opt.as_deref())
+/// 写入 API key（启动期 settings::init 与运行期 PUT /api/settings 共用；
+/// `None` = 关闭鉴权）。
+pub fn set_key(key: Option<String>) {
+    *CONFIGURED_KEY.write().unwrap_or_else(|e| e.into_inner()) = key;
 }
 
 /// 是否启用了 API 认证（设置了 `SAP_API_KEY`）。供首页等处展示认证状态。
 pub fn is_enabled() -> bool {
-    configured_key().is_some()
+    CONFIGURED_KEY
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .is_some()
 }
 
 /// 从 `Authorization` 头值中提取 Bearer token。
@@ -71,7 +71,11 @@ pub async fn require_api_key(
     next: axum::middleware::Next,
 ) -> Response {
     // 未配置 key → 免鉴权（本机默认，向后兼容）
-    let Some(expected) = configured_key() else {
+    let Some(expected) = CONFIGURED_KEY
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+    else {
         return next.run(req).await;
     };
 
@@ -81,7 +85,7 @@ pub async fn require_api_key(
         .and_then(|v| v.to_str().ok())
         .and_then(extract_bearer);
 
-    if token_matches(provided, expected) {
+    if token_matches(provided, &expected) {
         next.run(req).await
     } else {
         unauthorized()
@@ -106,6 +110,15 @@ fn unauthorized() -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn set_key_flips_is_enabled() {
+        // 热改鉴权（PUT /api/settings）的存储层：set 后 is_enabled 翻转
+        set_key(Some("t0ken".into()));
+        assert!(is_enabled());
+        set_key(None);
+        assert!(!is_enabled());
+    }
 
     #[test]
     fn extract_bearer_valid() {

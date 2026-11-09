@@ -83,42 +83,38 @@ pub fn init_metrics() {
     }
 }
 
-/// 按 IP 限流器（启动期由 [`init_rate_limiter`] 写入；`None` = 不限流）。
+/// 按 IP 限流器（由 [`init_rate_limiter`] 写入；`None` = 不限流）。
+/// v0.20 起运行期可热改（PUT /api/settings）——RwLock 而非 OnceLock。
+/// 中间件在读锁内完成 check 后立刻释放（锁内不 await）。
 type IpLimiter = RateLimiter<IpAddr, DefaultKeyedStateStore<IpAddr>, DefaultClock>;
-static RATE_LIMITER: OnceLock<Option<IpLimiter>> = OnceLock::new();
+static RATE_LIMITER: std::sync::RwLock<Option<IpLimiter>> = std::sync::RwLock::new(None);
 
-/// 启动期设置限流：`rps=None` 或 0 → 不限流；≥1 → 按 IP 每秒 rps 个请求。
+/// 设置限流：`rps=None` 或 0 → 不限流；≥1 → 按 IP 每秒 rps 个请求。
+/// 启动期与运行期热改（settings）共用。
 pub fn init_rate_limiter(rps: Option<u32>) {
     // NonZeroU32::new(r) 对 r=0 返 None（= 不启用），不会 panic
     let limiter =
         rps.and_then(|r| NonZeroU32::new(r).map(|n| RateLimiter::keyed(Quota::per_second(n))));
-    let _ = RATE_LIMITER.set(limiter);
+    *RATE_LIMITER.write().unwrap_or_else(|e| e.into_inner()) = limiter;
     // 限流阈值本身也存一份（/api/version 能力自描述用；None = 不限流）
-    let _ = RATE_LIMIT_RPS.set(rps);
+    *RATE_LIMIT_RPS.write().unwrap_or_else(|e| e.into_inner()) = rps;
 }
 
 /// 已配置的限流阈值（未初始化 = None = 不限流）。供 /api/version 自描述。
 pub(crate) fn rate_limit_rps() -> Option<u32> {
-    RATE_LIMIT_RPS.get().copied().flatten()
+    *RATE_LIMIT_RPS.read().unwrap_or_else(|e| e.into_inner())
 }
 
-/// 限流阈值（启动期由 [`init_rate_limiter`] 一并写入）。
-static RATE_LIMIT_RPS: OnceLock<Option<u32>> = OnceLock::new();
+/// 限流阈值（由 [`init_rate_limiter`] 一并写入）。
+static RATE_LIMIT_RPS: std::sync::RwLock<Option<u32>> = std::sync::RwLock::new(None);
 
-/// 只读模式（`SAP_READ_ONLY=1`，启动期由 [`init_read_only`] 写入；默认关闭）。
+/// 全局只读开关的**生效值**在 settings 热态（`PUT /api/settings` 即改即生效）。
 ///
 /// 语义：拦截**网关自身编排的写端点**（`/api/objects` 的 PUT source / POST replace、
 /// `/api/adt` 的非读方法），防误改。`syntax` 不落库、照常放行；`POST /api/rfc`
 /// **不在拦截范围**——RFC 无法按函数名可靠区分读写，SAP 端授权才是真正的边界。
-static READ_ONLY: OnceLock<bool> = OnceLock::new();
-
-/// 启动期设置只读模式。
-pub fn init_read_only(enabled: bool) {
-    let _ = READ_ONLY.set(enabled);
-}
-
 fn read_only_enabled() -> bool {
-    *READ_ONLY.get().unwrap_or(&false)
+    crate::settings::current().read_only
 }
 
 /// 只读模式是否启用。pub(crate) 供 /api/version 能力自描述。
@@ -207,14 +203,17 @@ async fn read_only_guard(
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Result<axum::response::Response, RfcError> {
-    let read_only = req
+    let read_only = (req
         .extensions()
         .get::<Scope>()
         .map(|s| s.0.read_only)
         // 未配置模式无默认系统：按非只读处理（写端点随后在 Sap 提取器处
         // 503 SYSTEM_NOT_CONFIGURED；setup 端点不属 SAP 写，不应被此守卫拦）
         .or_else(|| state.default().map(|d| d.read_only))
-        .unwrap_or(false);
+        .unwrap_or(false))
+        // v0.20：全局只读热开关（PUT /api/settings）——与系统级取 OR，
+        // 系统级 read_only 不能被全局放开
+        || crate::settings::current().read_only;
     if read_only && is_read_only_blocked(req.method(), req.uri().path()) {
         return Err(RfcError {
             code: -1,
@@ -323,7 +322,7 @@ where
     F: FnMut(&RfcConnection) -> Result<R, RfcError> + Send + 'static,
     R: Send + 'static,
 {
-    let timeout = sys.request_timeout;
+    let timeout = sys.effective_timeout();
     run_blocking_with_timeout(sys, timeout, f).await
 }
 
@@ -462,6 +461,26 @@ pub fn app(state: SharedState) -> Router {
         // 落盘 sap_systems.toml 并热加载；与业务面同守卫栈——鉴权/限流/
         // runtime/只读。GET /api/setup 挂公开侧）
         .route("/api/setup/system", post(crate::setup::add_handler))
+        // 运行期配置管理（v0.20 方案 A）：读单系统（编辑预填，密码不回显）、
+        // 编辑（半更新 + 热替换句柄）、删除（热卸载 + toml 同步）。
+        // 同一道安全门（未鉴权时仅回环可写，见 setup.rs admin_write_gate）。
+        .route(
+            "/api/setup/system/{name}",
+            axum::routing::get(crate::setup::get_system_handler)
+                .put(crate::setup::update_handler)
+                .delete(crate::setup::delete_handler),
+        )
+        // 切默认系统（热切换：无前缀路径的新目标）
+        .route(
+            "/api/setup/default",
+            axum::routing::put(crate::setup::set_default_handler),
+        )
+        // 网关设置（v0.20 第二期）：热设置读改——GET 带来源标注；PUT 逐项校验
+        // 即改即生效并落盘 sap_gateway.toml（写路径与系统配置同一道安全门）
+        .route(
+            "/api/settings",
+            axum::routing::get(crate::settings::get_handler).put(crate::settings::update_handler),
+        )
         // 运行时重载（v0.18）：让目标系统"像刚重启过"——连接池换代 + 清元数据。
         // 前端在 SAP 端改完 RFC 参数后调一次即可让新签名生效，无需重启进程。
         // 作用域形态 /api/s/{system}/admin/reload 由 ScopeService 自动映射。
@@ -628,9 +647,14 @@ struct AdminReloadBody {
 }
 
 async fn admin_reload_handler(
+    axum::extract::State(state): axum::extract::State<SharedState>,
+    headers: axum::http::HeaderMap,
     sap: Sap,
     body: Option<Json<AdminReloadBody>>,
 ) -> Result<Json<serde_json::Value>, RfcError> {
+    // v0.20：与配置写同一道安全门——reload 会清连接池/缓存，无鉴权部署上
+    // 不该让任意来源触发（未鉴权 → 仅本机回环可调）
+    crate::setup::admin_write_gate(&state, &headers)?;
     // 被隔离（SYSID 冲突）的系统不提供服务，也不允许借 reload 绕过检查
     sap.check_available()?;
     let extra = body.map(|Json(b)| b.func_names).unwrap_or_default();
@@ -659,7 +683,12 @@ async fn admin_reload_handler(
 ///
 /// 返回 202 是刻意的：重启是异步发生的，调用方不该等——拿到 202 就该转去轮询
 /// `/ready`，等它先 503 再 200。
-async fn admin_restart_handler() -> (axum::http::StatusCode, Json<serde_json::Value>) {
+async fn admin_restart_handler(
+    axum::extract::State(state): axum::extract::State<SharedState>,
+    headers: axum::http::HeaderMap,
+) -> Result<(axum::http::StatusCode, Json<serde_json::Value>), RfcError> {
+    // v0.20：重启是配置面最重的动作，同门把守（未鉴权 → 仅本机回环）
+    crate::setup::admin_write_gate(&state, &headers)?;
     let secs = drain_secs();
     tokio::spawn(async move {
         // 先让 202 回到调用方，再置位——否则调用方可能拿到连接中断而非正常响应
@@ -676,7 +705,7 @@ async fn admin_restart_handler() -> (axum::http::StatusCode, Json<serde_json::Va
         std::process::exit(0);
     });
 
-    (
+    Ok((
         axum::http::StatusCode::ACCEPTED,
         Json(serde_json::json!({
             "status": "restarting",
@@ -684,7 +713,7 @@ async fn admin_restart_handler() -> (axum::http::StatusCode, Json<serde_json::Va
             "note": "已进入排空态：/ready 立刻返回 503 + Retry-After，在途请求继续完成；窗口结束后进程退出。",
             "warning": "进程须由 supervisor 拉起才会自动恢复（start.sh 守护循环 / launchd KeepAlive / systemd Restart=always）。",
         })),
-    )
+    ))
 }
 
 async fn systems_handler(
@@ -768,9 +797,6 @@ async fn rate_limit_middleware(
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
-    let Some(limiter) = RATE_LIMITER.get().and_then(|opt| opt.as_ref()) else {
-        return next.run(req).await; // 未启用限流
-    };
     let ip = req
         .extensions()
         .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
@@ -781,14 +807,19 @@ async fn rate_limit_middleware(
         tracing::warn!("限流中间件取不到客户端 IP（ConnectInfo 缺失），本次放行");
         return next.run(req).await;
     };
-    if limiter.check_key(&ip).is_ok() {
-        next.run(req).await
-    } else {
-        (
+    // 读锁内完成 check 后立刻释放（RwLockReadGuard 非 Send，不能跨 await）
+    let allowed = {
+        let guard = RATE_LIMITER.read().unwrap_or_else(|e| e.into_inner());
+        guard.as_ref().map(|limiter| limiter.check_key(&ip).is_ok())
+    };
+    match allowed {
+        None => next.run(req).await, // 未启用限流
+        Some(true) => next.run(req).await,
+        Some(false) => (
             axum::http::StatusCode::TOO_MANY_REQUESTS,
             Json(serde_json::json!({"error":{"code":429,"message":"Rate limit exceeded (too many requests from this IP)","key":"RATE_LIMITED"}})),
         )
-            .into_response()
+            .into_response(),
     }
 }
 
@@ -937,10 +968,7 @@ async fn ready_handler(sap: Sap) -> axum::response::Response {
         let retry_after = drain_secs().max(1);
         return (
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
-            [(
-                axum::http::header::RETRY_AFTER,
-                retry_after.to_string(),
-            )],
+            [(axum::http::header::RETRY_AFTER, retry_after.to_string())],
             Json(serde_json::json!({
                 "status": "draining",
                 "retry_after_secs": retry_after,
@@ -1124,9 +1152,16 @@ fn summarize_params(req: &InvokeRequest) -> String {
 /// （例如 `KEY` 已会命中 `KEYDATE`，属于可接受的宁可多遮）。
 fn mask_value(key: &str, value: &ScalarValue) -> String {
     const SENSITIVE: &[&str] = &[
-        "PASSWD", "PASSWORD", "PASSWORT", "PASS", // 各种密码写法（含德语）
-        "PWD", "PW",   // SAP BAPI 系（BAPIPWD）与简写（IV_PW）
-        "SECRET", "TOKEN", "CREDENTIAL", "KEY",
+        "PASSWD",
+        "PASSWORD",
+        "PASSWORT",
+        "PASS", // 各种密码写法（含德语）
+        "PWD",
+        "PW", // SAP BAPI 系（BAPIPWD）与简写（IV_PW）
+        "SECRET",
+        "TOKEN",
+        "CREDENTIAL",
+        "KEY",
     ];
     let upper = key.to_uppercase();
     if SENSITIVE.iter().any(|s| upper.contains(s)) {
@@ -1276,7 +1311,7 @@ pub(crate) async fn run_invoke_and_log(
         .timeout_secs
         .filter(|&s| s >= 1)
         .map(|s| Duration::from_secs(s.min(MAX_TIMEOUT_SECS)))
-        .unwrap_or(sys.request_timeout);
+        .unwrap_or_else(|| sys.effective_timeout());
     // 通过 with_connection 执行：遇通信类错误自动丢弃并新建连接重试；
     // 调用方可传 retry:false 关闭（写 BAPI 防响应丢失双执行）。
     // 元数据解析（resolve_meta）用该系统自己的缓存实例。
@@ -1481,10 +1516,10 @@ async fn openapi_dynamic_handler(
     Ok(Json(spec))
 }
 
-/// 默认语言（从 SAP_LANG 环境变量读，回退 EN）。
+/// 默认语言（settings 热态，启动取自 SAP_LANG；PUT /api/settings 可热改）。
 /// 端点⑤④可用 ?lang= 覆盖。
 fn default_lang() -> String {
-    std::env::var("SAP_LANG").unwrap_or_else(|_| "EN".to_string())
+    crate::settings::current().lang.clone()
 }
 
 /// 把 ParamInfo 转成 FieldDef，STRUCTURE/TABLE 类型递归展开子字段（深度上限由 get_field_infos 的句柄链决定）。
@@ -3240,9 +3275,14 @@ mod tests {
 
     /// 双系统测试注册表：a4h（默认）+ prd，全 lazy 池（无 SAP SDK 可构造）。
     fn test_state() -> SharedState {
+        test_state_at("127.0.0.1:3000")
+    }
+
+    /// 同 [`test_state`]，监听地址可指定（安全门测试用远程/通配形态）。
+    fn test_state_at(listen_addr: &str) -> SharedState {
         let cfg = crate::config::AppConfig {
             conn_params: vec![],
-            listen_addr: "127.0.0.1:3000".into(),
+            listen_addr: listen_addr.into(),
             pool_size: 1,
             pool_idle_validate: Duration::from_secs(30),
             api_key: None,
@@ -3259,9 +3299,11 @@ mod tests {
             // 临时目录：setup POST（test:false）会把系统落盘到这里，
             // 不能指向仓库相对路径污染工作区（曾把 no-such.toml 扫进过 git）
             systems_file: std::env::temp_dir().join("sap-for-agents-test-systems.toml"),
+            gateway_file: std::env::temp_dir().join("sap-for-agents-test-gateway.toml"),
             setup_enabled: true,
             setup_force: false,
             open_browser: false,
+            lang: "EN".into(),
         };
         let direct = || {
             vec![
@@ -3305,38 +3347,90 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn setup_locked_after_configured() {
-        // v0.19.1 安全修复：已配置部署的 POST /api/setup/system 默认锁定
-        // （防无鉴权部署上的凭据中继/内网探测），SAP_SETUP=force 豁免
+    async fn setup_gate_allows_loopback_and_blocks_remote_or_rebinding() {
+        // v0.20 方案 A：旧"配置后锁定"改为按部署形态判定——本机回环访问可写
+        //（运行期改配置的核心诉求），远程未鉴权锁定，DNS rebinding Host 拦截
         crate::setup::init(true, false); // 开关开、未 force
+
+        // 1) 回环监听 + 回环 Host：已配置部署也可写（test:false 免真实连接）
         let resp = app(test_state())
             .oneshot(
                 axum::http::Request::builder()
                     .method("POST")
                     .uri("/api/setup/system")
                     .header("content-type", "application/json")
+                    .header("host", "127.0.0.1:3000")
                     .body(axum::body::Body::from(
-                        r#"{"name":"x1","ashost":"h","sysnr":"00","client":"001","user":"u","passwd":"p"}"#,
+                        r#"{"name":"x1","ashost":"h","sysnr":"00","client":"001","user":"u","passwd":"p","test":false}"#,
                     ))
                     .unwrap(),
             )
             .await
             .unwrap();
-        assert_eq!(resp.status(), axum::http::StatusCode::FORBIDDEN, "已配置应锁定");
-        let body = body_string(resp.into_body()).await;
-        assert!(body.contains("SETUP_LOCKED"), "错误键应为 SETUP_LOCKED: {body}");
+        assert!(
+            resp.status().is_success(),
+            "本机回环写入应放行: {}",
+            resp.status()
+        );
 
-        // force 豁免：锁定解除（试连 test:false 免真实连接；后续流程同未配置路径）
-        crate::setup::init(true, true);
+        // 2) rebinding Host（恶意域名解析到 127.0.0.1，浏览器视角同源）：拦截
         let resp = app(test_state())
             .oneshot(
                 axum::http::Request::builder()
-                    .method("POST")
-                    .uri("/api/setup/system")
+                    .method("PUT")
+                    .uri("/api/setup/system/a4h")
                     .header("content-type", "application/json")
-                    .body(axum::body::Body::from(
-                        r#"{"name":"x2","ashost":"h","sysnr":"00","client":"001","user":"u","passwd":"p","test":false}"#,
-                    ))
+                    .header("host", "evil.example.com:3000")
+                    .body(axum::body::Body::from(r#"{"user":"attacker"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::FORBIDDEN,
+            "rebinding Host 应拦截"
+        );
+        let body = body_string(resp.into_body()).await;
+        assert!(
+            body.contains("SETUP_LOCKED"),
+            "错误键应为 SETUP_LOCKED: {body}"
+        );
+
+        // 3) 非回环监听 + 未鉴权：锁定（本机 Host 也一样——监听形态先判）
+        let resp = app(test_state_at("0.0.0.0:3000"))
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("PUT")
+                    .uri("/api/setup/default")
+                    .header("content-type", "application/json")
+                    .header("host", "192.168.1.5:3000")
+                    .body(axum::body::Body::from(r#"{"name":"a4h"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::FORBIDDEN,
+            "远程未鉴权应锁定"
+        );
+        let body = body_string(resp.into_body()).await;
+        assert!(
+            body.contains("SETUP_LOCKED"),
+            "错误键应为 SETUP_LOCKED: {body}"
+        );
+
+        // 4) force 豁免一切形态
+        crate::setup::init(true, true);
+        let resp = app(test_state_at("0.0.0.0:3000"))
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("PUT")
+                    .uri("/api/setup/default")
+                    .header("content-type", "application/json")
+                    .header("host", "192.168.1.5:3000")
+                    .body(axum::body::Body::from(r#"{"name":"a4h"}"#))
                     .unwrap(),
             )
             .await
@@ -3347,6 +3441,171 @@ mod tests {
             resp.status()
         );
         crate::setup::init(true, false); // 还原默认，避免污染并行测试
+    }
+
+    #[tokio::test]
+    async fn settings_get_put_roundtrip_hot_values() {
+        // v0.20 第二期：GET 三层清单；PUT 热改即生效并落盘 gateway 文件。
+        // HotSettings 是进程全局——测试末尾必须还原，避免污染并行测试。
+        let app = app(test_state());
+        let gateway_file = std::env::temp_dir().join("sap-for-agents-test-gateway.toml");
+        let _ = std::fs::remove_file(&gateway_file);
+
+        // 1) GET：三层结构齐备
+        let resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/settings")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let v: serde_json::Value =
+            serde_json::from_str(&body_string(resp.into_body()).await).unwrap();
+        assert!(v["hot"]["request_timeout_secs"].is_object());
+        assert!(v["apply_on_system_rebuild"]["pool_size"].is_object());
+        assert!(v["apply_on_restart"]["listen_addr"].is_object());
+
+        // 2) PUT：改限流/排空 → 200；GET 反映新值，来源 file
+        let resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("PUT")
+                    .uri("/api/settings")
+                    .header("content-type", "application/json")
+                    .header("host", "127.0.0.1:3000") // 安全门：回环 Host
+                    .body(axum::body::Body::from(
+                        r#"{"rate_limit_rps":5,"drain_secs":9}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/settings")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&body_string(resp.into_body()).await).unwrap();
+        assert_eq!(v["hot"]["rate_limit_rps"]["value"], 5);
+        assert_eq!(v["hot"]["rate_limit_rps"]["source"], "file");
+        assert_eq!(v["hot"]["drain_secs"]["value"], 9);
+
+        // 3) 非法值 → 400 SETTING_PARAM_INVALID；重启档键 → 422（deny_unknown_fields）
+        let resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("PUT")
+                    .uri("/api/settings")
+                    .header("content-type", "application/json")
+                    .header("host", "127.0.0.1:3000")
+                    .body(axum::body::Body::from(r#"{"request_timeout_secs":0}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::BAD_REQUEST);
+        let body = body_string(resp.into_body()).await;
+        assert!(body.contains("SETTING_PARAM_INVALID"), "{body}");
+        let resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("PUT")
+                    .uri("/api/settings")
+                    .header("content-type", "application/json")
+                    .header("host", "127.0.0.1:3000")
+                    .body(axum::body::Body::from(r#"{"listen_addr":"1.2.3.4:3000"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::UNPROCESSABLE_ENTITY);
+
+        // 4) 还原（清全局态与落盘文件，避免污染并行测试）
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("PUT")
+                    .uri("/api/settings")
+                    .header("content-type", "application/json")
+                    .header("host", "127.0.0.1:3000")
+                    .body(axum::body::Body::from(
+                        r#"{"rate_limit_rps":0,"drain_secs":5}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let _ = std::fs::remove_file(&gateway_file);
+    }
+
+    #[tokio::test]
+    async fn admin_restart_and_reload_gated_like_config_writes() {
+        // v0.20：restart/reload 是配置面动作，与配置写同一道门。
+        // 只测 403 与回环放行——restart 的 202 路径会真的 process::exit(0)，不能进测试。
+        crate::setup::init(true, false);
+
+        // 远程未鉴权 → 403（restart）
+        let resp = app(test_state_at("0.0.0.0:3000"))
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/admin/restart")
+                    .header("host", "192.168.1.5:3000")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::FORBIDDEN);
+        let body = body_string(resp.into_body()).await;
+        assert!(body.contains("SETUP_LOCKED"), "{body}");
+
+        // 远程未鉴权 → 403（reload 作用域形态）
+        let resp = app(test_state_at("0.0.0.0:3000"))
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/s/a4h/admin/reload")
+                    .header("host", "192.168.1.5:3000")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::FORBIDDEN);
+
+        // 本机回环 → reload 放行（池换代在 lazy 池上无 FFI，安全）
+        let resp = app(test_state())
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/s/a4h/admin/reload")
+                    .header("host", "127.0.0.1:3000")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            resp.status().is_success(),
+            "回环 reload 应放行: {}",
+            resp.status()
+        );
     }
 
     #[tokio::test]
@@ -3493,9 +3752,11 @@ mod tests {
             runtime_mode: false,
             update_check: false,
             systems_file: toml_path.to_path_buf(),
+            gateway_file: std::env::temp_dir().join("sap-gw-unconf-gateway.toml"),
             setup_enabled: true,
             setup_force: false,
             open_browser: false,
+            lang: "EN".into(),
         };
         Arc::new(crate::systems::build_registry(vec![], &cfg))
     }
@@ -3556,6 +3817,7 @@ mod tests {
                     .method(axum::http::Method::POST)
                     .uri("/api/setup/system")
                     .header("content-type", "application/json")
+                    .header("host", "127.0.0.1:3000") // v0.20 安全门：无鉴权写入要求回环 Host
                     .body(axum::body::Body::from(req_body.to_string()))
                     .unwrap(),
             )
@@ -3603,6 +3865,7 @@ mod tests {
                     .method(axum::http::Method::POST)
                     .uri("/api/setup/system")
                     .header("content-type", "application/json")
+                    .header("host", "127.0.0.1:3000") // v0.20 安全门：无鉴权写入要求回环 Host
                     .body(axum::body::Body::from(
                         serde_json::json!({"name": "x", "ashost": "h", "sysnr": "00",
                                            "user": "u", "passwd": "p",
@@ -3624,6 +3887,7 @@ mod tests {
                     .method(axum::http::Method::POST)
                     .uri("/api/setup/system")
                     .header("content-type", "application/json")
+                    .header("host", "127.0.0.1:3000") // v0.20 安全门：无鉴权写入要求回环 Host
                     .body(axum::body::Body::from(
                         serde_json::json!({"name": "x", "user": "u", "passwd": "p",
                                            "test": false})
@@ -3645,9 +3909,9 @@ mod tests {
         // 用 test_state（已配置）也不影响——页面是静态模板，状态由前端拉取。
         let app = app(test_state());
         for (uri, marker) in [
-            ("/setup", "Guided Setup"),         // 默认英文
-            ("/setup?lang=en", "Guided Setup"), // 显式英文
-            ("/setup?lang=zh", "首次配置引导"), // 中文
+            ("/setup", "Configuration Console"),         // 默认英文
+            ("/setup?lang=en", "Configuration Console"), // 显式英文
+            ("/setup?lang=zh", "配置台"),                // 中文
         ] {
             let resp = app
                 .clone()
@@ -3680,9 +3944,6 @@ mod tests {
             .await
             .unwrap();
         let body = body_string(resp.into_body()).await;
-        assert!(
-            body.contains("首次配置引导"),
-            "Accept-Language: zh 应出中文页"
-        );
+        assert!(body.contains("配置台"), "Accept-Language: zh 应出中文页");
     }
 }

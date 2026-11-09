@@ -71,7 +71,7 @@ pub(crate) struct SystemsFile {
     pub(crate) systems: BTreeMap<String, RawSystem>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub(crate) struct RawSystem {
     pub(crate) ashost: Option<String>,
     pub(crate) sysnr: Option<String>,
@@ -388,8 +388,9 @@ pub struct SystemHandle {
     pub meta: crate::metadata::MetadataCache,
     /// 该系统只读（写端点 403）
     pub read_only: bool,
-    /// 该系统单请求超时
-    pub request_timeout: Duration,
+    /// 该系统单请求超时**覆盖**（toml 的 request_timeout_secs；None = 跟随
+    /// 全局热设置——v0.20 起 PUT /api/settings 即改即生效，见 effective_timeout）
+    pub request_timeout: Option<Duration>,
     /// 连接目标标识（SYSID 查重的同后端豁免用，见 [`backend_key`]）
     backend: String,
     /// 首连成功后登记的 SYSID（连接属性读取，本地无 RFC 往返）
@@ -492,6 +493,13 @@ impl SystemHandle {
             sdk_desc_removed,
             sdk_type_removed,
         }
+    }
+
+    /// 生效的单请求超时：系统级覆盖优先，否则取全局热设置
+    /// （settings.rs——PUT /api/settings 改全局默认后，未覆盖的系统立即生效）。
+    pub fn effective_timeout(&self) -> Duration {
+        self.request_timeout
+            .unwrap_or_else(|| crate::settings::current().request_timeout)
     }
 
     /// 已登记的 SYSID（未知时 None——系统尚未成功连过）。
@@ -682,6 +690,63 @@ impl SystemRegistry {
             "系统已热加载（setup API，无需重启）"
         );
     }
+
+    /// 运行期替换一个系统的句柄（setup 编辑路径）：连接池/ADT/元数据缓存
+    /// 全部换新，旧句柄由在途请求持有的 Arc 引用维持到归还后自然释放。
+    /// 系统在默认位时，即便 `make_default=false` 也保持默认指向新句柄
+    /// （默认不能悬空指向旧句柄）。同名不存在返回 false（调用方前置校验）。
+    pub fn replace_system(
+        &self,
+        name: &str,
+        handle: Arc<SystemHandle>,
+        make_default: bool,
+    ) -> bool {
+        let mut inner = self.inner.write().unwrap_or_else(|e| e.into_inner());
+        if !inner.systems.contains_key(name) {
+            return false;
+        }
+        inner.systems.insert(name.to_string(), Arc::clone(&handle));
+        let was_default = inner
+            .default
+            .as_ref()
+            .map(|d| d.name == name)
+            .unwrap_or(false);
+        if make_default || was_default {
+            inner.default = Some(handle);
+        }
+        tracing::info!(system = %name, default = make_default || was_default, "系统已热替换（setup 编辑，无需重启）");
+        true
+    }
+
+    /// 运行期移除系统：返回被移除的句柄与其**移除前**是否为默认。默认位
+    /// 随移除置空——由调用方提升剩余系统为新默认（或接受回到未配置模式）。
+    pub fn remove_system(&self, name: &str) -> Option<(Arc<SystemHandle>, bool)> {
+        let mut inner = self.inner.write().unwrap_or_else(|e| e.into_inner());
+        let handle = inner.systems.remove(name)?;
+        inner.order.retain(|n| n != name);
+        let was_default = inner
+            .default
+            .as_ref()
+            .map(|d| d.name == name)
+            .unwrap_or(false);
+        if was_default {
+            inner.default = None;
+        }
+        tracing::info!(system = %name, was_default, "系统已移除（setup 删除，无需重启）");
+        Some((handle, was_default))
+    }
+
+    /// 提升默认系统（无前缀路径的新目标）。名字未知返回 Err（带合法名单）。
+    pub fn set_default(&self, name: &str) -> Result<(), String> {
+        let mut inner = self.inner.write().unwrap_or_else(|e| e.into_inner());
+        let handle =
+            inner.systems.get(name).cloned().ok_or_else(|| {
+                format!("系统 '{}' 不存在（可用: {}）", name, inner.order.join(", "))
+            })?;
+        inner.default = Some(handle);
+        tracing::info!(system = %name, "默认系统已切换（setup API，无需重启）");
+        Ok(())
+    }
 }
 
 /// 从连接参数表取值。
@@ -725,7 +790,6 @@ fn build_adt(spec: &SystemSpec, timeout: Duration) -> Option<crate::adt::AdtEndp
 pub(crate) fn make_handle(spec: &SystemSpec, cfg: &AppConfig) -> Arc<SystemHandle> {
     let pool_size = spec.pool_size.unwrap_or(cfg.pool_size);
     let idle_validate = spec.idle_validate.unwrap_or(cfg.pool_idle_validate);
-    let request_timeout = spec.request_timeout.unwrap_or(cfg.request_timeout);
     let read_only = spec.read_only.unwrap_or(cfg.read_only);
 
     let pool = Arc::new(RfcConnectionPool::lazy(
@@ -733,7 +797,8 @@ pub(crate) fn make_handle(spec: &SystemSpec, cfg: &AppConfig) -> Arc<SystemHandl
         pool_size,
         idle_validate,
     ));
-    let adt = build_adt(spec, request_timeout);
+    // ADT 端点超时是构建期快照（AdtEndpoint 不持热设置引用）
+    let adt = build_adt(spec, spec.request_timeout.unwrap_or(cfg.request_timeout));
 
     Arc::new(SystemHandle {
         name: spec.name.clone(),
@@ -741,7 +806,7 @@ pub(crate) fn make_handle(spec: &SystemSpec, cfg: &AppConfig) -> Arc<SystemHandl
         adt,
         meta: crate::metadata::MetadataCache::new(),
         read_only,
-        request_timeout,
+        request_timeout: spec.request_timeout,
         backend: backend_key(&spec.conn_params),
         sysid: OnceLock::new(),
         quarantined: AtomicBool::new(false),
@@ -952,9 +1017,11 @@ mod tests {
             runtime_mode: false,
             update_check: false,
             systems_file: "no-such-file.toml".into(),
+            gateway_file: "no-such-gateway.toml".into(),
             setup_enabled: true,
             setup_force: false,
             open_browser: false,
+            lang: "EN".into(),
         }
     }
 
@@ -1197,7 +1264,7 @@ ashost = "h"
             adt: None,
             meta: crate::metadata::MetadataCache::new(),
             read_only: false,
-            request_timeout: Duration::from_secs(5),
+            request_timeout: Some(Duration::from_secs(5)),
             backend: backend_key(&params),
             sysid: OnceLock::new(),
             quarantined: AtomicBool::new(false),
@@ -1322,5 +1389,50 @@ ashost = "h"
             passwd_ref: None,
         };
         assert!(build_adt(&lb, Duration::from_secs(5)).is_none());
+    }
+
+    #[test]
+    fn replace_remove_and_set_default_mutate_registry() {
+        let cfg = test_cfg(vec![]);
+        let reg = build_registry(vec![], &cfg);
+        let a = mk_handle("a", "h-a");
+        let b = mk_handle("b", "h-b");
+        reg.add_system(Arc::new(a), false);
+        reg.add_system(Arc::new(b), true);
+        assert_eq!(reg.default().unwrap().name, "b");
+
+        // 替换默认系统：make_default=false 也必须保持默认指向新句柄
+        let a2 = mk_handle("a", "h-a2");
+        assert!(reg.replace_system("a", Arc::new(a2), false));
+        assert_eq!(reg.default().unwrap().name, "b", "替换 b 无关默认");
+        let b2 = mk_handle("b", "h-b2");
+        assert!(reg.replace_system("b", Arc::new(b2), false));
+        assert_eq!(
+            reg.default().unwrap().name,
+            "b",
+            "默认位系统被替换后默认仍指向新句柄"
+        );
+        // 同名不存在 → false
+        assert!(!reg.replace_system("ghost", Arc::new(mk_handle("ghost", "h-g")), true));
+
+        // 切默认
+        reg.set_default("a").unwrap();
+        assert_eq!(reg.default().unwrap().name, "a");
+        assert!(reg.set_default("ghost").is_err());
+
+        // 移除非默认系统：默认不受影响、order 收缩
+        let (removed, was_default) = reg.remove_system("b").unwrap();
+        assert_eq!(removed.name, "b");
+        assert!(!was_default);
+        assert_eq!(reg.names(), vec!["a".to_string()]);
+        assert_eq!(reg.default().unwrap().name, "a");
+        assert!(reg.remove_system("b").is_none(), "重复移除 → None");
+
+        // 移除默认系统：default 置空（调用方决定提升谁或接受未配置模式）
+        let (removed, was_default) = reg.remove_system("a").unwrap();
+        assert_eq!(removed.name, "a");
+        assert!(was_default);
+        assert!(reg.default().is_none());
+        assert!(reg.names().is_empty());
     }
 }

@@ -418,14 +418,8 @@ async fn call_tool(state: SharedState, name: &str, args: Value) -> Result<Value,
             // 与 /api/rfc 共用「执行 + 审计环 + rc 指标 + 签名漂移提示」路径
             // （此前绕过审计与指标、自带一份 timeout clamp 复制品，2026-11-05
             // 审计 P1）。MCP 无 per-IP 语义，审计 caller 记为 "mcp"。
-            let out = crate::server::run_invoke_and_log(
-                sys,
-                "mcp".to_string(),
-                req,
-                "mcp",
-                None,
-            )
-            .await?;
+            let out =
+                crate::server::run_invoke_and_log(sys, "mcp".to_string(), req, "mcp", None).await?;
             serde_json::to_value(out.0).map_err(|e| RfcError {
                 code: -1,
                 status: 500,

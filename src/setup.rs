@@ -64,12 +64,121 @@ pub fn is_forced() -> bool {
     SETUP_FORCE.load(std::sync::atomic::Ordering::SeqCst)
 }
 
-/// setup 写入对**当前系统集合**是否可用：开关开着，且（未配置 || force）。
-/// 已配置部署默认锁定 `POST /api/setup/system`——无鉴权部署上，开放的引导
-/// 写入等于允许任何人添加恶意"系统"（网关会拿配置的凭据 Basic-auth 进去，
-/// 构成凭据中继）并把试连当内网探针。
-pub fn writable_for_configured(configured: bool) -> bool {
-    is_enabled() && (is_forced() || !configured)
+/// setup 写入对**当前部署形态**是否可用 + 不可写原因（GET /api/setup 的
+/// `writable` 与 `/api/version` 的 `capabilities.setup` 同源）。
+///
+/// v0.20 方案 A：取代旧"配置后锁定"——运行期改配置是核心诉求，锁不再按
+/// "是否已配置"判定，而按**部署形态**判定（见 [`admin_write_gate`] 的门规则）。
+pub fn writable_status(listen_addr: &str) -> (bool, Option<String>) {
+    if !is_enabled() {
+        (false, Some("SAP_SETUP=off".into()))
+    } else if is_forced() || crate::auth::is_enabled() || listen_is_loopback(listen_addr) {
+        (true, None)
+    } else {
+        (
+            false,
+            Some(format!(
+                "网关监听在非回环地址 {listen_addr} 且未启用鉴权（SAP_API_KEY 未设）——\
+                 配置写入已锁定；远程访问设 SAP_API_KEY 走 Bearer，本机调试可设 SAP_SETUP=force"
+            )),
+        )
+    }
+}
+
+/// 不可写原因的机器键（`GET /api/setup` 的 `disabled_reason_key`；前端
+/// 按语言渲染用，人读文本仍在 `disabled_reason`）：`setup_off` /
+/// `no_loopback_unauth`；可写时 None。
+pub fn writable_reason_key(listen_addr: &str) -> Option<&'static str> {
+    if !is_enabled() {
+        Some("setup_off")
+    } else if is_forced() || crate::auth::is_enabled() || listen_is_loopback(listen_addr) {
+        None
+    } else {
+        Some("no_loopback_unauth")
+    }
+}
+
+/// 监听/Host 地址的主机部分是否回环（127.0.0.0/8、::1、localhost）。
+/// 支持 `host:port` 与 `[v6]:port`；裸 IPv6（无端口）不作为监听/Host 出现。
+fn addr_host_is_loopback(addr: &str) -> bool {
+    let addr = addr.trim();
+    let host = if let Some(rest) = addr.strip_prefix('[') {
+        rest.split(']').next().unwrap_or(rest)
+    } else {
+        addr.rsplit_once(':').map(|(h, _)| h).unwrap_or(addr)
+    };
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    host.parse::<std::net::IpAddr>()
+        .map(|ip| ip.is_loopback())
+        .unwrap_or(false)
+}
+
+/// 监听地址是否只绑在回环上（本机专用部署的判定）。
+fn listen_is_loopback(listen_addr: &str) -> bool {
+    addr_host_is_loopback(listen_addr)
+}
+
+/// 请求 Host 头的主机部分是否回环——DNS rebinding 防御：恶意页把自己的
+/// 域名解析到 127.0.0.1 后，浏览器视角下对其网关的请求是"同源"，可携带
+/// 任意头与 JSON 体，但 Host 头仍暴露真实访问名，非回环即拒。
+fn host_header_is_loopback(headers: &axum::http::HeaderMap) -> bool {
+    headers
+        .get(axum::http::header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .map(addr_host_is_loopback)
+        .unwrap_or(false)
+}
+
+/// setup 管理写入（增/删/改系统、切默认）的安全门。
+///
+/// - `SAP_SETUP=off`：一切写入禁用（403 `SETUP_DISABLED`）；
+/// - `SAP_SETUP=force`：全放行（部署者明确自担风险）；
+/// - 启用鉴权（SAP_API_KEY）：`require_api_key` 中间件已验过 Bearer，放行；
+/// - 未鉴权：仅当**监听地址**为回环且请求 Host 也是回环时放行。
+///
+/// 为什么不需要 CSRF token：写端点全部要求 `Content-Type: application/json`
+/// （axum Json 提取器强制）或非简单方法（PUT/DELETE）——浏览器跨站表单发不
+/// 出 JSON，无预检 fetch 发不出非简单方法，而预检请求网关不回 CORS 头即被
+/// 拦截。唯一剩下的浏览器向量为 DNS rebinding，由 Host 回环校验挡住。
+pub(crate) fn admin_write_gate(
+    state: &SharedState,
+    headers: &axum::http::HeaderMap,
+) -> Result<(), RfcError> {
+    if !is_enabled() {
+        return Err(RfcError {
+            code: -1,
+            status: 403,
+            message: "引导式配置已禁用（SAP_SETUP=off）：请手工编辑 sap_systems.toml 后重启".into(),
+            key: "SETUP_DISABLED".into(),
+        });
+    }
+    if is_forced() || crate::auth::is_enabled() {
+        return Ok(());
+    }
+    let locked = |detail: String| RfcError {
+        code: -1,
+        status: 403,
+        message: format!(
+            "配置写入已锁定：{}（无鉴权部署的安全门：仅本机回环访问可写；\
+             远程访问设 SAP_API_KEY 走 Bearer，本机调试可设 SAP_SETUP=force）",
+            detail
+        ),
+        key: "SETUP_LOCKED".into(),
+    };
+    if !listen_is_loopback(&state.cfg().listen_addr) {
+        return Err(locked(format!(
+            "网关监听在非回环地址 {} 且未启用鉴权",
+            state.cfg().listen_addr
+        )));
+    }
+    if !host_header_is_loopback(headers) {
+        return Err(locked(
+            "请求 Host 不是本机回环地址（疑似 DNS rebinding / 跨主机访问）".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// 启动期写入「自动打开引导页」开关（main 调一次）。
@@ -99,8 +208,7 @@ pub async fn status_handler(
 ) -> Json<serde_json::Value> {
     let names = state.names();
     let cfg = state.cfg();
-    let enabled = is_enabled();
-    let writable = writable_for_configured(!names.is_empty());
+    let (writable, disabled_reason) = writable_status(&cfg.listen_addr);
     Json(serde_json::json!({
         "configured": !names.is_empty(),
         "default": state.default().map(|d| d.name.clone()),
@@ -111,13 +219,8 @@ pub async fn status_handler(
         // 环境变量合成路径提示：toml 首写时 env 系统会一并写入（见模块注释）
         "env_synth_will_be_persisted": crate::systems::synth_env_spec(cfg).is_some(),
         "writable": writable,
-        "disabled_reason": if writable {
-            None
-        } else if !enabled {
-            Some("SAP_SETUP=off")
-        } else {
-            Some("网关已配置且 SAP_SETUP≠force（引导写入已锁定）")
-        },
+        "disabled_reason": disabled_reason,
+        "disabled_reason_key": writable_reason_key(&cfg.listen_addr),
         "fields": field_schema(),
         "connection_forms": {
             "direct": "ashost + sysnr（+ client）——直连单个应用服务器",
@@ -134,9 +237,10 @@ pub async fn status_handler(
             "default": true,
         },
         "note": "未配置时 Agent 引导用户：按 fields 清单向用户采集 → POST /api/setup/system \
-                 （先试连后落盘，成功即热加载，无需重启）。密码建议让用户提供环境变量引用 \
-                 （${VAR} 形式，插值规则同 toml），避免明文出现在对话里。\
-                 人类引导页（含可复制的 agent 交接文字）：/setup",
+                 （先试连后落盘，成功即热加载，无需重启）。运行期增删改系统/切默认：\
+                 PUT|DELETE /api/setup/system/{name}、PUT /api/setup/default（可写时同样免重启）。\
+                 密码建议让用户提供环境变量引用（${VAR} 形式，插值规则同 toml），避免明文出现在对话里。\
+                 人类配置台（含可复制的 agent 交接文字）：/setup",
     }))
 }
 
@@ -226,34 +330,81 @@ impl SetupSystemRequest {
     }
 }
 
+/// 试连一个候选系统句柄并登记 SYSID：真实打开一条 RFC 连接读系统信息
+/// （账号/密码/网络一次验真）；与其他**后端**撞 SYSID（克隆系统）直接拒绝——
+/// 存进去也会被隔离（SDK 描述符缓存按 SYSID 分区，见 systems.rs）。
+/// 新增（`add_handler`）与改配置（`update_handler`）共用；调用点都在落盘前，
+/// 报错文案里的"未写入"对两条路径同样成立。
+async fn test_and_register(
+    handle: &Arc<crate::systems::SystemHandle>,
+) -> Result<crate::connection::RemoteSystemInfo, RfcError> {
+    let pool = Arc::clone(&handle.pool);
+    let joined = tokio::time::timeout(
+        TEST_TIMEOUT,
+        tokio::task::spawn_blocking(move || pool.with_connection(|conn| conn.system_info())),
+    )
+    .await;
+    let info = match joined {
+        Err(_) => {
+            return Err(RfcError {
+                code: -1,
+                status: 502,
+                message: format!(
+                    "连接测试超时（{}s，未写入）。检查 ashost/网络/防火墙后重试",
+                    TEST_TIMEOUT.as_secs()
+                ),
+                key: "SETUP_CONNECT_TIMEOUT".into(),
+            })
+        }
+        Ok(Err(join)) => {
+            return Err(RfcError {
+                code: -1,
+                status: 502,
+                message: format!("连接测试任务异常（未写入）: {}", join),
+                key: "SETUP_CONNECT_FAILED".into(),
+            })
+        }
+        Ok(Ok(Err(e))) => {
+            return Err(RfcError {
+                code: e.code,
+                status: 502,
+                message: format!(
+                    "连接测试失败（未写入）: {} [{}]。检查地址/系统号/账号/密码",
+                    e.message, e.key
+                ),
+                key: "SETUP_CONNECT_FAILED".into(),
+            })
+        }
+        Ok(Ok(Ok(info))) => info,
+    };
+    if let Err(owner) = handle.record_sysid(&info.sysid) {
+        return Err(RfcError {
+            code: -1,
+            status: 409,
+            message: format!(
+                "系统 '{}' 的 SYSID {} 与系统 '{}' 冲突（SDK 描述符缓存按 SYSID 分区，\
+                 跨后端同 SYSID 会静默共享错误签名；未写入）",
+                handle.name, info.sysid, owner
+            ),
+            key: "SYSTEM_SYSID_CONFLICT".into(),
+        });
+    }
+    tracing::info!(
+        system = %handle.name,
+        sysid = %info.sysid,
+        release = %info.release,
+        "setup 连接测试成功"
+    );
+    Ok(info)
+}
+
 /// `POST /api/setup/system`：引导写入一个 SAP 系统并热加载。
 pub async fn add_handler(
     axum::extract::State(state): axum::extract::State<SharedState>,
+    headers: axum::http::HeaderMap,
     Json(body): Json<SetupSystemRequest>,
 ) -> Result<Json<serde_json::Value>, RfcError> {
-    if !is_enabled() {
-        return Err(RfcError {
-            code: -1,
-            status: 403,
-            message: "引导式配置已禁用（SAP_SETUP=off）：请手工编辑 sap_systems.toml 后重启".into(),
-            key: "SETUP_DISABLED".into(),
-        });
-    }
-    // 配置后锁定（v0.19.1 安全修复）：已有系统的部署不再接受引导写入——
-    // 无鉴权部署上这等于允许任何人做凭据中继/内网探测。force 可豁免。
-    if !is_forced() && !state.names().is_empty() {
-        return Err(RfcError {
-            code: -1,
-            status: 403,
-            message: format!(
-                "网关已配置（系统: {}），引导写入已锁定——这是无鉴权部署的防滥用措施。\
-                 运行期加系统：手工编辑 {} 后重启；确需保持引导写入可设 SAP_SETUP=force",
-                state.names().join(", "),
-                state.cfg().systems_file.display()
-            ),
-            key: "SETUP_LOCKED".into(),
-        });
-    }
+    admin_write_gate(&state, &headers)?;
 
     // 1. 校验（与启动期 toml 解析同一套 build_spec：命名/插值/连接形态）
     let raw = body.to_raw();
@@ -288,66 +439,7 @@ pub async fn add_handler(
     // 4. 试连（真实打开一条 RFC 连接读系统信息——账号/密码/网络一次验真）
     let mut tested_info: Option<crate::connection::RemoteSystemInfo> = None;
     if body.test.unwrap_or(true) {
-        let pool = Arc::clone(&handle.pool);
-        let joined = tokio::time::timeout(
-            TEST_TIMEOUT,
-            tokio::task::spawn_blocking(move || pool.with_connection(|conn| conn.system_info())),
-        )
-        .await;
-        let info = match joined {
-            Err(_) => {
-                return Err(RfcError {
-                    code: -1,
-                    status: 502,
-                    message: format!(
-                        "连接测试超时（{}s，未写入）。检查 ashost/网络/防火墙后重试",
-                        TEST_TIMEOUT.as_secs()
-                    ),
-                    key: "SETUP_CONNECT_TIMEOUT".into(),
-                })
-            }
-            Ok(Err(join)) => {
-                return Err(RfcError {
-                    code: -1,
-                    status: 502,
-                    message: format!("连接测试任务异常（未写入）: {}", join),
-                    key: "SETUP_CONNECT_FAILED".into(),
-                })
-            }
-            Ok(Ok(Err(e))) => {
-                return Err(RfcError {
-                    code: e.code,
-                    status: 502,
-                    message: format!(
-                        "连接测试失败（未写入）: {} [{}]。检查地址/系统号/账号/密码",
-                        e.message, e.key
-                    ),
-                    key: "SETUP_CONNECT_FAILED".into(),
-                })
-            }
-            Ok(Ok(Ok(info))) => info,
-        };
-        // SYSID 登记：与其他后端撞 SYSID（克隆系统）直接拒绝写入——
-        // 存进去也会被隔离（SDK 描述符缓存按 SYSID 分区，见 systems.rs）
-        if let Err(owner) = handle.record_sysid(&info.sysid) {
-            return Err(RfcError {
-                code: -1,
-                status: 409,
-                message: format!(
-                    "系统 '{}' 的 SYSID {} 与系统 '{}' 冲突（SDK 描述符缓存按 SYSID 分区，\
-                     跨后端同 SYSID 会静默共享错误签名；未写入）",
-                    spec.name, info.sysid, owner
-                ),
-                key: "SYSTEM_SYSID_CONFLICT".into(),
-            });
-        }
-        tracing::info!(
-            system = %spec.name,
-            sysid = %info.sysid,
-            release = %info.release,
-            "setup 连接测试成功"
-        );
-        tested_info = Some(info);
+        tested_info = Some(test_and_register(&handle).await?);
     } else {
         tracing::warn!(system = %spec.name, "setup 跳过连接测试（test:false，配置未验证可达性）");
     }
@@ -407,6 +499,412 @@ pub async fn add_handler(
         "systems_count": state.names().len(),
         "note": "已热加载，无需重启网关。GET /api/systems 查看；再添系统重复 POST 即可",
     })))
+}
+
+// ========================================================================
+// 运行期配置管理（v0.20 方案 A）：读取 / 编辑 / 删除系统 + 切默认
+// ========================================================================
+
+/// `GET /api/setup/system/{name}`：读取一个系统的原始配置（编辑预填用）。
+/// **密码永不回显**——只给引用形态（`${VAR}`）或"已设置"标志。
+pub async fn get_system_handler(
+    axum::extract::State(state): axum::extract::State<SharedState>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+    headers: axum::http::HeaderMap,
+) -> Result<Json<serde_json::Value>, RfcError> {
+    // 读取与写入同门：配置面（含掩码后的结构信息）不对非本机/未鉴权方暴露
+    admin_write_gate(&state, &headers)?;
+    let raw = read_system_raw(state.cfg(), &name).map_err(|e| RfcError {
+        code: -1,
+        status: 500,
+        message: format!("读取系统 '{}' 配置失败: {}", name, e),
+        key: "SETUP_READ_FAILED".into(),
+    })?;
+    let Some(raw) = raw else {
+        return Err(system_unknown(&state, &name));
+    };
+    let from_toml = state.cfg().systems_file.exists();
+    Ok(Json(system_raw_json(&name, &raw, &state, from_toml)))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateSystemRequest {
+    /// 半更新语义：未提供的字段保持原值（密码不回显，留空 = 不改密码）。
+    ashost: Option<String>,
+    sysnr: Option<String>,
+    client: Option<String>,
+    user: Option<String>,
+    passwd: Option<String>,
+    lang: Option<String>,
+    default: Option<bool>,
+    /// 改后是否真实试连（默认 true）
+    test: Option<bool>,
+    pool_size: Option<usize>,
+    idle_validate_secs: Option<u64>,
+    request_timeout_secs: Option<u64>,
+    adt_base_url: Option<String>,
+    adt_user: Option<String>,
+    adt_passwd: Option<String>,
+    read_only: Option<bool>,
+    /// 连接参数透传表（提供即整体替换原 conn）
+    conn: Option<BTreeMap<String, String>>,
+}
+
+/// 半更新合并：body 里 Some 的字段覆盖原条目，其余原样保留。
+fn merge_update_raw(mut base: RawSystem, body: &UpdateSystemRequest) -> RawSystem {
+    if body.ashost.is_some() {
+        base.ashost = body.ashost.clone();
+    }
+    if body.sysnr.is_some() {
+        base.sysnr = body.sysnr.clone();
+    }
+    if body.client.is_some() {
+        base.client = body.client.clone();
+    }
+    if body.user.is_some() {
+        base.user = body.user.clone();
+    }
+    if body.passwd.is_some() {
+        base.passwd = body.passwd.clone();
+    }
+    if body.lang.is_some() {
+        base.lang = body.lang.clone();
+    }
+    if let Some(d) = body.default {
+        base.default = d;
+    }
+    if body.pool_size.is_some() {
+        base.pool_size = body.pool_size;
+    }
+    if body.idle_validate_secs.is_some() {
+        base.idle_validate_secs = body.idle_validate_secs;
+    }
+    if body.request_timeout_secs.is_some() {
+        base.request_timeout_secs = body.request_timeout_secs;
+    }
+    if body.adt_base_url.is_some() {
+        base.adt_base_url = body.adt_base_url.clone();
+    }
+    if body.adt_user.is_some() {
+        base.adt_user = body.adt_user.clone();
+    }
+    if body.adt_passwd.is_some() {
+        base.adt_passwd = body.adt_passwd.clone();
+    }
+    if body.read_only.is_some() {
+        base.read_only = body.read_only;
+    }
+    if let Some(c) = &body.conn {
+        base.conn = c.clone();
+    }
+    base
+}
+
+/// `PUT /api/setup/system/{name}`：修改一个系统的连接配置并热替换。
+///
+/// - **不支持改名**（名字是 URL 段 + toml 键 + 审计字段的三重标识，改名等于
+///   删除重建）；其余字段半更新：未提供的保持原值（改密码只传 `passwd`）。
+/// - 流程与新增同链路：合并 → build_spec 校验 → 试连（可 `test:false` 跳过）
+///   → 落盘（toml 条目原地替换）→ 热替换句柄（旧池由在途请求自然排空）。
+pub async fn update_handler(
+    axum::extract::State(state): axum::extract::State<SharedState>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<UpdateSystemRequest>,
+) -> Result<Json<serde_json::Value>, RfcError> {
+    admin_write_gate(&state, &headers)?;
+    if state.resolve(&name).is_none() {
+        return Err(system_unknown(&state, &name));
+    }
+    if body.passwd.as_ref().is_some_and(|p| p.trim().is_empty()) {
+        return Err(RfcError {
+            code: -1,
+            status: 400,
+            message:
+                "passwd 不能为空串——不传该字段即保持原密码（改回环境变量引用则直接传 \"${VAR}\"）"
+                    .into(),
+            key: "SETUP_PARAM_INVALID".into(),
+        });
+    }
+    let Some(existing) = read_system_raw(state.cfg(), &name).map_err(|e| RfcError {
+        code: -1,
+        status: 500,
+        message: format!("读取系统 '{}' 原配置失败（未写入）: {}", name, e),
+        key: "SETUP_READ_FAILED".into(),
+    })?
+    else {
+        // 运行态有、配置源没有：状态不一致（toml 被外部删了?）——拒绝盲改
+        return Err(RfcError {
+            code: -1,
+            status: 409,
+            message: format!(
+                "系统 '{}' 在运行态存在但配置源缺失（sap_systems.toml 被外部改动?），\
+                 拒绝半更新合并；请删除后重建该系统",
+                name
+            ),
+            key: "SETUP_STATE_INCONSISTENT".into(),
+        });
+    };
+    let will_be_default = body.default.unwrap_or(existing.default);
+    let raw = merge_update_raw(existing, &body);
+
+    // 1. 校验（与新增同一套 build_spec）
+    let spec = crate::systems::build_spec(&name, &raw).map_err(|e| RfcError {
+        code: -1,
+        status: 400,
+        message: format!("系统定义不合法（未写入）: {}", e),
+        key: "SETUP_PARAM_INVALID".into(),
+    })?;
+
+    // 2. 组装新句柄（lazy 池不触 FFI）+ 试连
+    let handle = crate::systems::make_handle(&spec, state.cfg());
+    let mut tested_info: Option<crate::connection::RemoteSystemInfo> = None;
+    if body.test.unwrap_or(true) {
+        tested_info = Some(test_and_register(&handle).await?);
+    } else {
+        tracing::warn!(system = %name, "setup 编辑跳过连接测试（test:false，配置未验证可达性）");
+    }
+
+    // 3. 落盘（toml 条目原地替换，互斥防并发；失败则不动运行态）
+    let cfg = state.cfg();
+    write_system_to_toml(cfg, &spec, &raw, will_be_default).map_err(|e| RfcError {
+        code: -1,
+        status: 500,
+        message: format!(
+            "写入 {} 失败（运行态未变）: {}",
+            cfg.systems_file.display(),
+            e
+        ),
+        key: "SETUP_WRITE_FAILED".into(),
+    })?;
+
+    // 4. 热替换句柄（旧池由在途请求的 Arc 引用维持到归还）
+    if !state.replace_system(&name, Arc::clone(&handle), will_be_default) {
+        return Err(RfcError {
+            code: -1,
+            status: 500,
+            message: format!(
+                "系统 '{}' 的配置已落盘但运行态替换失败（并发变更?）。\
+                 GET /api/systems 核对现状，必要时重启网关对齐",
+                name
+            ),
+            key: "SETUP_RACE".into(),
+        });
+    }
+
+    tracing::info!(
+        system = %name,
+        file = %cfg.systems_file.display(),
+        default = will_be_default,
+        tested = tested_info.is_some(),
+        "setup：系统配置已修改并热替换"
+    );
+
+    Ok(Json(serde_json::json!({
+        "saved": true,
+        "updated": true,
+        "name": name,
+        "default": will_be_default,
+        "file": cfg.systems_file.display().to_string(),
+        "connection": match tested_info {
+            Some(info) => serde_json::json!({
+                "tested": true, "sysid": info.sysid, "release": info.release,
+                "host": info.host, "destination": info.destination,
+            }),
+            None => serde_json::json!({"tested": false,
+                "note": "test:false 跳过试连——配置未验证可达性，调用期首次建连才见真章"}),
+        },
+        "note": "已热替换，无需重启网关；旧连接由在途请求自然排空",
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DeleteQuery {
+    /// 删除最后一个系统时必须显式 ?force=true（回到未配置模式：业务端点 503）
+    force: Option<bool>,
+}
+
+/// `DELETE /api/setup/system/{name}`：删除一个系统并热卸载。
+///
+/// - 默认系统被删且还有剩余系统 → 自动提升声明序第一个为新默认（toml 同步）；
+/// - 删除**最后一个**系统要求 `?force=true`（显式确认回到未配置模式）；
+/// - toml 条目同步删除；删空整个文件移除（重启后回到未配置/`.env` 合成模式）；
+/// - 系统来自 `.env` 合成（无 toml）时只卸载运行态——重启网关它会重新出现。
+pub async fn delete_handler(
+    axum::extract::State(state): axum::extract::State<SharedState>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+    headers: axum::http::HeaderMap,
+    axum::extract::Query(q): axum::extract::Query<DeleteQuery>,
+) -> Result<Json<serde_json::Value>, RfcError> {
+    admin_write_gate(&state, &headers)?;
+    if state.resolve(&name).is_none() {
+        return Err(system_unknown(&state, &name));
+    }
+    let is_last = state.names().len() == 1;
+    if is_last && !q.force.unwrap_or(false) {
+        return Err(RfcError {
+            code: -1,
+            status: 409,
+            message: format!(
+                "'{}' 是最后一个系统——删除后网关回到未配置模式（业务端点 503 \
+                 SYSTEM_NOT_CONFIGURED）。确认请加 ?force=true",
+                name
+            ),
+            key: "SETUP_LAST_SYSTEM".into(),
+        });
+    }
+
+    let Some((_handle, was_default)) = state.remove_system(&name) else {
+        return Err(system_unknown(&state, &name));
+    };
+
+    // toml 同步：条目删除；删空整个文件移除
+    let file_outcome = remove_system_from_toml(state.cfg(), &name).map_err(|e| RfcError {
+        code: -1,
+        status: 500,
+        message: format!(
+            "运行态已卸载但更新 {} 失败: {}",
+            state.cfg().systems_file.display(),
+            e
+        ),
+        key: "SETUP_WRITE_FAILED".into(),
+    })?;
+
+    // 默认系统被删且还有剩余 → 提升声明序第一个（toml 标志同步）
+    let mut default_now: Option<String> = state.default().map(|d| d.name.clone());
+    if was_default && default_now.is_none() {
+        if let Some(first) = state.names().first().cloned() {
+            state.set_default(&first).map_err(|e| RfcError {
+                code: -1,
+                status: 500,
+                message: format!("提升默认系统失败: {}", e),
+                key: "SETUP_INTERNAL".into(),
+            })?;
+            set_default_in_toml(state.cfg(), &first).map_err(|e| RfcError {
+                code: -1,
+                status: 500,
+                message: format!("更新默认标志失败: {}", e),
+                key: "SETUP_WRITE_FAILED".into(),
+            })?;
+            default_now = Some(first);
+        }
+    }
+
+    let from_env = !state.cfg().systems_file.exists();
+    tracing::info!(
+        system = %name,
+        was_default,
+        default_now = default_now.as_deref().unwrap_or("<none>"),
+        file_removed = file_outcome.1,
+        "setup：系统已删除"
+    );
+
+    Ok(Json(serde_json::json!({
+        "deleted": true,
+        "name": name,
+        "was_default": was_default,
+        "default": default_now,
+        "file": {
+            "path": state.cfg().systems_file.display().to_string(),
+            "entry_removed": file_outcome.0,
+            "file_removed": file_outcome.1,
+        },
+        "note": if from_env {
+            "该系统来自 .env 合成（无 sap_systems.toml）——运行态已卸载，重启网关后会重新出现"
+        } else if file_outcome.1 {
+            "配置文件已删空并移除——重启网关后回到未配置模式（.env 有连接变量则重新合成）"
+        } else {
+            "已热卸载，无需重启网关。注册表（registry.json）中该系统的条目保留——重新添加同名系统即可复用"
+        },
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SetDefaultRequest {
+    name: String,
+}
+
+/// `PUT /api/setup/default`：切换默认系统（无前缀路径的新目标），热生效。
+pub async fn set_default_handler(
+    axum::extract::State(state): axum::extract::State<SharedState>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<SetDefaultRequest>,
+) -> Result<Json<serde_json::Value>, RfcError> {
+    admin_write_gate(&state, &headers)?;
+    if state.resolve(&body.name).is_none() {
+        return Err(system_unknown(&state, &body.name));
+    }
+    state.set_default(&body.name).map_err(|e| RfcError {
+        code: -1,
+        status: 500,
+        message: format!("切换默认系统失败: {}", e),
+        key: "SETUP_INTERNAL".into(),
+    })?;
+    let file_updated = set_default_in_toml(state.cfg(), &body.name).map_err(|e| RfcError {
+        code: -1,
+        status: 500,
+        message: format!("更新默认标志失败: {}", e),
+        key: "SETUP_WRITE_FAILED".into(),
+    })?;
+    tracing::info!(system = %body.name, "setup：默认系统已切换");
+    Ok(Json(serde_json::json!({
+        "saved": true,
+        "default": body.name,
+        "file_updated": file_updated,
+        "note": "已热切换，无需重启网关。无前缀路径（/api/rfc 等）此后打到该系统",
+    })))
+}
+
+/// 404 SYSTEM_UNKNOWN（与 ScopeService 的未知系统错误同键同形）。
+fn system_unknown(state: &SharedState, name: &str) -> RfcError {
+    RfcError {
+        code: -1,
+        status: 404,
+        message: format!(
+            "系统 '{}' 不存在（可用: {}）",
+            name,
+            state.names().join(", ")
+        ),
+        key: "SYSTEM_UNKNOWN".into(),
+    }
+}
+
+/// 原始系统条目的响应 JSON（编辑预填）。**密码永不回显**：引用形态给
+/// `passwd.ref`，其余给 `passwd.set`。`default` 取运行态（隐式默认对 toml
+/// 不可见）。
+fn system_raw_json(
+    name: &str,
+    raw: &RawSystem,
+    state: &SharedState,
+    from_toml: bool,
+) -> serde_json::Value {
+    let runtime_default = state.default().map(|d| d.name == name).unwrap_or(false);
+    let passwd = match &raw.passwd {
+        Some(p) if p.contains("${") => serde_json::json!({"ref": p}),
+        Some(_) => serde_json::json!({"set": true}),
+        None => serde_json::json!({"set": false}),
+    };
+    serde_json::json!({
+        "name": name,
+        "default": runtime_default,
+        "ashost": raw.ashost,
+        "sysnr": raw.sysnr,
+        "client": raw.client,
+        "user": raw.user,
+        "passwd": passwd,
+        "lang": raw.lang,
+        "pool_size": raw.pool_size,
+        "idle_validate_secs": raw.idle_validate_secs,
+        "request_timeout_secs": raw.request_timeout_secs,
+        "adt_base_url": raw.adt_base_url,
+        "adt_user": raw.adt_user,
+        "adt_passwd": raw.adt_passwd,
+        "read_only": raw.read_only,
+        "conn": raw.conn,
+        "source": if from_toml { "toml" } else { "env_synthetic" },
+    })
 }
 
 // ========================================================================
@@ -479,6 +977,130 @@ fn write_system_to_toml(
     out.push_str(&body);
     crate::config::write_private_file(path, &out)?;
     Ok(persisted_env)
+}
+
+/// 读取一个系统的原始 toml 条目（编辑预填/半更新合并用；**不解析密码**）。
+/// toml 不存在时回退 `.env` 合成系统的等价 RawSystem（同名才命中）。
+fn read_system_raw(
+    cfg: &crate::config::AppConfig,
+    name: &str,
+) -> Result<Option<RawSystem>, String> {
+    let _guard = FILE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    if !cfg.systems_file.exists() {
+        return Ok(crate::systems::synth_env_spec(cfg)
+            .filter(|s| s.name == name)
+            .map(|s| spec_to_raw(&s)));
+    }
+    let content =
+        std::fs::read_to_string(&cfg.systems_file).map_err(|e| format!("读取失败: {}", e))?;
+    let file: crate::systems::SystemsFile =
+        toml::from_str(&content).map_err(|e| format!("解析失败（文件被改坏?）: {}", e))?;
+    Ok(file.systems.get(name).cloned())
+}
+
+/// resolved [`SystemSpec`] 反解为原始形态（`.env` 合成系统的读取/合并场景；
+/// conn 透传键的原始大小写在解析期已丢失——以大写键写回，语义等价）。
+fn spec_to_raw(spec: &SystemSpec) -> RawSystem {
+    let get = |k: &str| {
+        spec.conn_params
+            .iter()
+            .find(|(pk, _)| *pk == k)
+            .map(|(_, v)| v.clone())
+    };
+    let mut conn = BTreeMap::new();
+    for (k, v) in &spec.conn_params {
+        if !matches!(
+            *k,
+            "ASHOST" | "SYSNR" | "CLIENT" | "USER" | "PASSWD" | "LANG"
+        ) {
+            conn.insert(k.to_string(), v.clone());
+        }
+    }
+    RawSystem {
+        ashost: get("ASHOST"),
+        sysnr: get("SYSNR"),
+        client: get("CLIENT"),
+        user: get("USER"),
+        // 引用形态优先：`${VAR}` 不落明文的约定在反解路径同样成立
+        passwd: spec.passwd_ref.clone().or_else(|| get("PASSWD")),
+        lang: get("LANG"),
+        default: spec.is_default,
+        pool_size: spec.pool_size,
+        idle_validate_secs: spec.idle_validate.map(|d| d.as_secs()),
+        request_timeout_secs: spec.request_timeout.map(|d| d.as_secs()),
+        adt_base_url: spec.adt_base_url.clone(),
+        adt_user: spec.adt_user.clone(),
+        adt_passwd: spec.adt_passwd.clone(),
+        read_only: spec.read_only,
+        conn,
+    }
+}
+
+/// 从 `sap_systems.toml` 删除一个系统条目；删空则整个文件移除（重启后回到
+/// 未配置/`.env` 合成模式）。返回 (条目是否删除, 文件是否被整体移除)；
+/// 文件不存在或条目不在 → (false, false)。进程内互斥（同 [`FILE_LOCK`]）。
+fn remove_system_from_toml(
+    cfg: &crate::config::AppConfig,
+    name: &str,
+) -> Result<(bool, bool), String> {
+    let _guard = FILE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let path = &cfg.systems_file;
+    if !path.exists() {
+        return Ok((false, false));
+    }
+    let content = std::fs::read_to_string(path).map_err(|e| format!("读取失败: {}", e))?;
+    let mut root: toml::Value =
+        toml::from_str(&content).map_err(|e| format!("解析失败（文件被改坏?）: {}", e))?;
+    let Some(systems) = root.get_mut("systems").and_then(|v| v.as_table_mut()) else {
+        return Err("文件没有 [systems] 表".into());
+    };
+    if systems.remove(name).is_none() {
+        return Ok((false, false));
+    }
+    if systems.is_empty() {
+        std::fs::remove_file(path).map_err(|e| format!("移除空配置文件失败: {}", e))?;
+        return Ok((true, true));
+    }
+    let body = toml::to_string_pretty(&root).map_err(|e| format!("序列化失败: {}", e))?;
+    crate::config::write_private_file(path, &body)?;
+    Ok((true, false))
+}
+
+/// 重写 toml 的 `default` 标志：只保留 `name` 的 `default = true`，其余清除。
+/// 文件不存在（`.env` 合成运行态恒单系统默认）→ 返回 false 无操作。
+/// 返回文件是否被实际改写。
+fn set_default_in_toml(cfg: &crate::config::AppConfig, name: &str) -> Result<bool, String> {
+    let _guard = FILE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let path = &cfg.systems_file;
+    if !path.exists() {
+        return Ok(false);
+    }
+    let content = std::fs::read_to_string(path).map_err(|e| format!("读取失败: {}", e))?;
+    let mut root: toml::Value =
+        toml::from_str(&content).map_err(|e| format!("解析失败（文件被改坏?）: {}", e))?;
+    let Some(systems) = root.get_mut("systems").and_then(|v| v.as_table_mut()) else {
+        return Err("文件没有 [systems] 表".into());
+    };
+    let mut changed = false;
+    for (k, v) in systems.iter_mut() {
+        let Some(t) = v.as_table_mut() else {
+            continue;
+        };
+        let is_target = k == name;
+        let marked = t.get("default").and_then(|d| d.as_bool()).unwrap_or(false);
+        if is_target && !marked {
+            t.insert("default".into(), toml::Value::Boolean(true));
+            changed = true;
+        } else if !is_target && marked {
+            t.remove("default");
+            changed = true;
+        }
+    }
+    if changed {
+        let body = toml::to_string_pretty(&root).map_err(|e| format!("序列化失败: {}", e))?;
+        crate::config::write_private_file(path, &body)?;
+    }
+    Ok(changed)
 }
 
 /// 请求体的原始字段 → toml 表（保留 `${VAR}` 原样；只写显式提供的键）。
@@ -612,9 +1234,11 @@ mod tests {
             runtime_mode: false,
             update_check: false,
             systems_file: systems_file.into(),
+            gateway_file: std::env::temp_dir().join("sap-setup-test-gateway.toml"),
             setup_enabled: true,
             setup_force: false,
             open_browser: false,
+            lang: "EN".into(),
         }
     }
 
@@ -752,5 +1376,132 @@ mod tests {
         lb.sysnr = None;
         lb.conn.insert("MSHOST".into(), "msg.example.com".into());
         assert!(crate::systems::build_spec("lb", &lb).is_ok());
+    }
+
+    #[test]
+    fn toml_remove_keeps_file_until_empty_then_removes_it() {
+        let dir = std::env::temp_dir().join(format!("sap-setup-rm-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("systems.toml");
+        std::fs::write(
+            &path,
+            "[systems.a]\nashost=\"h\"\nsysnr=\"00\"\nuser=\"u\"\npasswd=\"p\"\n\
+             [systems.b]\nashost=\"h2\"\nsysnr=\"01\"\nuser=\"u\"\npasswd=\"p\"\n",
+        )
+        .unwrap();
+        let cfg = test_cfg(path.to_str().unwrap());
+
+        // 删一个：文件保留、其余条目原样
+        let out = remove_system_from_toml(&cfg, "a").unwrap();
+        assert_eq!(out, (true, false));
+        let content = std::fs::read_to_string(&path).unwrap();
+        let file: crate::systems::SystemsFile = toml::from_str(&content).unwrap();
+        assert!(file.systems.contains_key("b") && !file.systems.contains_key("a"));
+
+        // 删最后一个：整个文件移除（重启后回到未配置/.env 合成模式）
+        let out = remove_system_from_toml(&cfg, "b").unwrap();
+        assert_eq!(out, (true, true));
+        assert!(!path.exists(), "删空后配置文件应被移除");
+
+        // 文件不存在 / 条目不存在 → (false, false)
+        assert_eq!(remove_system_from_toml(&cfg, "b").unwrap(), (false, false));
+        std::fs::write(
+            &path,
+            "[systems.a]\nashost=\"h\"\nsysnr=\"00\"\nuser=\"u\"\npasswd=\"p\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            remove_system_from_toml(&cfg, "ghost").unwrap(),
+            (false, false)
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn toml_set_default_rewrites_flags_exactly_one() {
+        let dir = std::env::temp_dir().join(format!("sap-setup-def-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("systems.toml");
+        std::fs::write(
+            &path,
+            "[systems.a]\nashost=\"h\"\nsysnr=\"00\"\nuser=\"u\"\npasswd=\"p\"\n\
+             [systems.b]\nashost=\"h2\"\nsysnr=\"01\"\nuser=\"u\"\npasswd=\"p\"\ndefault=true\n",
+        )
+        .unwrap();
+        let cfg = test_cfg(path.to_str().unwrap());
+
+        // b(default) → a：标志互换
+        let changed = set_default_in_toml(&cfg, "a").unwrap();
+        assert!(changed);
+        let file: crate::systems::SystemsFile =
+            toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(file.systems["a"].default && !file.systems["b"].default);
+
+        // 已是默认：幂等，文件不动
+        assert!(!set_default_in_toml(&cfg, "a").unwrap());
+
+        // 隐式默认（无标志）的单系统：补标志
+        let path2 = dir.join("single.toml");
+        std::fs::write(
+            &path2,
+            "[systems.only]\nashost=\"h\"\nsysnr=\"00\"\nuser=\"u\"\npasswd=\"p\"\n",
+        )
+        .unwrap();
+        let cfg2 = test_cfg(path2.to_str().unwrap());
+        assert!(set_default_in_toml(&cfg2, "only").unwrap());
+        let file: crate::systems::SystemsFile =
+            toml::from_str(&std::fs::read_to_string(&path2).unwrap()).unwrap();
+        assert!(file.systems["only"].default);
+
+        // 文件不存在 → 无操作
+        let cfg3 = test_cfg(dir.join("nope.toml").to_str().unwrap());
+        assert!(!set_default_in_toml(&cfg3, "x").unwrap());
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&path2);
+    }
+
+    #[test]
+    fn addr_host_loopback_parsing() {
+        assert!(super::addr_host_is_loopback("127.0.0.1:3000"));
+        assert!(super::addr_host_is_loopback("localhost:3000"));
+        assert!(super::addr_host_is_loopback("LOCALHOST:3000"));
+        assert!(super::addr_host_is_loopback("[::1]:3000"));
+        assert!(super::addr_host_is_loopback("127.8.8.8:9999"));
+        // 非回环
+        assert!(!super::addr_host_is_loopback("0.0.0.0:3000"));
+        assert!(!super::addr_host_is_loopback("10.0.0.5:3000"));
+        assert!(!super::addr_host_is_loopback("evil.example.com:3000"));
+        assert!(!super::addr_host_is_loopback("192.168.1.2:3000"));
+    }
+
+    #[test]
+    fn merge_update_keeps_unspecified_fields() {
+        let _g = lock_and_set_pw();
+        let existing = sample_raw(); // a4h 形态：ashost/sysnr/client/user/passwd(${VAR})
+        let body_json = serde_json::json!({"user": "newuser"});
+        let body: UpdateSystemRequest = serde_json::from_value(body_json).unwrap();
+        let merged = merge_update_raw(existing, &body);
+        assert_eq!(merged.user.as_deref(), Some("newuser"));
+        assert_eq!(
+            merged.ashost.as_deref(),
+            Some("vhcala4h"),
+            "未提供的字段保持原值"
+        );
+        assert_eq!(
+            merged.passwd.as_deref(),
+            Some(format!("${{{}}}", TEST_PW_VAR).as_str()),
+            "密码未提供即保持"
+        );
+
+        // conn 整体替换 + default 翻转
+        let body2: UpdateSystemRequest = serde_json::from_value(serde_json::json!({
+            "conn": {"MSHOST": "m"},
+            "default": true,
+        }))
+        .unwrap();
+        let merged2 = merge_update_raw(sample_raw(), &body2);
+        assert_eq!(merged2.conn.get("MSHOST").map(String::as_str), Some("m"));
+        assert!(merged2.default);
+        assert_eq!(merged2.ashost.as_deref(), Some("vhcala4h"));
     }
 }

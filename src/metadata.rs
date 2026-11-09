@@ -312,12 +312,20 @@ mod tests {
             .write()
             .unwrap()
             .insert("Z_B".into(), FuncMetadata::default());
-        cache.types.write().unwrap().insert("Z_T".into(), Vec::new());
+        cache
+            .types
+            .write()
+            .unwrap()
+            .insert("Z_T".into(), Vec::new());
 
         let cleared = cache.clear_all();
         let mut funcs = cleared.func_names.clone();
         funcs.sort();
-        assert_eq!(funcs, vec!["Z_A", "Z_B"], "函数名清单供 reload 点名移除 SDK 缓存");
+        assert_eq!(
+            funcs,
+            vec!["Z_A", "Z_B"],
+            "函数名清单供 reload 点名移除 SDK 缓存"
+        );
         assert_eq!(cleared.type_names, vec!["Z_T"]);
 
         // 清空后再 clear 为空（不重复上报）

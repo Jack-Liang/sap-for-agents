@@ -30,6 +30,8 @@ curl -H "Authorization: Bearer <SAP_API_KEY>" http://127.0.0.1:3000/api/function
 | Goal | Endpoint |
 |------|-----------|
 | Gateway not configured yet (first run) → **guided setup**: checklist of what to ask the user for, then write & hot-load a system | `GET /api/setup` (public) → `POST /api/setup/system` |
+| Runtime config management: **read / edit / remove one system, switch the default** (all hot, no restart, no file editing) | `GET`·`PUT`·`DELETE /api/setup/system/{name}`, `PUT /api/setup/default` |
+| Want to change **gateway settings** at runtime (timeout / rate limit / read-only / API key / lang…) without a restart | `GET`·`PUT /api/settings` |
 | New session → **list connected systems** (multi-system deployments; single-system ones list one entry — see "Multiple systems" below) | `GET /api/systems` (public) |
 | You (or a human in SE37) **changed an RFC's parameters** and the gateway still reports the old signature → reload that system's runtime state (no restart) | `POST /api/admin/reload` (or `POST /api/s/{system}/admin/reload`) |
 | You **changed `.env` or swapped the binary** and need the process to actually restart (drain, then exit; the supervisor brings it back) | `POST /api/admin/restart` (202; poll `/ready` until 503 → 200) |
@@ -93,10 +95,57 @@ curl http://127.0.0.1:3000/api/systems
 ```
 
 - Body fields mirror one `[systems.{name}]` table of `sap_systems.toml` (unknown keys → 422); load-balanced connections use `conn: {"MSHOST": "...", "R3NAME": "...", "GROUP": "..."}` instead of `ashost`/`sysnr`.
-- Human handoff: an unconfigured desktop run auto-opens `/setup` in the user's browser; the page offers a copy-paste message describing exactly this flow (address filled in). If the user pastes it to you, just execute the steps above.
+- Human handoff: an unconfigured desktop run auto-opens `/setup` in the user's browser; the page offers a copy-paste message describing exactly this flow (address filled in). If the user pastes it to you, just execute the steps above. The same page is the full **configuration console** once configured (add/edit/remove/switch systems in the browser).
 - The connection is **tested before anything is persisted** — wrong host/credentials return `502 SETUP_CONNECT_FAILED` (or `502 SETUP_CONNECT_TIMEOUT`) and nothing is written. `test:false` skips the check for offline pre-provisioning.
 - Success = persisted to `sap_systems.toml` **and hot-loaded**. The first system always becomes the default; add more systems later the same way (`default:true` switches the default). If the process had been running on env-var config, that system is persisted into the file too, so a restart changes nothing.
-- `409 SETUP_NAME_EXISTS` → pick another name; `409 SYSTEM_SYSID_CONFLICT` → two backends share a SYSID (see "Multiple systems"); `403 SETUP_DISABLED` → the deployer set `SAP_SETUP=off`; `403 SETUP_LOCKED` → the gateway is already configured and guided writes are locked (anti-abuse on unauthenticated deployments: no credential-relay / internal probing via fake systems) — edit the file manually, or set `SAP_SETUP=force` to keep guided writes open
+- `409 SETUP_NAME_EXISTS` → pick another name; `409 SYSTEM_SYSID_CONFLICT` → two backends share a SYSID (see "Multiple systems"); `403 SETUP_DISABLED` → the deployer set `SAP_SETUP=off`; `403 SETUP_LOCKED` → writes are blocked on **non-loopback, unauthenticated** deployments (anti-abuse: no credential-relay / internal probing / DNS-rebinding config writes) — the fix is a deploy-side switch: `SAP_API_KEY` for authenticated remote access or `SAP_SETUP=force` to override deliberately.
+
+### Runtime system management (v0.20: no restart, no file editing)
+
+All four management verbs share the same write gate (above) and the same test-before-persist discipline:
+
+```bash
+# Read one system's config (passwd NEVER echoed — ref form or "set" flag only)
+curl http://127.0.0.1:3000/api/setup/system/a4h
+# → {"name":"a4h","default":true,"ashost":"vhcala4h","sysnr":"00",...,"passwd":{"ref":"${SAP_A4H_PASSWD}"},"source":"toml"}
+
+# Edit (partial update: omitted fields keep their stored values — change just the password)
+curl -X PUT http://127.0.0.1:3000/api/setup/system/a4h -H "Content-Type: application/json" -d '{"passwd":"${SAP_A4H_PASSWD2}"}'
+# → validated → test connection (skip with "test":false) → toml entry replaced in place → hot-swapped (old pool drains via in-flight requests)
+
+# Remove (hot-unload; the default flag auto-promotes the first remaining system)
+curl -X DELETE http://127.0.0.1:3000/api/setup/system/a4h
+# Deleting the LAST system requires ?force=true (explicit consent back to unconfigured mode: 503 SYSTEM_NOT_CONFIGURED)
+
+# Switch the default system (unprefixed paths hit it afterwards) — hot
+curl -X PUT http://127.0.0.1:3000/api/setup/default -H "Content-Type: application/json" -d '{"name":"a4h"}'
+```
+
+- **Renaming a system is not supported** (the name is the URL segment, the toml key, and the audit/registry reference) — delete and re-add instead.
+- Every write also updates `sap_systems.toml` in place, so a restart changes nothing (single source of truth).
+
+### Runtime gateway settings (v0.20: hot, persisted to `sap_gateway.toml`)
+
+Three tiers, honestly labeled by `GET /api/settings` (each item carries a `source`: `default` / `env` / `file`):
+
+- **hot** — applied on the next request and persisted: `request_timeout_secs`, `rate_limit_rps` (0 = off), `read_only` (global; OR-ed with per-system flags), `api_key` (value never echoed; `""` disables auth), `drain_secs`, `update_check`, `lang`.
+- **apply_on_system_rebuild** — global defaults baked into system handles (`pool_size`, `pool_idle_validate_secs`, `adt_base_url`): change affects systems created/edited afterwards; change a *running* system via `PUT /api/setup/system/{name}`.
+- **apply_on_restart** — `listen_addr`, `mode`, `systems_file`, `registry_file`: edit `.env` and restart (the `/setup` console has a restart button).
+
+```bash
+curl http://127.0.0.1:3000/api/settings
+# → {"hot":{"request_timeout_secs":{"value":60,"source":"default"},...},
+#    "apply_on_system_rebuild":{...},"apply_on_restart":{...},"file":"sap_gateway.toml"}
+
+curl -X PUT http://127.0.0.1:3000/api/settings -H "Content-Type: application/json" \
+  -d '{"request_timeout_secs":120,"rate_limit_rps":10,"read_only":true}'
+# → {"saved":true,"applied":["request_timeout_secs","rate_limit_rps","read_only"],...}
+#    effective immediately (next request uses the new values) and persisted.
+```
+
+- Writes share the same gate as system config (unauthenticated → loopback only).
+- Persistence is a separate file `sap_gateway.toml` (`SAP_GATEWAY_FILE`, 0600 — holds the API key in plaintext, same trust level as `.env`); precedence **file > env > default**; delete a key from the file to fall back to env.
+- Changing the API key takes effect immediately — the *next* request (including yours) needs the new Bearer token. Don't lock yourself out.
 
 ## Standard workflow
 
@@ -129,9 +178,10 @@ curl http://127.0.0.1:3000/api/s/prd/ready                # that system's readin
 - Unknown system name → `404 SYSTEM_UNKNOWN` (the error lists valid names). Compare objects across systems by calling the same read endpoint under two scopes (e.g. `/api/functions/ZFOO/source` on `a4h` vs `prd`) and diffing.
 - Flat delivery port `/api/invokes/{alias}` is **routed by the entry's recorded `system`** (aliases are global); an explicit scope that disagrees with the entry returns `409 SYSTEM_MISMATCH`. `GET /api/registry?system=prd` filters entries.
 - MCP tools accept an optional `system` argument (default = default system).
-- Systems can also be **added at runtime**: `POST /api/setup/system` validates → test-connects → appends to `sap_systems.toml` → hot-loads (see "First-run setup"). No restart needed; removal still means editing the file and restarting.
+- Systems can also be **managed at runtime**: `POST /api/setup/system` adds, `PUT/DELETE /api/setup/system/{name}` edits/removes, `PUT /api/setup/default` switches the default — all validate, persist to `sap_systems.toml` and hot-apply (see "First-run setup"). No restart needed for any of them.
 - An SAP-side **RFC interface change** (parameters added/removed/retyped in SE37) is cached in three places — the SAP-side function-group load **per connection**, the SDK's function/type descriptor cache **per SYSID, process-global** (sapnwrfc.h: "The RFC Runtime maintains a cache for every R/3 System ID" — swapping connections does NOT refresh it), and the gateway's metadata cache **per function name**. `POST /api/admin/reload` drops all three: it bumps the connection-pool generation (idle connections closed at once, borrowed ones dropped when returned), clears the function/DDIC metadata cache, and removes the matching SDK cache entries by name (`RfcRemoveFunctionDesc`). Optional body `{"func_names":["Z_FOO"]}` point-removes functions that were invoked but never introspected. This is the "restart" an agent or a frontend should call; it does **not** restart the process and does **not** re-read `.env` / `sap_systems.toml`. Scoped form `POST /api/s/{system}/admin/reload`. Response: `system`, `connections_closed`, `func_metadata_cleared`, `type_metadata_cleared`, `sdk_desc_removed`, `sdk_type_removed`.
 - When the change lives **outside** a system's runtime state (`.env` values, a new binary), you need `POST /api/admin/restart`. It returns **202 immediately** and restarts asynchronously: `/ready` starts answering **503 + `Retry-After`** for `SAP_DRAIN_SECS` seconds (default 5) while the listener keeps finishing in-flight requests, then the process exits `0`. **It only comes back if a supervisor restarts it** (`start.sh` guard loop, launchd `KeepAlive`, systemd `Restart=always`, docker `--restart`); started as a bare `exec`, it stays down. Correct client sequence: POST → get 202 → poll `/ready` → see 503 (do not retry work yet) → see 200 → resume. `SIGTERM`/`SIGINT` follow the same drain path, so a plain `kill` no longer produces `ECONNREFUSED` — callers get a retryable 503 instead.
+- `/api/admin/reload` and `/api/admin/restart` sit behind the **same gate as config writes** (v0.20): unauthenticated deployments can only call them from the loopback host (Host header must be loopback too — anti DNS-rebinding); remote callers set `SAP_API_KEY` and pass the Bearer token. The gateway's own `/setup` console ships a restart button.
 - Several entries pointing at the **same system with different clients** (same ashost/sysnr, different `client`) are fully supported: repository objects are cross-client in SAP, so signatures are identical and each entry still gets its own pool / ADT / registry namespace.
 - Hard limit: two **different backends** sharing one SYSID (e.g. cloned dev containers reached via different hosts) are quarantined with `503 SYSTEM_SYSID_CONFLICT` — the SDK's descriptor cache is partitioned by SYSID, so cross-backend SYSID twins would silently share wrong signatures.
 

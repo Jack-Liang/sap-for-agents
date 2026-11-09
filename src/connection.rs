@@ -31,15 +31,12 @@ pub fn drop_sdk_function_desc(sysid: &str, func_name: &str) -> bool {
     let mut error_info = unsafe { std::mem::zeroed::<RFC_ERROR_INFO>() };
     // 先判存在再移除：RfcRemoveFunctionDesc 对不存在的条目也返回 RFC_OK（实测），
     // 直接调用无法区分"真移除了"与"本来就没有"，计数会虚高。
-    let cached = unsafe {
-        RfcGetCachedFunctionDesc(sysid_uc.as_ptr(), name_uc.as_ptr(), &mut error_info)
-    };
+    let cached =
+        unsafe { RfcGetCachedFunctionDesc(sysid_uc.as_ptr(), name_uc.as_ptr(), &mut error_info) };
     if cached.is_null() {
         return false;
     }
-    let rc = unsafe {
-        RfcRemoveFunctionDesc(sysid_uc.as_ptr(), name_uc.as_ptr(), &mut error_info)
-    };
+    let rc = unsafe { RfcRemoveFunctionDesc(sysid_uc.as_ptr(), name_uc.as_ptr(), &mut error_info) };
     rc == RFC_OK
 }
 
@@ -50,7 +47,8 @@ pub fn drop_sdk_type_desc(sysid: &str, type_name: &str) -> bool {
     let name_uc = str_to_sap_uc(&type_name.to_uppercase());
     let mut error_info = unsafe { std::mem::zeroed::<RFC_ERROR_INFO>() };
     // 同 drop_sdk_function_desc：先判存在，Remove 对缺失条目也返回 RFC_OK
-    let cached = unsafe { RfcGetCachedTypeDesc(sysid_uc.as_ptr(), name_uc.as_ptr(), &mut error_info) };
+    let cached =
+        unsafe { RfcGetCachedTypeDesc(sysid_uc.as_ptr(), name_uc.as_ptr(), &mut error_info) };
     if cached.handle.is_null() {
         return false;
     }

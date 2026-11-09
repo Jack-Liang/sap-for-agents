@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-<title>Guided Setup · sap-for-agents</title>
+<title>Configuration Console · sap-for-agents</title>
 <script src="https://cdn.tailwindcss.com?plugins=forms,container-queries"></script>
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@500;700&family=Space+Grotesk:wght@600;700&family=Geist:wght@400&display=swap" rel="stylesheet"/>
 <script>
@@ -73,13 +73,21 @@ tailwind.config = {
         border-radius: 0.5rem;
         padding: 24px;
     }
+    .field-label { display:block; font-size:12px; color:#3d494c; margin-bottom:4px; font-family:'JetBrains Mono',monospace; }
+    .field-input { width:100%; font-size:13px; padding:7px 10px; border:1px solid rgba(188,201,205,.7); border-radius:6px; background:#fff; }
+    .field-input:focus { outline:2px solid rgba(6,182,212,.4); border-color:#06b6d4; }
+    .btn { padding:6px 12px; border-radius:6px; font-size:12px; font-weight:700; font-family:'JetBrains Mono',monospace; cursor:pointer; transition:opacity .15s, background .15s; }
+    .btn-primary { background:#00687a; color:#fff; } .btn-primary:hover { opacity:.9; }
+    .btn-ghost { border:1px solid rgba(188,201,205,.8); color:#00687a; background:#fff; } .btn-ghost:hover { background:#eceef0; }
+    .btn-danger { border:1px solid #f3b4b4; color:#ba1a1a; background:#fff; } .btn-danger:hover { background:#fdf0f0; }
+    .badge { font-size:11px; padding:1px 8px; border-radius:9999px; font-family:'JetBrains Mono',monospace; }
 </style>
 </head>
 <body class="font-body-md min-h-screen flex flex-col blueprint-bg mesh-gradient">
 
 <nav class="fixed top-0 w-full z-50 bg-surface/80 backdrop-blur-md border-b border-outline-variant/30">
     <div class="flex justify-between items-center px-6 h-16 max-w-3xl mx-auto">
-        <a href="/" class="font-bold text-[20px] font-bold text-primary tracking-tighter" style="font-family:'Space Grotesk',sans-serif">sap-for-agents</a>
+        <a href="/" class="font-bold text-[20px] text-primary tracking-tighter" style="font-family:'Space Grotesk',sans-serif">sap-for-agents</a>
         <div class="flex items-center gap-3">
             <div class="flex items-center gap-1 text-[12px]" style="font-family:'JetBrains Mono',monospace">
                 <a href="/setup?lang=en" class="text-primary font-bold">English</a>
@@ -97,27 +105,104 @@ tailwind.config = {
 <main class="flex-grow pt-28 pb-12 px-6 max-w-3xl mx-auto w-full">
 
     <section class="mb-8">
-        <h1 class="text-[34px] font-bold text-on-background mb-2 tracking-tighter" style="font-family:'Space Grotesk',sans-serif">Guided Setup</h1>
-        <p class="text-body-lg text-on-surface-variant">The gateway is running locally but no SAP system is configured yet. Hand the message below to your AI assistant — it will walk you through the rest (about five questions).</p>
+        <h1 class="text-[34px] font-bold text-on-background mb-2 tracking-tighter" style="font-family:'Space Grotesk',sans-serif">Configuration Console</h1>
+        <p class="text-body-lg text-on-surface-variant">Add, edit, remove, and switch SAP systems at runtime — changes apply instantly, no restart, no config-file editing. Pre-configured? Hand the message below to your AI assistant and it will do it for you.</p>
     </section>
 
-    <!-- Copyable handoff text -->
-    <section class="bento-card mb-6" id="handoff-card">
+    <!-- Writes-locked notice -->
+    <section class="bento-card mb-6 hidden" id="locked-note" style="border-color:#f3b4b4">
+        <div class="flex items-start gap-3">
+            <span class="w-3 h-3 rounded-full bg-red-500 mt-1"></span>
+            <div>
+                <h2 class="text-[16px] font-semibold text-on-background" style="font-family:'Space Grotesk',sans-serif">Configuration writes are locked</h2>
+                <p class="text-body-md text-on-surface-variant mt-1" id="locked-reason"></p>
+            </div>
+        </div>
+    </section>
+
+    <!-- Systems panel (configured) -->
+    <section class="bento-card mb-6 hidden" id="systems-panel">
+        <div class="flex items-center justify-between mb-4">
+            <div class="flex items-center gap-3">
+                <span class="w-3 h-3 rounded-full bg-green-500"></span>
+                <h2 class="text-[18px] font-semibold text-on-background" style="font-family:'Space Grotesk',sans-serif">Systems</h2>
+            </div>
+            <button class="btn btn-primary" id="add-toggle">+ Add system</button>
+        </div>
+        <div id="systems-grid" class="grid gap-3"></div>
+        <p class="text-[12px] text-on-surface-variant mt-3">Unprefixed API paths (<code class="bg-surface-container px-1 rounded" style="font-family:'JetBrains Mono',monospace">/api/rfc</code> …) hit the ★ default system; target a specific one with <code class="bg-surface-container px-1 rounded" style="font-family:'JetBrains Mono',monospace">/api/s/{name}/…</code>. Connection status refreshes every ~60&nbsp;s (probe loop).</p>
+    </section>
+
+    <!-- Add system form (hidden; toggled) -->
+    <section class="bento-card mb-6 hidden" id="add-card">
+        <h2 class="text-[18px] font-semibold text-on-background mb-3" style="font-family:'Space Grotesk',sans-serif">Add a system</h2>
+        <div class="grid grid-cols-2 gap-3">
+            <div><label class="field-label">name * <span class="text-on-surface-variant/60">lowercase URL id, e.g. a4h</span></label><input class="field-input" id="add-name"/></div>
+            <div><label class="field-label">client</label><input class="field-input" id="add-client" placeholder="001"/></div>
+            <div><label class="field-label">ashost * <span class="text-on-surface-variant/60">(or conn.MSHOST)</span></label><input class="field-input" id="add-ashost"/></div>
+            <div><label class="field-label">sysnr * <span class="text-on-surface-variant/60">(or conn.MSHOST)</span></label><input class="field-input" id="add-sysnr" placeholder="00"/></div>
+            <div><label class="field-label">user *</label><input class="field-input" id="add-user" autocomplete="off"/></div>
+            <div><label class="field-label">passwd * <span class="text-on-surface-variant/60">${ENV_VAR} supported</span></label><input class="field-input" id="add-passwd" type="password" autocomplete="new-password"/></div>
+            <div><label class="field-label">lang</label><input class="field-input" id="add-lang" placeholder="EN"/></div>
+            <div class="flex items-end pb-1"><label class="flex items-center gap-2 text-[13px] text-on-surface-variant"><input type="checkbox" id="add-default"/> make default</label></div>
+        </div>
+        <details class="mt-3">
+            <summary class="text-[13px] font-semibold text-primary cursor-pointer select-none" style="font-family:'JetBrains Mono',monospace">Advanced (pool / ADT / read-only / conn passthrough)</summary>
+            <div class="grid grid-cols-2 gap-3 mt-3">
+                <div><label class="field-label">pool_size</label><input class="field-input" id="add-pool_size" inputmode="numeric"/></div>
+                <div><label class="field-label">request_timeout_secs</label><input class="field-input" id="add-request_timeout_secs" inputmode="numeric"/></div>
+                <div><label class="field-label">adt_base_url <span class="text-on-surface-variant/60">"" = disable</span></label><input class="field-input" id="add-adt_base_url"/></div>
+                <div><label class="field-label">adt_user</label><input class="field-input" id="add-adt_user"/></div>
+                <div><label class="field-label">adt_passwd</label><input class="field-input" id="add-adt_passwd" type="password" autocomplete="new-password"/></div>
+                <div class="flex items-end pb-1"><label class="flex items-center gap-2 text-[13px] text-on-surface-variant"><input type="checkbox" id="add-read_only"/> read-only</label></div>
+                <div class="col-span-2"><label class="field-label">conn (JSON object, e.g. {"MSHOST":"msg.host","GROUP":"SPACE"})</label><input class="field-input" id="add-conn" placeholder='{"MSHOST":"…"}'/></div>
+                <div class="flex items-end pb-1"><label class="flex items-center gap-2 text-[13px] text-on-surface-variant"><input type="checkbox" id="add-skip-test"/> skip test connection (offline pre-provisioning)</label></div>
+            </div>
+        </details>
+        <div class="flex items-center gap-3 mt-4">
+            <button class="btn btn-primary" id="add-save">Test &amp; save</button>
+            <button class="btn btn-ghost" id="add-cancel">Cancel</button>
+            <span class="text-[13px]" id="add-msg"></span>
+        </div>
+        <p class="text-[12px] text-on-surface-variant mt-2">A real test connection is opened before anything is persisted — a failed connect never reaches the config file.</p>
+    </section>
+
+
+    <!-- Gateway settings -->
+    <section class="bento-card mb-6" id="settings-panel">
         <div class="flex items-center justify-between mb-3">
-            <h2 class="text-[18px] font-semibold text-on-background" style="font-family:'Space Grotesk',sans-serif">① Copy this and send it to your AI assistant</h2>
-            <button id="copy-btn" class="px-4 py-1.5 bg-primary text-on-primary rounded text-[13px] font-bold hover:opacity-90 transition-opacity" style="font-family:'JetBrains Mono',monospace">Copy</button>
+            <h2 class="text-[18px] font-semibold text-on-background" style="font-family:'Space Grotesk',sans-serif">Gateway settings</h2>
+            <div class="flex items-center gap-2">
+                <button class="btn btn-ghost" id="restart-btn">Restart gateway</button>
+                <button class="btn btn-primary" id="settings-save">Save changes</button>
+            </div>
+        </div>
+        <div class="grid grid-cols-2 gap-3" id="hot-settings-grid"></div>
+        <h3 class="text-[14px] font-semibold text-on-background mt-4 mb-2">Applies to systems created/edited afterwards <span class="text-[12px] font-normal text-on-surface-variant">(change a running system via its Edit form)</span></h3>
+        <div class="grid grid-cols-2 gap-3" id="rebuild-settings-grid"></div>
+        <h3 class="text-[14px] font-semibold text-on-background mt-4 mb-2">Requires a process restart <span class="text-[12px] font-normal text-on-surface-variant">(edit .env, then restart)</span></h3>
+        <div class="grid grid-cols-2 gap-3" id="restart-settings-grid"></div>
+        <p class="hidden text-[13px] text-red-700 mt-2" id="settings-lock"></p>
+        <div class="flex items-center gap-3 mt-4"><span class="text-[13px]" id="settings-msg"></span></div>
+    </section>
+
+    <!-- Copyable handoff text (pre-config) -->
+    <section class="bento-card mb-6 hidden" id="handoff-card">
+        <div class="flex items-center justify-between mb-3">
+            <h2 class="text-[18px] font-semibold text-on-background" style="font-family:'Space Grotesk',sans-serif">First time? Copy this and send it to your AI assistant</h2>
+            <button id="copy-btn" class="btn btn-primary">Copy</button>
         </div>
         <pre id="handoff-text" class="text-[13px] leading-[20px] bg-surface-container-low border border-outline-variant/40 rounded p-4 overflow-x-auto whitespace-pre-wrap" style="font-family:'JetBrains Mono',monospace"></pre>
         <p class="text-[12px] text-on-surface-variant mt-2">For AI assistants running on this machine (Claude Code / Cursor / Copilot CLI, …). The gateway address is filled in automatically.</p>
     </section>
 
-    <!-- What happens next -->
-    <section class="bento-card mb-6">
-        <h2 class="text-[18px] font-semibold text-on-background mb-3" style="font-family:'Space Grotesk',sans-serif">② What happens next</h2>
+    <!-- What happens next (pre-config) -->
+    <section class="bento-card mb-6 hidden" id="next-card">
+        <h2 class="text-[18px] font-semibold text-on-background mb-3" style="font-family:'Space Grotesk',sans-serif">What happens next</h2>
         <ol class="space-y-2 text-body-md text-on-surface-variant list-decimal list-inside">
             <li>Your assistant asks the gateway which fields are needed, then interviews you: SAP host, system number, client, user, password, and a short system name.</li>
             <li>It submits them to the gateway — <strong class="text-on-background">which opens a real test connection first</strong>. Nothing is saved if the connection fails, so you never end up with a broken config.</li>
-            <li>Once the test passes the system is live <strong class="text-on-background">without a restart</strong>, and this page turns green automatically.</li>
+            <li>Once the test passes the system is live <strong class="text-on-background">without a restart</strong>, and this page turns into the systems console above.</li>
         </ol>
         <p class="text-[12px] text-on-surface-variant mt-3">Tip: passwords accept a <code class="bg-surface-container px-1 rounded" style="font-family:'JetBrains Mono',monospace">${ENV_VAR}</code> indirection, keeping the secret in your environment and out of the chat log.</p>
     </section>
@@ -125,38 +210,54 @@ tailwind.config = {
     <!-- Manual alternative (collapsed) -->
     <section class="bento-card mb-6">
         <details>
-            <summary class="text-[15px] font-semibold text-on-background cursor-pointer select-none" style="font-family:'Space Grotesk',sans-serif">Prefer doing it by hand? (click to expand)</summary>
+            <summary class="text-[15px] font-semibold text-on-background cursor-pointer select-none" style="font-family:'Space Grotesk',sans-serif">Prefer the API or doing it by hand? (click to expand)</summary>
             <div class="mt-4 space-y-3 text-body-md text-on-surface-variant">
-                <p>Create <code class="bg-surface-container px-1 rounded" style="font-family:'JetBrains Mono',monospace">sap_systems.toml</code> next to the gateway binary (template: <code style="font-family:'JetBrains Mono',monospace">sap_systems.toml.example</code>):</p>
-                <pre class="text-[13px] leading-[20px] bg-surface-container-low border border-outline-variant/40 rounded p-4 overflow-x-auto" style="font-family:'JetBrains Mono',monospace">[systems.a4h]
-ashost  = "your-sap-host"
-sysnr   = "00"
-client  = "001"
-user    = "account"
-passwd  = "password"
-default = true</pre>
-                <p>Restart the gateway afterwards. Or do it in one curl (the gateway test-connects before persisting):</p>
-                <pre class="text-[13px] leading-[20px] bg-surface-container-low border border-outline-variant/40 rounded p-4 overflow-x-auto" style="font-family:'JetBrains Mono',monospace">curl -X POST http://127.0.0.1:3000/api/setup/system \
-  -H "Content-Type: application/json" \
-  -d '{"name":"a4h","ashost":"host","sysnr":"00","client":"001","user":"user","passwd":"password"}'</pre>
+                <p>Everything this page does is plain HTTP (writes are allowed from this machine by default):</p>
+                <pre class="text-[13px] leading-[20px] bg-surface-container-low border border-outline-variant/40 rounded p-4 overflow-x-auto" style="font-family:'JetBrains Mono',monospace">curl -X POST   http://127.0.0.1:3000/api/setup/system          -H "Content-Type: application/json" -d '{"name":"a4h",…}'
+curl           http://127.0.0.1:3000/api/setup/system/a4h      # read one (passwd masked)
+curl -X PUT    http://127.0.0.1:3000/api/setup/system/a4h      -H "Content-Type: application/json" -d '{"passwd":"new"}'   # partial update
+curl -X DELETE http://127.0.0.1:3000/api/setup/system/a4h      # remove (last one needs ?force=true)
+curl -X PUT    http://127.0.0.1:3000/api/setup/default         -H "Content-Type: application/json" -d '{"name":"a4h"}'     # switch default</pre>
+                <p>Or edit <code class="bg-surface-container px-1 rounded" style="font-family:'JetBrains Mono',monospace">sap_systems.toml</code> by hand and restart the gateway.</p>
             </div>
         </details>
     </section>
 
-    <!-- Done (initially hidden) -->
-    <section class="bento-card mb-6 hidden" id="done-card" style="border-color:#16a34a">
-        <div class="flex items-center gap-3 mb-3">
-            <span class="w-3 h-3 rounded-full bg-green-500"></span>
-            <h2 class="text-[18px] font-semibold text-on-background" style="font-family:'Space Grotesk',sans-serif">Setup complete — gateway is ready</h2>
-        </div>
-        <div id="done-systems" class="text-body-md text-on-surface-variant mb-4"></div>
-        <div class="flex gap-3">
-            <a href="/" class="px-4 py-2 bg-primary text-on-primary rounded text-[13px] font-bold hover:opacity-90 transition-opacity" style="font-family:'JetBrains Mono',monospace">Open home</a>
-            <a href="/docs" class="px-4 py-2 border border-primary text-primary rounded text-[13px] font-bold hover:bg-surface-container transition-colors" style="font-family:'JetBrains Mono',monospace">API docs</a>
-        </div>
-    </section>
-
 </main>
+
+<!-- Edit modal -->
+<div class="hidden fixed inset-0 z-[60] bg-black/40 flex items-start justify-center pt-24 px-6" id="edit-modal">
+    <div class="bento-card w-full max-w-xl" style="padding:28px">
+        <div class="flex items-center justify-between mb-4">
+            <h2 class="text-[18px] font-semibold text-on-background" style="font-family:'Space Grotesk',sans-serif">Edit system <span class="text-primary" id="edit-title"></span></h2>
+            <button class="btn btn-ghost" id="edit-close">✕</button>
+        </div>
+        <div class="grid grid-cols-2 gap-3">
+            <div><label class="field-label">ashost <span class="text-on-surface-variant/60">blank = keep</span></label><input class="field-input" id="edit-ashost"/></div>
+            <div><label class="field-label">sysnr <span class="text-on-surface-variant/60">blank = keep</span></label><input class="field-input" id="edit-sysnr"/></div>
+            <div><label class="field-label">client</label><input class="field-input" id="edit-client"/></div>
+            <div><label class="field-label">user</label><input class="field-input" id="edit-user" autocomplete="off"/></div>
+            <div><label class="field-label">passwd <span class="text-on-surface-variant/60">blank = keep current</span></label><input class="field-input" id="edit-passwd" type="password" autocomplete="new-password"/></div>
+            <div><label class="field-label">lang</label><input class="field-input" id="edit-lang"/></div>
+            <div><label class="field-label">pool_size</label><input class="field-input" id="edit-pool_size" inputmode="numeric"/></div>
+            <div><label class="field-label">request_timeout_secs</label><input class="field-input" id="edit-request_timeout_secs" inputmode="numeric"/></div>
+            <div><label class="field-label">adt_base_url <span class="text-on-surface-variant/60">"" = disable</span></label><input class="field-input" id="edit-adt_base_url"/></div>
+            <div><label class="field-label">adt_user</label><input class="field-input" id="edit-adt_user"/></div>
+            <div><label class="field-label">adt_passwd</label><input class="field-input" id="edit-adt_passwd" type="password" autocomplete="new-password"/></div>
+            <div class="flex items-end pb-1"><label class="flex items-center gap-2 text-[13px] text-on-surface-variant"><input type="checkbox" id="edit-read_only"/> read-only</label></div>
+            <div class="col-span-2"><label class="field-label">conn (JSON object, blank = keep)</label><input class="field-input" id="edit-conn"/></div>
+            <div class="flex items-end pb-1"><label class="flex items-center gap-2 text-[13px] text-on-surface-variant"><input type="checkbox" id="edit-default"/> make default</label></div>
+            <div class="flex items-end pb-1"><label class="flex items-center gap-2 text-[13px] text-on-surface-variant"><input type="checkbox" id="edit-skip-test"/> skip test connection</label></div>
+        </div>
+        <div class="flex items-center gap-3 mt-4">
+            <button class="btn btn-primary" id="edit-save">Test &amp; save</button>
+            <button class="btn btn-ghost" id="edit-cancel">Cancel</button>
+            <span class="text-[13px]" id="edit-msg"></span>
+        </div>
+        <p class="text-[12px] text-on-surface-variant mt-2">Partial update: fields left blank keep their stored value. Renaming a system is not supported — delete and re-add. The new pool is swapped in hot; in-flight requests finish on the old one.</p>
+        <p class="hidden text-[12px] text-amber-700 mt-1" id="edit-src-note"></p>
+    </div>
+</div>
 
 <footer class="pb-8 text-center text-[12px] text-on-surface-variant/70">
     <a href="/agents.md" class="hover:text-primary transition-colors">Agent docs</a> ·
@@ -178,16 +279,333 @@ FYI: your full working documentation is at {{ORIGIN}}/agents.md (read it if you 
 <script>
 (function () {
     var ORIGIN = window.location.origin;
+    var S = { setup: null, systems: null, editing: null, settings: null };
+
+    // ---------- helpers ----------
+    function $(id) { return document.getElementById(id); }
+    function val(id) { var v = $(id).value.trim(); return v === '' ? null : v; }
+    function setVal(id, v) { $(id).value = (v === null || v === undefined) ? '' : String(v); }
+    function numOrNull(id) { var v = val(id); return v === null ? null : Number(v); }
+    function bool(id) { return $(id).checked; }
+
+    function api(method, url, body, retried) {
+        var opt = { method: method, headers: {} };
+        var tok = localStorage.getItem('gw_token');
+        if (tok) opt.headers['Authorization'] = 'Bearer ' + tok;
+        if (body !== undefined) {
+            opt.headers['Content-Type'] = 'application/json';
+            opt.body = JSON.stringify(body);
+        }
+        return fetch(url, opt).then(function (r) {
+            if (r.status === 401 && !retried) {
+                var t = prompt('Gateway Bearer token (SAP_API_KEY):');
+                if (t) { localStorage.setItem('gw_token', t); return api(method, url, body, true); }
+            }
+            return r.text().then(function (t2) {
+                var j = null; try { j = t2 ? JSON.parse(t2) : null; } catch (e) {}
+                return { ok: r.ok, status: r.status, json: j };
+            });
+        });
+    }
+    // 网关错误键 → 英文文案（静态键纯英文；动态键保留 API 细节，信息不丢）。
+    // 后端错误消息本身是中文（仓库约定）——这里让英文界面上的常见错误读起来是英文。
+    var EN_ERR = {
+        SETUP_LOCKED: 'Configuration writes are locked on this unauthenticated deployment (loopback access only). Set SAP_API_KEY for remote access, or SAP_SETUP=force to override.',
+        SETUP_DISABLED: 'Guided setup is disabled (SAP_SETUP=off). Edit sap_systems.toml manually instead.',
+        SETUP_LAST_SYSTEM: 'This is the last system — deleting it returns the gateway to unconfigured mode. Pass ?force=true to confirm.',
+        SYSTEM_NOT_CONFIGURED: 'No SAP system is configured yet. See GET /api/setup for guided onboarding.',
+        AUTH_INVALID: 'Missing or invalid Bearer token (SAP_API_KEY).',
+        READ_ONLY: 'Read-only mode is on — write endpoints are disabled.',
+        RUNTIME_MODE: 'Runtime mode (SAP_MODE=runtime): only registry reads and /api/invokes are served.',
+        SETUP_CONNECT_TIMEOUT: 'Connection test timed out — nothing was saved. Check ashost/network/firewall and retry.',
+        SETUP_CONNECT_FAILED: 'Connection test failed — nothing was saved. Detail: ',
+        SETUP_NAME_EXISTS: 'A system with this name already exists. Detail: ',
+        SYSTEM_SYSID_CONFLICT: 'SYSID conflict with another backend (cloned system?) — not saved. Detail: ',
+        SETUP_STATE_INCONSISTENT: 'System exists at runtime but is missing from the config source. Detail: ',
+        SETUP_PARAM_INVALID: 'Invalid system definition (nothing was saved). Detail: ',
+        SETTING_PARAM_INVALID: 'Invalid settings (nothing was saved). Detail: ',
+        SETUP_READ_FAILED: 'Failed to read the stored config. Detail: ',
+        SETUP_WRITE_FAILED: 'Failed to persist the config change. Detail: ',
+        SETUP_RACE: 'Saved to disk but the runtime swap failed — check GET /api/systems. Detail: ',
+        SETUP_INTERNAL: 'Internal error. Detail: '
+    };
+    function errMsg(res, fallback) {
+        var e = res.json && res.json.error;
+        if (e && e.key && EN_ERR[e.key] !== undefined) {
+            var en = EN_ERR[e.key];
+            return en + (en.endsWith(': ') && e.message ? e.message : '');
+        }
+        return (e && e.message) || fallback || ('HTTP ' + res.status);
+    }
+
+    // ---------- status pill + section switching ----------
+    var dot = $('status-dot'), text = $('status-text');
+    var EN_REASON = {
+        setup_off: 'Guided setup is disabled (SAP_SETUP=off).',
+        no_loopback_unauth: 'The gateway listens on a non-loopback address without authentication — configuration writes are locked. Set SAP_API_KEY (Bearer) for remote access, or SAP_SETUP=force to override.'
+    };
+    function reasonText(st) {
+        if (!st) return '';
+        return (st.disabled_reason_key && EN_REASON[st.disabled_reason_key]) || st.disabled_reason || '';
+    }
+
+    function render() {
+        var st = S.setup, sys = S.systems;
+        var configured = st && st.configured;
+        var writable = st && st.writable;
+        if (!st) { text.textContent = 'Gateway unreachable'; return; }
+        if (!configured) {
+            dot.className = 'w-2 h-2 rounded-full bg-amber-400 animate-pulse';
+            text.textContent = writable ? 'Setup pending' : 'Setup pending (writes locked)';
+        } else {
+            var bad = (sys && sys.systems || []).some(function (s) { return s.quarantined; });
+            var down = (sys && sys.systems || []).some(function (s) { return !s.connected; });
+            dot.className = 'w-2 h-2 rounded-full ' + (bad ? 'bg-red-500' : down ? 'bg-amber-400' : 'bg-green-500');
+            text.textContent = configured ? ('Configured · ' + (sys ? sys.count : '?') + ' system' + (sys && sys.count === 1 ? '' : 's')) : '';
+        }
+        $('locked-note').classList.toggle('hidden', !!writable);
+        if (!writable) $('locked-reason').textContent = reasonText(st);
+        $('systems-panel').classList.toggle('hidden', !configured);
+        $('handoff-card').classList.toggle('hidden', !!configured);
+        $('next-card').classList.toggle('hidden', !!configured);
+        if (configured) renderSystems();
+    }
+    function refresh() {
+        return Promise.all([
+            fetch('/api/setup').then(function (r) { return r.json(); }).catch(function () { return null; }),
+            fetch('/api/systems').then(function (r) { return r.json(); }).catch(function () { return null; }),
+            fetch('/api/settings').then(function (r) { return r.json(); }).catch(function () { return null; })
+        ]).then(function (rs) { S.setup = rs[0]; S.systems = rs[1]; S.settings = rs[2]; render(); renderSettings(); });
+    }
+
+    // ---------- system cards ----------
+    // 后端探测消息是中文（仓库约定）——英文界面映射为英文
+    function probeErrText(msg) {
+        if (!msg) return '';
+        if (msg.indexOf('连接超时') === 0) return 'Connection timed out (5s probe)';
+        if (msg.indexOf('探测任务失败') === 0) return 'Probe task failed: ' + msg.slice(7);
+        return msg; // RFC 错误本身是英文
+    }
+
+    function statusBadge(s) {
+        if (s.quarantined) return '<span class="badge bg-red-100 text-red-700">quarantined · SYSID conflict</span>';
+        if (s.connected) return '<span class="badge bg-green-100 text-green-700">connected</span>' + (s.sysid ? ' <span class="badge bg-surface-container-high text-on-surface-variant">' + s.sysid + '</span>' : '');
+        if (s.connect_error) return '<span class="badge bg-amber-100 text-amber-700" title="' + String(s.connect_error).replace(/"/g, '&quot;') + '">unreachable</span>';
+        return '<span class="badge bg-surface-container-high text-on-surface-variant">not connected yet</span>';
+    }
+    function renderSystems() {
+        var grid = $('systems-grid');
+        var list = (S.systems && S.systems.systems) || [];
+        var writable = S.setup && S.setup.writable;
+        $('add-toggle').classList.toggle('hidden', !writable);
+        grid.innerHTML = '';
+        list.forEach(function (s) {
+            var card = document.createElement('div');
+            card.className = 'border border-outline-variant/40 rounded-lg p-4 bg-white/70';
+            card.setAttribute('data-system', s.name);
+            var actions = '';
+            if (writable) {
+                actions =
+                    (s.default ? '' : '<button class="btn btn-ghost" data-act="default">Set default</button>') +
+                    '<button class="btn btn-ghost" data-act="edit">Edit</button>';
+            }
+            card.innerHTML =
+                '<div class="flex items-center justify-between mb-2">' +
+                    '<div class="flex items-center gap-2">' +
+                        '<span class="font-bold text-[16px] text-on-background" style="font-family:\'Space Grotesk\',sans-serif">' + (s.default ? '★ ' : '') + s.name + '</span>' +
+                        statusBadge(s) +
+                        (s.read_only ? ' <span class="badge bg-surface-container-high text-on-surface-variant">read-only</span>' : '') +
+                        (s.adt ? ' <span class="badge bg-surface-container-high text-on-surface-variant">adt</span>' : '') +
+                    '</div>' +
+                    '<div class="flex items-center gap-2">' +
+                        '<button class="btn btn-ghost" data-act="test">Test</button><button class="btn btn-ghost" data-act="reload">Reload</button>' + actions +
+                        (writable ? '<button class="btn btn-danger" data-act="delete">Delete</button>' : '') +
+                    '</div>' +
+                '</div>' +
+                '<div class="text-[12px] text-on-surface-variant" data-role="meta">' + (s.connect_error ? probeErrText(String(s.connect_error)) : '') + '</div>' +
+                '<div class="text-[12px] mt-1" data-role="test"></div>';
+            card.querySelectorAll('button[data-act]').forEach(function (b) {
+                b.addEventListener('click', function () { act(b.getAttribute('data-act'), s.name); });
+            });
+            // writable → 补一行连接参数（GET 单系统，密码掩码不回显）
+            if (writable) {
+                api('GET', '/api/setup/system/' + encodeURIComponent(s.name)).then(function (res) {
+                    if (!res.ok || !res.json) return;
+                    var j = res.json;
+                    var bits = [];
+                    if (j.ashost) bits.push(j.ashost + (j.sysnr ? ':' + j.sysnr : ''));
+                    if (j.client) bits.push('client ' + j.client);
+                    if (j.user) bits.push('user ' + j.user);
+                    if (j.passwd && j.passwd.ref) bits.push('passwd ' + j.passwd.ref);
+                    if (j.source === 'env_synthetic') bits.push('from .env (persists on first write)');
+                    var meta = card.querySelector('[data-role="meta"]');
+                    var extra = bits.join(' · ');
+                    meta.textContent = meta.textContent ? extra + ' · ' + meta.textContent : extra;
+                });
+            }
+            grid.appendChild(card);
+        });
+    }
+
+    function act(name, system) {
+        if (name === 'test') return testSystem(system);
+        if (name === 'reload') {
+            var r0 = findCardSlot(system);
+            if (r0) r0.innerHTML = '<span class="text-on-surface-variant">Reloading…</span>';
+            return api('POST', '/api/s/' + encodeURIComponent(system) + '/admin/reload').then(function (res) {
+                var slot = findCardSlot(system);
+                if (slot) slot.innerHTML = res.ok
+                    ? '<span class="badge bg-green-100 text-green-700">Reloaded (pools rotated, caches cleared)</span>'
+                    : '<span class="badge bg-red-100 text-red-700">Reload failed: ' + String(errMsg(res, 'HTTP ' + res.status)).slice(0, 140) + '</span>';
+            });
+        }
+        if (name === 'edit') return openEdit(system);
+        if (name === 'default') {
+            return api('PUT', '/api/setup/default', { name: system }).then(function (res) {
+                if (!res.ok) alert(errMsg(res, 'Switch failed'));
+                refresh();
+            });
+        }
+        if (name === 'delete') {
+            var last = S.systems && S.systems.count === 1;
+            var msg = last
+                ? '"' + system + '" is the ONLY system. Deleting it returns the gateway to unconfigured mode (all business endpoints answer 503). Continue?'
+                : 'Delete system "' + system + '"? Its config entry is removed from sap_systems.toml and the runtime is unloaded immediately (no restart).';
+            if (!confirm(msg)) return;
+            var url = '/api/setup/system/' + encodeURIComponent(system) + (last ? '?force=true' : '');
+            return api('DELETE', url).then(function (res) {
+                if (!res.ok) alert(errMsg(res, 'Delete failed'));
+                refresh();
+            });
+        }
+    }
+
+    // 按卡片 data-system 精确找状态槽——不用文本匹配（系统名互为子串时会点错卡）
+    function findCardSlot(name) {
+        var cards = $('systems-grid').children;
+        for (var i = 0; i < cards.length; i++) {
+            if (cards[i].getAttribute('data-system') === name) {
+                return cards[i].querySelector('[data-role="test"]');
+            }
+        }
+        return null;
+    }
+
+    function testSystem(name) {
+        var slotEl = findCardSlot(name);
+        if (!slotEl) return;
+        slotEl.innerHTML = '<span class="text-on-surface-variant">Testing…</span>';
+        fetch('/api/s/' + encodeURIComponent(name) + '/ready').then(function (r) {
+            return r.text().then(function (t) {
+                var j = null; try { j = JSON.parse(t); } catch (e) {}
+                return { ok: r.ok, status: r.status, json: j };
+            });
+        }).then(function (res) {
+            slotEl.innerHTML = res.ok
+                ? '<span class="badge bg-green-100 text-green-700">SAP reachable (RFC_PING ok)</span>'
+                : '<span class="badge bg-red-100 text-red-700">unreachable: ' + String(errMsg(res, 'HTTP ' + res.status)).slice(0, 160) + '</span>';
+        });
+    }
+
+    // ---------- add form ----------
+    $('add-toggle').addEventListener('click', function () {
+        $('add-card').classList.toggle('hidden');
+        $('add-msg').textContent = '';
+    });
+    $('add-cancel').addEventListener('click', function () { $('add-card').classList.add('hidden'); });
+    $('add-save').addEventListener('click', function () {
+        var body = {};
+        var need = { name: 'add-name', ashost: 'add-ashost', sysnr: 'add-sysnr', user: 'add-user', passwd: 'add-passwd' };
+        for (var k in need) { var v = val(need[k]); if (v) body[k] = v; }
+        ['client', 'lang', 'pool_size', 'request_timeout_secs', 'adt_base_url', 'adt_user', 'adt_passwd'].forEach(function (k) {
+            var v = val('add-' + k);
+            if (v === null) return;
+            body[k] = (k === 'pool_size' || k === 'request_timeout_secs') ? Number(v) : v;
+        });
+        if (bool('add-default')) body.default = true;
+        if (bool('add-read_only')) body.read_only = true;
+        if (bool('add-skip-test')) body.test = false;
+        var cj = val('add-conn');
+        if (cj) { try { body.conn = JSON.parse(cj); } catch (e) { $('add-msg').textContent = 'conn must be a JSON object'; return; } }
+        if (!body.name || (!body.ashost && !body.conn)) { $('add-msg').textContent = 'name and (ashost+sysnr or conn) are required'; return; }
+        $('add-msg').textContent = 'Testing connection…';
+        api('POST', '/api/setup/system', body).then(function (res) {
+            if (res.ok) {
+                $('add-msg').textContent = '';
+                $('add-card').classList.add('hidden');
+                ['add-name','add-ashost','add-sysnr','add-client','add-user','add-passwd','add-lang'].forEach(function (id) { $(id).value = ''; });
+                refresh();
+            } else {
+                $('add-msg').textContent = errMsg(res, 'Failed');
+            }
+        });
+    });
+
+    // ---------- edit modal ----------
+    function openEdit(name) {
+        S.editing = name;
+        $('edit-title').textContent = name;
+        ['edit-ashost','edit-sysnr','edit-client','edit-user','edit-passwd','edit-lang',
+         'edit-pool_size','edit-request_timeout_secs','edit-adt_base_url','edit-adt_user',
+         'edit-adt_passwd','edit-conn'].forEach(function (id) { $(id).value = ''; });
+        $('edit-default').checked = false; $('edit-read_only').checked = false; $('edit-skip-test').checked = false;
+        $('edit-msg').textContent = '';
+        $('edit-modal').classList.remove('hidden');
+        api('GET', '/api/setup/system/' + encodeURIComponent(name)).then(function (res) {
+            if (!res.ok) { $('edit-msg').textContent = errMsg(res, 'Read failed'); return; }
+            var j = res.json;
+            S.editing_default = !!j.default;
+            setVal('edit-ashost', j.ashost); setVal('edit-sysnr', j.sysnr); setVal('edit-client', j.client);
+            setVal('edit-user', j.user); setVal('edit-lang', j.lang);
+            setVal('edit-pool_size', j.pool_size); setVal('edit-request_timeout_secs', j.request_timeout_secs);
+            setVal('edit-adt_base_url', j.adt_base_url); setVal('edit-adt_user', j.adt_user);
+            setVal('edit-adt_passwd', j.adt_passwd);
+            setVal('edit-conn', j.conn && Object.keys(j.conn).length ? JSON.stringify(j.conn) : '');
+            $('edit-default').checked = S.editing_default;
+            $('edit-read_only').checked = j.read_only === true;
+            var note = $('edit-src-note');
+            if (j.source === 'env_synthetic') {
+                note.textContent = '⚠ This system comes from .env synthesis — saving persists the whole system set (including it) into sap_systems.toml (otherwise it vanishes on restart)';
+                note.classList.remove('hidden');
+            } else {
+                note.classList.add('hidden');
+            }
+            if (j.passwd && j.passwd.ref) $('edit-passwd').placeholder = j.passwd.ref + ' (blank = keep)';
+            else if (j.passwd && j.passwd.set) $('edit-passwd').placeholder = 'blank = keep current password';
+        });
+    }
+    function closeEdit() { $('edit-modal').classList.add('hidden'); S.editing = null; }
+    $('edit-close').addEventListener('click', closeEdit);
+    $('edit-cancel').addEventListener('click', closeEdit);
+    $('edit-save').addEventListener('click', function () {
+        if (!S.editing) return;
+        var body = {};
+        ['ashost','sysnr','client','user','passwd','lang','adt_base_url','adt_user','adt_passwd'].forEach(function (k) {
+            var v = val('edit-' + k); if (v !== null) body[k] = v;
+        });
+        ['pool_size','request_timeout_secs'].forEach(function (k) {
+            var v = numOrNull('edit-' + k); if (v !== null) body[k] = v;
+        });
+        var cj = val('edit-conn');
+        if (cj) { try { body.conn = JSON.parse(cj); } catch (e) { $('edit-msg').textContent = 'conn must be a JSON object'; return; } }
+        if ($('edit-default').checked !== !!S.editing_default) body.default = $('edit-default').checked;
+        if (bool('edit-read_only')) body.read_only = true;
+        if (bool('edit-skip-test')) body.test = false;
+        $('edit-msg').textContent = 'Testing connection…';
+        api('PUT', '/api/setup/system/' + encodeURIComponent(S.editing), body).then(function (res) {
+            if (res.ok) { closeEdit(); refresh(); }
+            else $('edit-msg').textContent = errMsg(res, 'Failed');
+        });
+    });
+    $('edit-modal').addEventListener('click', function (e) { if (e.target === $('edit-modal')) closeEdit(); });
+
+    // ---------- handoff copy ----------
     var tpl = document.getElementById('handoff-tpl').textContent;
     var handoff = tpl.replace(/\{\{ORIGIN\}\}/g, ORIGIN);
     document.getElementById('handoff-text').textContent = handoff;
-
     var btn = document.getElementById('copy-btn');
     btn.addEventListener('click', function () {
-        function ok() {
-            btn.textContent = '✓ Copied';
-            setTimeout(function () { btn.textContent = 'Copy'; }, 2000);
-        }
+        function ok() { btn.textContent = '✓ Copied'; setTimeout(function () { btn.textContent = 'Copy'; }, 2000); }
         if (navigator.clipboard && navigator.clipboard.writeText) {
             navigator.clipboard.writeText(handoff).then(ok, fallback);
         } else { fallback(); }
@@ -201,31 +619,134 @@ FYI: your full working documentation is at {{ORIGIN}}/agents.md (read it if you 
         }
     });
 
-    var dot = document.getElementById('status-dot');
-    var text = document.getElementById('status-text');
-    var timer = null;
-    function refresh() {
-        fetch('/api/setup').then(function (r) { return r.json(); }).then(function (v) {
-            if (v.configured) {
-                dot.className = 'w-2 h-2 rounded-full bg-green-500';
-                text.textContent = 'Configured';
-                document.getElementById('handoff-card').classList.add('hidden');
-                var names = (v.systems || []).join(', ');
-                document.getElementById('done-systems').textContent =
-                    'Connected systems: ' + names + '. Unprefixed paths hit the default; target a specific one with /api/s/{name}/...';
-                document.getElementById('done-card').classList.remove('hidden');
-                if (timer) { clearInterval(timer); timer = null; }
+
+    // ---------- 网关设置（v0.20 第二期） ----------
+    var HOT_FIELDS = [
+        {k:'request_timeout_secs', label:'Request timeout (s)', type:'number'},
+        {k:'rate_limit_rps', label:'Rate limit rps (0 = off)', type:'number'},
+        {k:'read_only', label:'Read-only mode (global)', type:'checkbox'},
+        {k:'api_key', label:'API key (Bearer auth)', type:'password', special:true},
+        {k:'drain_secs', label:'Drain window (s)', type:'number'},
+        {k:'update_check', label:'Update check (every 24h)', type:'checkbox'},
+        {k:'lang', label:'Default language (e.g. EN/ZH)', type:'text'}
+    ];
+
+    function srcBadge(source) {
+        var c = source === 'file' ? 'bg-green-100 text-green-700'
+              : 'bg-surface-container-high text-on-surface-variant';
+        var t = source === 'file' ? 'customized' : source === 'env' ? 'env' : 'default';
+        return ' <span class="badge ' + c + '">' + t + '</span>';
+    }
+
+    function renderSettings() {
+        var st = S.settings;
+        if (!st) return;
+        var grid = $('hot-settings-grid');
+        grid.innerHTML = '';
+        HOT_FIELDS.forEach(function (f) {
+            var v = st.hot[f.k];
+            var cell = document.createElement('div');
+            if (f.type === 'checkbox') {
+                cell.innerHTML = '<label class="flex items-center gap-2 text-[13px] text-on-surface-variant mt-5"><input type="checkbox" id="set-' + f.k + '"' + (v.value ? ' checked' : '') + '/>' + f.label + srcBadge(v.source) + '</label>';
+            } else if (f.special) {
+                cell.innerHTML = '<label class="field-label">' + f.label + srcBadge(v.source) + ' <span class="text-on-surface-variant/60">' + (v.value ? 'set (value hidden)' : 'not set') + '</span></label>' +
+                    '<div class="flex items-center gap-2">' +
+                    '<input class="field-input" id="set-' + f.k + '" type="password" autocomplete="new-password" placeholder="blank = keep; type a new token to change"/>' +
+                    '<label class="flex items-center gap-1 text-[12px] text-on-surface-variant whitespace-nowrap"><input type="checkbox" id="set-api_key-off"/> disable auth</label></div>';
             } else {
-                dot.className = 'w-2 h-2 rounded-full bg-amber-400 animate-pulse';
-                text.textContent = v.writable ? 'Setup pending' : 'Setup pending (writes disabled)';
-                timer = timer || setInterval(refresh, 3000);
+                cell.innerHTML = '<label class="field-label">' + f.label + srcBadge(v.source) + '</label>' +
+                    '<input class="field-input" id="set-' + f.k + '" type="' + (f.type === 'number' ? 'number' : 'text') + '" value="' + String(v.value).replace(/"/g, '&quot;') + '"/>';
             }
-        }).catch(function () {
-            text.textContent = 'Gateway unreachable';
-            timer = timer || setInterval(refresh, 3000);
+            grid.appendChild(cell);
+            wireDirty(f, cell.querySelector('input'));
+        });
+        var rb = $('rebuild-settings-grid');
+        rb.innerHTML = Object.keys(st.apply_on_system_rebuild).map(function (k) {
+            return '<div><label class="field-label">' + k + '</label><div class="text-[13px] text-on-surface">' + String(st.apply_on_system_rebuild[k].value) + srcBadge(st.apply_on_system_rebuild[k].source) + '</div></div>';
+        }).join('');
+        var rr = $('restart-settings-grid');
+        rr.innerHTML = Object.keys(st.apply_on_restart).map(function (k) {
+            return '<div><label class="field-label">' + k + '</label><div class="text-[13px] text-on-surface">' + String(st.apply_on_restart[k].value) + srcBadge(st.apply_on_restart[k].source) + '</div></div>';
+        }).join('');
+        // 锁定态：输入禁用 + 保存/重启隐藏 + 行内原因（与顶部锁定卡同源）
+        var writable = S.setup && S.setup.writable;
+        grid.querySelectorAll('input').forEach(function (el) { el.disabled = !writable; });
+        $('settings-save').classList.toggle('hidden', !writable);
+        $('restart-btn').classList.toggle('hidden', !writable);
+        var lock = $('settings-lock');
+        lock.classList.toggle('hidden', !!writable);
+        if (!writable) lock.textContent = reasonText(S.setup);
+    }
+
+    // 未保存高亮：输入与已加载值不一致时描琥珀圈（保存/刷新后自动消除）
+    function wireDirty(f, el) {
+        if (!el) return;
+        var ev = f.type === 'checkbox' ? 'change' : 'input';
+        el.addEventListener(ev, function () {
+            var cur = S.settings.hot[f.k];
+            var dirty;
+            if (f.type === 'checkbox') dirty = el.checked !== cur.value;
+            else if (f.special) dirty = el.value.trim() !== '' || $('set-api_key-off').checked;
+            else dirty = el.value.trim() !== '' && el.value.trim() !== String(cur.value);
+            el.classList.toggle('ring-2', dirty);
+            el.classList.toggle('ring-amber-300', dirty);
         });
     }
+
+    function saveSettings() {
+        if (!S.settings) return;
+        var body = {};
+        HOT_FIELDS.forEach(function (f) {
+            var el = $('set-' + f.k);
+            var cur = S.settings.hot[f.k];
+            if (f.type === 'checkbox') {
+                if (el.checked !== cur.value) body[f.k] = el.checked;
+            } else if (f.special) {
+                if ($('set-api_key-off').checked) body[f.k] = '';
+                else { var t = el.value.trim(); if (t) body[f.k] = t; }
+            } else {
+                var v = el.value.trim();
+                if (v === '') return; // blank = keep
+                if (f.type === 'number') v = Number(v);
+                if (v !== cur.value) body[f.k] = v;
+            }
+        });
+        if (!Object.keys(body).length) { $('settings-msg').textContent = 'No changes'; return; }
+        $('settings-msg').textContent = 'Saving…';
+        api('PUT', '/api/settings', body).then(function (res) {
+            if (res.ok) {
+                $('settings-msg').textContent = '✓ Applied and persisted';
+                setTimeout(function () { $('settings-msg').textContent = ''; }, 3000);
+                refresh();
+            } else {
+                $('settings-msg').textContent = errMsg(res, 'Save failed');
+            }
+        });
+    }
+
+    function restartGateway() {
+        var d = (S.settings && S.settings.hot && S.settings.hot.drain_secs) ? S.settings.hot.drain_secs.value : 5;
+        if (!confirm('Restart the gateway? Drains for ~' + d + 's, then the process exits — it only comes back if a supervisor (start.sh / launchd / systemd / docker --restart) restarts it.')) return;
+        $('settings-msg').textContent = 'Restarting…';
+        api('POST', '/api/admin/restart').then(function (res) {
+            if (res.status !== 202) { $('settings-msg').textContent = errMsg(res, 'Restart request failed'); return; }
+            var tries = 0;
+            var iv = setInterval(function () {
+                tries++;
+                fetch('/health').then(function (r) {
+                    if (r.ok) { clearInterval(iv); $('settings-msg').textContent = '✓ Gateway restarted'; refresh(); }
+                }).catch(function () {});
+                if (tries > 30) { clearInterval(iv); $('settings-msg').textContent = 'Timed out — if no supervisor is present, start the gateway manually'; }
+            }, 1000);
+        });
+    }
+
+    $('settings-save').addEventListener('click', saveSettings);
+    $('restart-btn').addEventListener('click', restartGateway);
+
+    // ---------- boot + polling ----------
     refresh();
+    setInterval(refresh, 10000);
 })();
 </script>
 </body>

@@ -42,10 +42,9 @@ const SAP_INFO_TIMEOUT: Duration = Duration::from_secs(10);
 /// 附 `<name>_error` 字段）。端点整体仍 200——SAP 宕机时恰恰最需要这份自描述。
 pub async fn gateway_info(state: &SharedState) -> Value {
     let mut out = local_info();
-    // capabilities.setup 最终值按真实系统集合覆写：已配置部署默认锁定
-    // 引导写入（防凭据中继/内网探测），SAP_SETUP=force 豁免
-    out["capabilities"]["setup"] =
-        json!(crate::setup::writable_for_configured(!state.names().is_empty()));
+    // capabilities.setup 最终值按部署形态判定（v0.20 方案 A）：SAP_SETUP=off
+    // 关闭；force / 已启用鉴权 / 回环监听 → 运行期可写，否则锁定
+    out["capabilities"]["setup"] = json!(crate::setup::writable_status(&state.cfg().listen_addr).0);
     // latest 与 SAP 块独立：任一不可用不影响另一个
     out["latest"] = latest_json().await;
 
@@ -268,6 +267,11 @@ const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(24 * 3600);
 /// 更新检查绝不能拖慢请求或刷屏；离线/隔离环境是常态而非异常。
 pub async fn update_checker_loop() {
     loop {
+        // 每轮读热设置：运行期关掉（PUT /api/settings）后本循环空转，不再发请求
+        if !crate::settings::current().update_check {
+            tokio::time::sleep(UPDATE_CHECK_INTERVAL).await;
+            continue;
+        }
         match fetch_latest_release().await {
             Ok(rel) => {
                 if is_newer(&rel.version, env!("CARGO_PKG_VERSION")) {

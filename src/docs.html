@@ -6,7 +6,12 @@
 <title>sap-for-agents — API Reference</title>
 <meta name="description" content="Interactive API reference (OpenAPI 3.0.3) for the sap-for-agents SAP NWRFC→REST gateway">
 <style>
-  body { margin: 0; font-family: -apple-system, system-ui, sans-serif; }
+  body { margin: 0; font-family: -apple-system, system-ui, sans-serif; background: #ffffff; }
+  .topbar { display: flex; gap: 16px; align-items: center; padding: 10px 24px;
+            border-bottom: 1px solid #eaecef; font-size: 14px; }
+  .topbar a { color: #00687a; text-decoration: none; font-weight: 600; }
+  .topbar a:hover { text-decoration: underline; }
+  .topbar .brand { font-weight: 700; color: #1f2328; }
   #fallback { display: none; padding: 48px 24px; max-width: 720px; margin: 0 auto;
               color: #1f2328; line-height: 1.6; }
   #fallback code { background: #f6f8fa; padding: 2px 6px; border-radius: 4px; }
@@ -26,6 +31,13 @@ window.addEventListener('load', function () {
 <script src="https://cdn.redoc.ly/redoc/latest/bundles/redoc.standalone.js"></script>
 </head>
 <body>
+<nav class="topbar">
+  <span class="brand">sap-for-agents</span>
+  <a href="/">Gateway</a>
+  <a href="/setup">Configuration console</a>
+  <a href="/openapi.json">openapi.json</a>
+  <a href="/agents.md">Agent docs</a>
+</nav>
 <redoc spec-url="/openapi.json"></redoc>
 <noscript>
   <div id="fallback">

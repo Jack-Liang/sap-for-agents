@@ -1,9 +1,9 @@
 <!doctype html>
-<html lang="zh" class="light">
+<html lang="zh-CN" class="light">
 <head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-<title>首次配置引导 · sap-for-agents</title>
+<title>配置台 · sap-for-agents</title>
 <script src="https://cdn.tailwindcss.com?plugins=forms,container-queries"></script>
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@500;700&family=Space+Grotesk:wght@600;700&family=Geist:wght@400&display=swap" rel="stylesheet"/>
 <script>
@@ -53,7 +53,7 @@ tailwind.config = {
 };
 </script>
 <style>
-    /* 与 index.zh.html 同一套视觉基调：蓝图网格 + 网格辉光 + 玻璃卡片 */
+    /* 与 index.html 同一视觉语言：蓝图网格 + 渐变光晕 + 毛玻璃卡片 */
     .blueprint-bg {
         background-image:
             linear-gradient(to right, rgba(109, 121, 125, 0.06) 1px, transparent 1px),
@@ -73,13 +73,21 @@ tailwind.config = {
         border-radius: 0.5rem;
         padding: 24px;
     }
+    .field-label { display:block; font-size:12px; color:#3d494c; margin-bottom:4px; font-family:'JetBrains Mono',monospace; }
+    .field-input { width:100%; font-size:13px; padding:7px 10px; border:1px solid rgba(188,201,205,.7); border-radius:6px; background:#fff; }
+    .field-input:focus { outline:2px solid rgba(6,182,212,.4); border-color:#06b6d4; }
+    .btn { padding:6px 12px; border-radius:6px; font-size:12px; font-weight:700; font-family:'JetBrains Mono',monospace; cursor:pointer; transition:opacity .15s, background .15s; }
+    .btn-primary { background:#00687a; color:#fff; } .btn-primary:hover { opacity:.9; }
+    .btn-ghost { border:1px solid rgba(188,201,205,.8); color:#00687a; background:#fff; } .btn-ghost:hover { background:#eceef0; }
+    .btn-danger { border:1px solid #f3b4b4; color:#ba1a1a; background:#fff; } .btn-danger:hover { background:#fdf0f0; }
+    .badge { font-size:11px; padding:1px 8px; border-radius:9999px; font-family:'JetBrains Mono',monospace; }
 </style>
 </head>
 <body class="font-body-md min-h-screen flex flex-col blueprint-bg mesh-gradient">
 
 <nav class="fixed top-0 w-full z-50 bg-surface/80 backdrop-blur-md border-b border-outline-variant/30">
     <div class="flex justify-between items-center px-6 h-16 max-w-3xl mx-auto">
-        <a href="/" class="font-bold text-[20px] font-bold text-primary tracking-tighter" style="font-family:'Space Grotesk',sans-serif">sap-for-agents</a>
+        <a href="/" class="font-bold text-[20px] text-primary tracking-tighter" style="font-family:'Space Grotesk',sans-serif">sap-for-agents</a>
         <div class="flex items-center gap-3">
             <div class="flex items-center gap-1 text-[12px]" style="font-family:'JetBrains Mono',monospace">
                 <a href="/setup?lang=en" class="text-on-surface-variant hover:text-primary transition-colors">English</a>
@@ -88,7 +96,7 @@ tailwind.config = {
             </div>
             <div class="flex items-center gap-1.5 px-2 py-0.5 bg-surface-container-high rounded-full" id="status-pill">
                 <span id="status-dot" class="w-2 h-2 rounded-full bg-amber-400 animate-pulse"></span>
-                <span id="status-text" class="text-[12px] text-on-surface-variant" style="font-family:'JetBrains Mono',monospace">检查中…</span>
+                <span id="status-text" class="text-[12px] text-on-surface-variant" style="font-family:'JetBrains Mono',monospace">检测中…</span>
             </div>
         </div>
     </div>
@@ -97,66 +105,159 @@ tailwind.config = {
 <main class="flex-grow pt-28 pb-12 px-6 max-w-3xl mx-auto w-full">
 
     <section class="mb-8">
-        <h1 class="text-[34px] font-bold text-on-background mb-2 tracking-tighter" style="font-family:'Space Grotesk',sans-serif">首次配置引导</h1>
-        <p class="text-body-lg text-on-surface-variant">网关已在本地运行，但还没有配置任何 SAP 系统。把下面这段话交给你的 AI 助手，它会引导你完成剩下的配置——大约需要回答 5 个问题。</p>
+        <h1 class="text-[34px] font-bold text-on-background mb-2 tracking-tighter" style="font-family:'Space Grotesk',sans-serif">配置台</h1>
+        <p class="text-body-lg text-on-surface-variant">运行期增删改 SAP 系统、切换默认——改完即生效，无需重启，不用碰配置文件。首次使用？把下面的交接文字发给你的 AI 助手，它会引导你完成。</p>
     </section>
 
-    <!-- 复制给 Agent 的交接文字 -->
-    <section class="bento-card mb-6" id="handoff-card">
+    <!-- 写入锁定提示 -->
+    <section class="bento-card mb-6 hidden" id="locked-note" style="border-color:#f3b4b4">
+        <div class="flex items-start gap-3">
+            <span class="w-3 h-3 rounded-full bg-red-500 mt-1"></span>
+            <div>
+                <h2 class="text-[16px] font-semibold text-on-background" style="font-family:'Space Grotesk',sans-serif">配置写入已锁定</h2>
+                <p class="text-body-md text-on-surface-variant mt-1" id="locked-reason"></p>
+            </div>
+        </div>
+    </section>
+
+    <!-- 系统面板（已配置） -->
+    <section class="bento-card mb-6 hidden" id="systems-panel">
+        <div class="flex items-center justify-between mb-4">
+            <div class="flex items-center gap-3">
+                <span class="w-3 h-3 rounded-full bg-green-500"></span>
+                <h2 class="text-[18px] font-semibold text-on-background" style="font-family:'Space Grotesk',sans-serif">系统</h2>
+            </div>
+            <button class="btn btn-primary" id="add-toggle">+ 添加系统</button>
+        </div>
+        <div id="systems-grid" class="grid gap-3"></div>
+        <p class="text-[12px] text-on-surface-variant mt-3">无前缀路径（<code class="bg-surface-container px-1 rounded" style="font-family:'JetBrains Mono',monospace">/api/rfc</code> 等）打到 ★ 默认系统；指定系统用 <code class="bg-surface-container px-1 rounded" style="font-family:'JetBrains Mono',monospace">/api/s/{系统名}/…</code>。连接状态由探测循环约 60 秒刷新一次。</p>
+    </section>
+
+    <!-- 添加系统表单（隐藏，按钮切换） -->
+    <section class="bento-card mb-6 hidden" id="add-card">
+        <h2 class="text-[18px] font-semibold text-on-background mb-3" style="font-family:'Space Grotesk',sans-serif">添加系统</h2>
+        <div class="grid grid-cols-2 gap-3">
+            <div><label class="field-label">name * <span class="text-on-surface-variant/60">小写 URL 标识，如 a4h</span></label><input class="field-input" id="add-name"/></div>
+            <div><label class="field-label">client</label><input class="field-input" id="add-client" placeholder="001"/></div>
+            <div><label class="field-label">ashost * <span class="text-on-surface-variant/60">（或 conn.MSHOST）</span></label><input class="field-input" id="add-ashost"/></div>
+            <div><label class="field-label">sysnr * <span class="text-on-surface-variant/60">（或 conn.MSHOST）</span></label><input class="field-input" id="add-sysnr" placeholder="00"/></div>
+            <div><label class="field-label">user *</label><input class="field-input" id="add-user" autocomplete="off"/></div>
+            <div><label class="field-label">passwd * <span class="text-on-surface-variant/60">支持 ${环境变量}</span></label><input class="field-input" id="add-passwd" type="password" autocomplete="new-password"/></div>
+            <div><label class="field-label">lang</label><input class="field-input" id="add-lang" placeholder="EN"/></div>
+            <div class="flex items-end pb-1"><label class="flex items-center gap-2 text-[13px] text-on-surface-variant"><input type="checkbox" id="add-default"/> 设为默认系统</label></div>
+        </div>
+        <details class="mt-3">
+            <summary class="text-[13px] font-semibold text-primary cursor-pointer select-none" style="font-family:'JetBrains Mono',monospace">高级（连接池 / ADT / 只读 / conn 透传）</summary>
+            <div class="grid grid-cols-2 gap-3 mt-3">
+                <div><label class="field-label">pool_size</label><input class="field-input" id="add-pool_size" inputmode="numeric"/></div>
+                <div><label class="field-label">request_timeout_secs</label><input class="field-input" id="add-request_timeout_secs" inputmode="numeric"/></div>
+                <div><label class="field-label">adt_base_url <span class="text-on-surface-variant/60">"" = 禁用</span></label><input class="field-input" id="add-adt_base_url"/></div>
+                <div><label class="field-label">adt_user</label><input class="field-input" id="add-adt_user"/></div>
+                <div><label class="field-label">adt_passwd</label><input class="field-input" id="add-adt_passwd" type="password" autocomplete="new-password"/></div>
+                <div class="flex items-end pb-1"><label class="flex items-center gap-2 text-[13px] text-on-surface-variant"><input type="checkbox" id="add-read_only"/> 只读</label></div>
+                <div class="col-span-2"><label class="field-label">conn（JSON 对象，如 {"MSHOST":"msg.host","GROUP":"SPACE"}）</label><input class="field-input" id="add-conn" placeholder='{"MSHOST":"…"}'/></div>
+                <div class="flex items-end pb-1"><label class="flex items-center gap-2 text-[13px] text-on-surface-variant"><input type="checkbox" id="add-skip-test"/> 跳过试连（离线预配置）</label></div>
+            </div>
+        </details>
+        <div class="flex items-center gap-3 mt-4">
+            <button class="btn btn-primary" id="add-save">试连并保存</button>
+            <button class="btn btn-ghost" id="add-cancel">取消</button>
+            <span class="text-[13px]" id="add-msg"></span>
+        </div>
+        <p class="text-[12px] text-on-surface-variant mt-2">落盘前会先真实试连一次——连不上就不会写入配置文件，永远不会有"存进去一个坏系统"。</p>
+    </section>
+
+
+    <!-- 网关设置 -->
+    <section class="bento-card mb-6" id="settings-panel">
         <div class="flex items-center justify-between mb-3">
-            <h2 class="text-[18px] font-semibold text-on-background" style="font-family:'Space Grotesk',sans-serif">① 复制这段话，发给你的 AI 助手</h2>
-            <button id="copy-btn" class="px-4 py-1.5 bg-primary text-on-primary rounded text-[13px] font-bold hover:opacity-90 transition-opacity" style="font-family:'JetBrains Mono',monospace">复制</button>
+            <h2 class="text-[18px] font-semibold text-on-background" style="font-family:'Space Grotesk',sans-serif">网关设置</h2>
+            <div class="flex items-center gap-2">
+                <button class="btn btn-ghost" id="restart-btn">重启网关</button>
+                <button class="btn btn-primary" id="settings-save">保存修改</button>
+            </div>
+        </div>
+        <div class="grid grid-cols-2 gap-3" id="hot-settings-grid"></div>
+        <h3 class="text-[14px] font-semibold text-on-background mt-4 mb-2">之后新建/编辑的系统生效 <span class="text-[12px] font-normal text-on-surface-variant">（改运行中系统请用其「编辑」表单）</span></h3>
+        <div class="grid grid-cols-2 gap-3" id="rebuild-settings-grid"></div>
+        <h3 class="text-[14px] font-semibold text-on-background mt-4 mb-2">需重启进程 <span class="text-[12px] font-normal text-on-surface-variant">（改 .env 后重启）</span></h3>
+        <div class="grid grid-cols-2 gap-3" id="restart-settings-grid"></div>
+        <p class="hidden text-[13px] text-red-700 mt-2" id="settings-lock"></p>
+        <div class="flex items-center gap-3 mt-4"><span class="text-[13px]" id="settings-msg"></span></div>
+    </section>
+
+    <!-- 可复制的交接文字（未配置时） -->
+    <section class="bento-card mb-6 hidden" id="handoff-card">
+        <div class="flex items-center justify-between mb-3">
+            <h2 class="text-[18px] font-semibold text-on-background" style="font-family:'Space Grotesk',sans-serif">首次配置：复制这段话发给你的 AI 助手</h2>
+            <button id="copy-btn" class="btn btn-primary">复制</button>
         </div>
         <pre id="handoff-text" class="text-[13px] leading-[20px] bg-surface-container-low border border-outline-variant/40 rounded p-4 overflow-x-auto whitespace-pre-wrap" style="font-family:'JetBrains Mono',monospace"></pre>
-        <p class="text-[12px] text-on-surface-variant mt-2">适用于本机运行的 AI 助手（Claude Code / Cursor / Copilot CLI 等）。内容已自动填入本网关地址。</p>
+        <p class="text-[12px] text-on-surface-variant mt-2">适用于本机运行的 AI 助手（Claude Code / Cursor / Copilot CLI 等）。网关地址已自动填入。</p>
     </section>
 
-    <!-- 接下来会发生什么 -->
-    <section class="bento-card mb-6">
-        <h2 class="text-[18px] font-semibold text-on-background mb-3" style="font-family:'Space Grotesk',sans-serif">② 接下来会发生什么</h2>
+    <!-- 接下来会发生什么（未配置时） -->
+    <section class="bento-card mb-6 hidden" id="next-card">
+        <h2 class="text-[18px] font-semibold text-on-background mb-3" style="font-family:'Space Grotesk',sans-serif">接下来会发生什么</h2>
         <ol class="space-y-2 text-body-md text-on-surface-variant list-decimal list-inside">
-            <li>AI 助手向网关询问需要哪些字段，然后向你提问：SAP 服务器地址、系统号、客户端、账号、密码，以及一个简短的系统名。</li>
-            <li>它把信息提交给网关——<strong class="text-on-background">网关会先真实试连一次</strong>，连不上不会保存，你不会得到一个坏配置。</li>
-            <li>试连通过后配置立即生效（<strong class="text-on-background">无需重启</strong>），本页面会自动变成绿色。</li>
+            <li>你的助手会先问网关需要哪些字段，然后向你采集：SAP 主机、系统号、客户端、账号、密码，外加一个简短的小写系统名。</li>
+            <li>它把信息提交给网关——<strong class="text-on-background">网关先真实试连一次</strong>，连不上什么都不落盘，所以配置永远不会是坏的。</li>
+            <li>试连通过后系统立即上线（<strong class="text-on-background">无需重启</strong>），本页自动变成上面的系统管理面板。</li>
         </ol>
-        <p class="text-[12px] text-on-surface-variant mt-3">提示：密码支持 <code class="bg-surface-container px-1 rounded" style="font-family:'JetBrains Mono',monospace">${环境变量名}</code> 引用形式，让密文留在环境变量里、不进入对话记录。</p>
+        <p class="text-[12px] text-on-surface-variant mt-3">提示：密码支持 <code class="bg-surface-container px-1 rounded" style="font-family:'JetBrains Mono',monospace">${环境变量}</code> 引用形式，密钥留在你的环境里，不出现在对话记录中。</p>
     </section>
 
-    <!-- 手工配置（可折叠） -->
+    <!-- 手工方式（折叠） -->
     <section class="bento-card mb-6">
         <details>
-            <summary class="text-[15px] font-semibold text-on-background cursor-pointer select-none" style="font-family:'Space Grotesk',sans-serif">不想用 AI？手工配置（点击展开）</summary>
+            <summary class="text-[15px] font-semibold text-on-background cursor-pointer select-none" style="font-family:'Space Grotesk',sans-serif">更喜欢用 API 或手工配置？（点开）</summary>
             <div class="mt-4 space-y-3 text-body-md text-on-surface-variant">
-                <p>在网关运行目录创建 <code class="bg-surface-container px-1 rounded" style="font-family:'JetBrains Mono',monospace">sap_systems.toml</code>（模板见 <code style="font-family:'JetBrains Mono',monospace">sap_systems.toml.example</code>）：</p>
-                <pre class="text-[13px] leading-[20px] bg-surface-container-low border border-outline-variant/40 rounded p-4 overflow-x-auto" style="font-family:'JetBrains Mono',monospace">[systems.a4h]
-ashost  = "你的SAP服务器地址"
-sysnr   = "00"
-client  = "001"
-user    = "账号"
-passwd  = "密码"
-default = true</pre>
-                <p>保存后重启网关即可。或者直接 curl 一行完成（网关会先试连再落盘）：</p>
-                <pre class="text-[13px] leading-[20px] bg-surface-container-low border border-outline-variant/40 rounded p-4 overflow-x-auto" style="font-family:'JetBrains Mono',monospace">curl -X POST http://127.0.0.1:3000/api/setup/system \
-  -H "Content-Type: application/json" \
-  -d '{"name":"a4h","ashost":"主机","sysnr":"00","client":"001","user":"账号","passwd":"密码"}'</pre>
+                <p>本页所有操作都是普通 HTTP（默认本机即可写入）：</p>
+                <pre class="text-[13px] leading-[20px] bg-surface-container-low border border-outline-variant/40 rounded p-4 overflow-x-auto" style="font-family:'JetBrains Mono',monospace">curl -X POST   http://127.0.0.1:3000/api/setup/system          -H "Content-Type: application/json" -d '{"name":"a4h",…}'
+curl           http://127.0.0.1:3000/api/setup/system/a4h      # 读单个系统（密码掩码不回显）
+curl -X PUT    http://127.0.0.1:3000/api/setup/system/a4h      -H "Content-Type: application/json" -d '{"passwd":"新密码"}'   # 半更新
+curl -X DELETE http://127.0.0.1:3000/api/setup/system/a4h      # 删除（最后一个系统需 ?force=true）
+curl -X PUT    http://127.0.0.1:3000/api/setup/default         -H "Content-Type: application/json" -d '{"name":"a4h"}'     # 切默认</pre>
+                <p>也可以手工编辑 <code class="bg-surface-container px-1 rounded" style="font-family:'JetBrains Mono',monospace">sap_systems.toml</code> 后重启网关。</p>
             </div>
         </details>
     </section>
 
-    <!-- 配置完成（初始隐藏） -->
-    <section class="bento-card mb-6 hidden" id="done-card" style="border-color:#16a34a">
-        <div class="flex items-center gap-3 mb-3">
-            <span class="w-3 h-3 rounded-full bg-green-500"></span>
-            <h2 class="text-[18px] font-semibold text-on-background" style="font-family:'Space Grotesk',sans-serif">配置完成，网关已就绪</h2>
-        </div>
-        <div id="done-systems" class="text-body-md text-on-surface-variant mb-4"></div>
-        <div class="flex gap-3">
-            <a href="/" class="px-4 py-2 bg-primary text-on-primary rounded text-[13px] font-bold hover:opacity-90 transition-opacity" style="font-family:'JetBrains Mono',monospace">打开首页</a>
-            <a href="/docs" class="px-4 py-2 border border-primary text-primary rounded text-[13px] font-bold hover:bg-surface-container transition-colors" style="font-family:'JetBrains Mono',monospace">API 文档</a>
-        </div>
-    </section>
-
 </main>
+
+<!-- 编辑弹窗 -->
+<div class="hidden fixed inset-0 z-[60] bg-black/40 flex items-start justify-center pt-24 px-6" id="edit-modal">
+    <div class="bento-card w-full max-w-xl" style="padding:28px">
+        <div class="flex items-center justify-between mb-4">
+            <h2 class="text-[18px] font-semibold text-on-background" style="font-family:'Space Grotesk',sans-serif">编辑系统 <span class="text-primary" id="edit-title"></span></h2>
+            <button class="btn btn-ghost" id="edit-close">✕</button>
+        </div>
+        <div class="grid grid-cols-2 gap-3">
+            <div><label class="field-label">ashost <span class="text-on-surface-variant/60">留空 = 保持</span></label><input class="field-input" id="edit-ashost"/></div>
+            <div><label class="field-label">sysnr <span class="text-on-surface-variant/60">留空 = 保持</span></label><input class="field-input" id="edit-sysnr"/></div>
+            <div><label class="field-label">client</label><input class="field-input" id="edit-client"/></div>
+            <div><label class="field-label">user</label><input class="field-input" id="edit-user" autocomplete="off"/></div>
+            <div><label class="field-label">passwd <span class="text-on-surface-variant/60">留空 = 保持原密码</span></label><input class="field-input" id="edit-passwd" type="password" autocomplete="new-password"/></div>
+            <div><label class="field-label">lang</label><input class="field-input" id="edit-lang"/></div>
+            <div><label class="field-label">pool_size</label><input class="field-input" id="edit-pool_size" inputmode="numeric"/></div>
+            <div><label class="field-label">request_timeout_secs</label><input class="field-input" id="edit-request_timeout_secs" inputmode="numeric"/></div>
+            <div><label class="field-label">adt_base_url <span class="text-on-surface-variant/60">"" = 禁用</span></label><input class="field-input" id="edit-adt_base_url"/></div>
+            <div><label class="field-label">adt_user</label><input class="field-input" id="edit-adt_user"/></div>
+            <div><label class="field-label">adt_passwd</label><input class="field-input" id="edit-adt_passwd" type="password" autocomplete="new-password"/></div>
+            <div class="flex items-end pb-1"><label class="flex items-center gap-2 text-[13px] text-on-surface-variant"><input type="checkbox" id="edit-read_only"/> 只读</label></div>
+            <div class="col-span-2"><label class="field-label">conn（JSON 对象，留空 = 保持）</label><input class="field-input" id="edit-conn"/></div>
+            <div class="flex items-end pb-1"><label class="flex items-center gap-2 text-[13px] text-on-surface-variant"><input type="checkbox" id="edit-default"/> 设为默认系统</label></div>
+            <div class="flex items-end pb-1"><label class="flex items-center gap-2 text-[13px] text-on-surface-variant"><input type="checkbox" id="edit-skip-test"/> 跳过试连</label></div>
+        </div>
+        <div class="flex items-center gap-3 mt-4">
+            <button class="btn btn-primary" id="edit-save">试连并保存</button>
+            <button class="btn btn-ghost" id="edit-cancel">取消</button>
+            <span class="text-[13px]" id="edit-msg"></span>
+        </div>
+        <p class="text-[12px] text-on-surface-variant mt-2">半更新：留空的字段保持存储值不变。不支持改名——删除后重新添加。保存后热替换连接池，在途请求继续用旧连接跑完。</p>
+        <p class="hidden text-[12px] text-amber-700 mt-1" id="edit-src-note"></p>
+    </div>
+</div>
 
 <footer class="pb-8 text-center text-[12px] text-on-surface-variant/70">
     <a href="/agents.md" class="hover:text-primary transition-colors">Agent 文档</a> ·
@@ -178,18 +279,293 @@ default = true</pre>
 <script>
 (function () {
     var ORIGIN = window.location.origin;
-    // 交接文字：模板填入实际地址
+    var S = { setup: null, systems: null, editing: null, editing_default: false, settings: null };
+
+    // ---------- 小工具 ----------
+    function $(id) { return document.getElementById(id); }
+    function val(id) { var v = $(id).value.trim(); return v === '' ? null : v; }
+    function setVal(id, v) { $(id).value = (v === null || v === undefined) ? '' : String(v); }
+    function bool(id) { return $(id).checked; }
+
+    function api(method, url, body, retried) {
+        var opt = { method: method, headers: {} };
+        var tok = localStorage.getItem('gw_token');
+        if (tok) opt.headers['Authorization'] = 'Bearer ' + tok;
+        if (body !== undefined) {
+            opt.headers['Content-Type'] = 'application/json';
+            opt.body = JSON.stringify(body);
+        }
+        return fetch(url, opt).then(function (r) {
+            // 网关开启了鉴权（SAP_API_KEY 或热改的 API Key）→ 要一次 token 并重试
+            if (r.status === 401 && !retried) {
+                var t = prompt('网关要求 Bearer token（SAP_API_KEY）：');
+                if (t) { localStorage.setItem('gw_token', t); return api(method, url, body, true); }
+            }
+            return r.text().then(function (t2) {
+                var j = null; try { j = t2 ? JSON.parse(t2) : null; } catch (e) {}
+                return { ok: r.ok, status: r.status, json: j };
+            });
+        });
+    }
+    function errMsg(res, fallback) {
+        return (res.json && res.json.error && res.json.error.message) || fallback || ('HTTP ' + res.status);
+    }
+
+    // ---------- 状态胶囊 + 区块切换 ----------
+    function reasonText(st) {
+        return st ? (st.disabled_reason || '') : '';
+    }
+
+    var dot = $('status-dot'), text = $('status-text');
+    function render() {
+        var st = S.setup, sys = S.systems;
+        var configured = st && st.configured;
+        var writable = st && st.writable;
+        if (!st) { text.textContent = '网关不可达'; return; }
+        if (!configured) {
+            dot.className = 'w-2 h-2 rounded-full bg-amber-400 animate-pulse';
+            text.textContent = writable ? '待配置' : '待配置（写入已锁定）';
+        } else {
+            var bad = (sys && sys.systems || []).some(function (s) { return s.quarantined; });
+            var down = (sys && sys.systems || []).some(function (s) { return !s.connected; });
+            dot.className = 'w-2 h-2 rounded-full ' + (bad ? 'bg-red-500' : down ? 'bg-amber-400' : 'bg-green-500');
+            text.textContent = '已配置 · ' + (sys ? sys.count : '?') + ' 个系统';
+        }
+        $('locked-note').classList.toggle('hidden', !!writable);
+        if (!writable) $('locked-reason').textContent = reasonText(st);
+        $('systems-panel').classList.toggle('hidden', !configured);
+        $('handoff-card').classList.toggle('hidden', !!configured);
+        $('next-card').classList.toggle('hidden', !!configured);
+        if (configured) renderSystems();
+    }
+    function refresh() {
+        return Promise.all([
+            fetch('/api/setup').then(function (r) { return r.json(); }).catch(function () { return null; }),
+            fetch('/api/systems').then(function (r) { return r.json(); }).catch(function () { return null; }),
+            fetch('/api/settings').then(function (r) { return r.json(); }).catch(function () { return null; })
+        ]).then(function (rs) { S.setup = rs[0]; S.systems = rs[1]; S.settings = rs[2]; render(); renderSettings(); });
+    }
+
+    // ---------- 系统卡片 ----------
+    function statusBadge(s) {
+        if (s.quarantined) return '<span class="badge bg-red-100 text-red-700">已隔离 · SYSID 冲突</span>';
+        if (s.connected) return '<span class="badge bg-green-100 text-green-700">已连接</span>' + (s.sysid ? ' <span class="badge bg-surface-container-high text-on-surface-variant">' + s.sysid + '</span>' : '');
+        if (s.connect_error) return '<span class="badge bg-amber-100 text-amber-700" title="' + String(s.connect_error).replace(/"/g, '&quot;') + '">不可达</span>';
+        return '<span class="badge bg-surface-container-high text-on-surface-variant">尚未连接</span>';
+    }
+    function renderSystems() {
+        var grid = $('systems-grid');
+        var list = (S.systems && S.systems.systems) || [];
+        var writable = S.setup && S.setup.writable;
+        $('add-toggle').classList.toggle('hidden', !writable);
+        grid.innerHTML = '';
+        list.forEach(function (s) {
+            var card = document.createElement('div');
+            card.className = 'border border-outline-variant/40 rounded-lg p-4 bg-white/70';
+            card.setAttribute('data-system', s.name);
+            var actions = '';
+            if (writable) {
+                actions =
+                    (s.default ? '' : '<button class="btn btn-ghost" data-act="default">设为默认</button>') +
+                    '<button class="btn btn-ghost" data-act="edit">编辑</button>';
+            }
+            card.innerHTML =
+                '<div class="flex items-center justify-between mb-2">' +
+                    '<div class="flex items-center gap-2">' +
+                        '<span class="font-bold text-[16px] text-on-background" style="font-family:\'Space Grotesk\',sans-serif">' + (s.default ? '★ ' : '') + s.name + '</span>' +
+                        statusBadge(s) +
+                        (s.read_only ? ' <span class="badge bg-surface-container-high text-on-surface-variant">只读</span>' : '') +
+                        (s.adt ? ' <span class="badge bg-surface-container-high text-on-surface-variant">adt</span>' : '') +
+                    '</div>' +
+                    '<div class="flex items-center gap-2">' +
+                        '<button class="btn btn-ghost" data-act="test">测试</button><button class="btn btn-ghost" data-act="reload">重载</button>' + actions +
+                        (writable ? '<button class="btn btn-danger" data-act="delete">删除</button>' : '') +
+                    '</div>' +
+                '</div>' +
+                '<div class="text-[12px] text-on-surface-variant" data-role="meta">' + (s.connect_error ? String(s.connect_error) : '') + '</div>' +
+                '<div class="text-[12px] mt-1" data-role="test"></div>';
+            card.querySelectorAll('button[data-act]').forEach(function (b) {
+                b.addEventListener('click', function () { act(b.getAttribute('data-act'), s.name); });
+            });
+            // 可写 → 补一行连接参数（GET 单系统，密码掩码不回显）
+            if (writable) {
+                api('GET', '/api/setup/system/' + encodeURIComponent(s.name)).then(function (res) {
+                    if (!res.ok || !res.json) return;
+                    var j = res.json;
+                    var bits = [];
+                    if (j.ashost) bits.push(j.ashost + (j.sysnr ? ':' + j.sysnr : ''));
+                    if (j.client) bits.push('client ' + j.client);
+                    if (j.user) bits.push('user ' + j.user);
+                    if (j.passwd && j.passwd.ref) bits.push('passwd ' + j.passwd.ref);
+                    if (j.source === 'env_synthetic') bits.push('来自 .env（首次写入时落盘）');
+                    var meta = card.querySelector('[data-role="meta"]');
+                    var extra = bits.join(' · ');
+                    meta.textContent = meta.textContent ? extra + ' · ' + meta.textContent : extra;
+                });
+            }
+            grid.appendChild(card);
+        });
+    }
+
+    function act(name, system) {
+        if (name === 'test') return testSystem(system);
+        if (name === 'reload') {
+            var r0 = findCardSlot(system);
+            if (r0) r0.innerHTML = '<span class="text-on-surface-variant">重载中…</span>';
+            return api('POST', '/api/s/' + encodeURIComponent(system) + '/admin/reload').then(function (res) {
+                var slot = findCardSlot(system);
+                if (slot) slot.innerHTML = res.ok
+                    ? '<span class="badge bg-green-100 text-green-700">已重载（连接池换代 + 缓存清空，新签名即拉即生效）</span>'
+                    : '<span class="badge bg-red-100 text-red-700">重载失败：' + String(errMsg(res, 'HTTP ' + res.status)).slice(0, 140) + '</span>';
+            });
+        }
+        if (name === 'edit') return openEdit(system);
+        if (name === 'default') {
+            return api('PUT', '/api/setup/default', { name: system }).then(function (res) {
+                if (!res.ok) alert(errMsg(res, '切换失败'));
+                refresh();
+            });
+        }
+        if (name === 'delete') {
+            var last = S.systems && S.systems.count === 1;
+            var msg = last
+                ? '"' + system + '" 是唯一系统，删除后网关回到未配置模式（业务端点全部 503）。确定继续吗？'
+                : '删除系统 "' + system + '"？sap_systems.toml 中的条目会同步移除，运行态立即卸载（无需重启）。';
+            if (!confirm(msg)) return;
+            var url = '/api/setup/system/' + encodeURIComponent(system) + (last ? '?force=true' : '');
+            return api('DELETE', url).then(function (res) {
+                if (!res.ok) alert(errMsg(res, '删除失败'));
+                refresh();
+            });
+        }
+    }
+
+    // 按卡片 data-system 精确找状态槽——不用文本匹配（系统名互为子串时会点错卡）
+    function findCardSlot(name) {
+        var cards = $('systems-grid').children;
+        for (var i = 0; i < cards.length; i++) {
+            if (cards[i].getAttribute('data-system') === name) {
+                return cards[i].querySelector('[data-role="test"]');
+            }
+        }
+        return null;
+    }
+
+    function testSystem(name) {
+        var slotEl = findCardSlot(name);
+        if (!slotEl) return;
+        slotEl.innerHTML = '<span class="text-on-surface-variant">测试中…</span>';
+        fetch('/api/s/' + encodeURIComponent(name) + '/ready').then(function (r) {
+            return r.text().then(function (t) {
+                var j = null; try { j = JSON.parse(t); } catch (e) {}
+                return { ok: r.ok, status: r.status, json: j };
+            });
+        }).then(function (res) {
+            slotEl.innerHTML = res.ok
+                ? '<span class="badge bg-green-100 text-green-700">SAP 可达（RFC_PING 通过）</span>'
+                : '<span class="badge bg-red-100 text-red-700">不可达：' + String(errMsg(res, 'HTTP ' + res.status)).slice(0, 160) + '</span>';
+        });
+    }
+
+    // ---------- 添加表单 ----------
+    $('add-toggle').addEventListener('click', function () {
+        $('add-card').classList.toggle('hidden');
+        $('add-msg').textContent = '';
+    });
+    $('add-cancel').addEventListener('click', function () { $('add-card').classList.add('hidden'); });
+    $('add-save').addEventListener('click', function () {
+        var body = {};
+        var need = { name: 'add-name', ashost: 'add-ashost', sysnr: 'add-sysnr', user: 'add-user', passwd: 'add-passwd' };
+        for (var k in need) { var v = val(need[k]); if (v) body[k] = v; }
+        ['client', 'lang', 'pool_size', 'request_timeout_secs', 'adt_base_url', 'adt_user', 'adt_passwd'].forEach(function (k) {
+            var v = val('add-' + k);
+            if (v === null) return;
+            body[k] = (k === 'pool_size' || k === 'request_timeout_secs') ? Number(v) : v;
+        });
+        if (bool('add-default')) body.default = true;
+        if (bool('add-read_only')) body.read_only = true;
+        if (bool('add-skip-test')) body.test = false;
+        var cj = val('add-conn');
+        if (cj) { try { body.conn = JSON.parse(cj); } catch (e) { $('add-msg').textContent = 'conn 必须是 JSON 对象'; return; } }
+        if (!body.name || (!body.ashost && !body.conn)) { $('add-msg').textContent = 'name 与（ashost+sysnr 或 conn）为必填'; return; }
+        $('add-msg').textContent = '试连中…';
+        api('POST', '/api/setup/system', body).then(function (res) {
+            if (res.ok) {
+                $('add-msg').textContent = '';
+                $('add-card').classList.add('hidden');
+                ['add-name','add-ashost','add-sysnr','add-client','add-user','add-passwd','add-lang'].forEach(function (id) { $(id).value = ''; });
+                refresh();
+            } else {
+                $('add-msg').textContent = errMsg(res, '失败');
+            }
+        });
+    });
+
+    // ---------- 编辑弹窗 ----------
+    function openEdit(name) {
+        S.editing = name;
+        $('edit-title').textContent = name;
+        ['edit-ashost','edit-sysnr','edit-client','edit-user','edit-passwd','edit-lang',
+         'edit-pool_size','edit-request_timeout_secs','edit-adt_base_url','edit-adt_user',
+         'edit-adt_passwd','edit-conn'].forEach(function (id) { $(id).value = ''; });
+        $('edit-default').checked = false; $('edit-read_only').checked = false; $('edit-skip-test').checked = false;
+        $('edit-msg').textContent = '';
+        $('edit-modal').classList.remove('hidden');
+        api('GET', '/api/setup/system/' + encodeURIComponent(name)).then(function (res) {
+            if (!res.ok) { $('edit-msg').textContent = errMsg(res, '读取失败'); return; }
+            var j = res.json;
+            S.editing_default = !!j.default;
+            setVal('edit-ashost', j.ashost); setVal('edit-sysnr', j.sysnr); setVal('edit-client', j.client);
+            setVal('edit-user', j.user); setVal('edit-lang', j.lang);
+            setVal('edit-pool_size', j.pool_size); setVal('edit-request_timeout_secs', j.request_timeout_secs);
+            setVal('edit-adt_base_url', j.adt_base_url); setVal('edit-adt_user', j.adt_user);
+            setVal('edit-adt_passwd', j.adt_passwd);
+            setVal('edit-conn', j.conn && Object.keys(j.conn).length ? JSON.stringify(j.conn) : '');
+            $('edit-default').checked = S.editing_default;
+            $('edit-read_only').checked = j.read_only === true;
+            var note = $('edit-src-note');
+            if (j.source === 'env_synthetic') {
+                note.textContent = '⚠ 此系统来自 .env 合成——保存会把整个系统集合（含它）落盘到 sap_systems.toml（否则重启后消失）';
+                note.classList.remove('hidden');
+            } else {
+                note.classList.add('hidden');
+            }
+            if (j.passwd && j.passwd.ref) $('edit-passwd').placeholder = j.passwd.ref + '（留空 = 保持）';
+            else if (j.passwd && j.passwd.set) $('edit-passwd').placeholder = '留空 = 保持原密码';
+        });
+    }
+    function closeEdit() { $('edit-modal').classList.add('hidden'); S.editing = null; }
+    $('edit-close').addEventListener('click', closeEdit);
+    $('edit-cancel').addEventListener('click', closeEdit);
+    $('edit-save').addEventListener('click', function () {
+        if (!S.editing) return;
+        var body = {};
+        ['ashost','sysnr','client','user','passwd','lang','adt_base_url','adt_user','adt_passwd'].forEach(function (k) {
+            var v = val('edit-' + k); if (v !== null) body[k] = v;
+        });
+        ['pool_size','request_timeout_secs'].forEach(function (k) {
+            var v = val('edit-' + k); if (v !== null) body[k] = Number(v);
+        });
+        var cj = val('edit-conn');
+        if (cj) { try { body.conn = JSON.parse(cj); } catch (e) { $('edit-msg').textContent = 'conn 必须是 JSON 对象'; return; } }
+        if ($('edit-default').checked !== S.editing_default) body.default = $('edit-default').checked;
+        if (bool('edit-read_only')) body.read_only = true;
+        if (bool('edit-skip-test')) body.test = false;
+        $('edit-msg').textContent = '试连中…';
+        api('PUT', '/api/setup/system/' + encodeURIComponent(S.editing), body).then(function (res) {
+            if (res.ok) { closeEdit(); refresh(); }
+            else $('edit-msg').textContent = errMsg(res, '失败');
+        });
+    });
+    $('edit-modal').addEventListener('click', function (e) { if (e.target === $('edit-modal')) closeEdit(); });
+
+    // ---------- 交接文字 ----------
     var tpl = document.getElementById('handoff-tpl').textContent;
     var handoff = tpl.replace(/\{\{ORIGIN\}\}/g, ORIGIN);
     document.getElementById('handoff-text').textContent = handoff;
-
-    // 复制按钮（127.0.0.1 是可信来源，clipboard API 可用；留 execCommand 兜底）
     var btn = document.getElementById('copy-btn');
     btn.addEventListener('click', function () {
-        function ok() {
-            btn.textContent = '✓ 已复制';
-            setTimeout(function () { btn.textContent = '复制'; }, 2000);
-        }
+        function ok() { btn.textContent = '✓ 已复制'; setTimeout(function () { btn.textContent = '复制'; }, 2000); }
         if (navigator.clipboard && navigator.clipboard.writeText) {
             navigator.clipboard.writeText(handoff).then(ok, fallback);
         } else { fallback(); }
@@ -198,38 +574,139 @@ default = true</pre>
             ta.value = handoff;
             document.body.appendChild(ta);
             ta.select();
-            try { document.execCommand('copy'); ok(); } catch (e) { /* 选区兜底 */ }
+            try { document.execCommand('copy'); ok(); } catch (e) { /* 选中兜底 */ }
             document.body.removeChild(ta);
         }
     });
 
-    // 实时状态：未配置 → 每 3s 轮询；配置成功后切绿并停止
-    var dot = document.getElementById('status-dot');
-    var text = document.getElementById('status-text');
-    var timer = null;
-    function refresh() {
-        fetch('/api/setup').then(function (r) { return r.json(); }).then(function (v) {
-            if (v.configured) {
-                dot.className = 'w-2 h-2 rounded-full bg-green-500';
-                dot.removeAttribute('style');
-                text.textContent = '已配置';
-                document.getElementById('handoff-card').classList.add('hidden');
-                var names = (v.systems || []).join('、');
-                document.getElementById('done-systems').textContent =
-                    '已连接的系统：' + names + '。无前缀路径走默认系统；按系统访问用 /api/s/{系统名}/...。';
-                document.getElementById('done-card').classList.remove('hidden');
-                if (timer) { clearInterval(timer); timer = null; }
+
+    // ---------- 网关设置（v0.20 第二期） ----------
+    var HOT_FIELDS = [
+        {k:'request_timeout_secs', label:'请求超时 request_timeout (s)', type:'number'},
+        {k:'rate_limit_rps', label:'限流 rate_limit_rps（0 = 不限流）', type:'number'},
+        {k:'read_only', label:'只读模式（全局）', type:'checkbox'},
+        {k:'api_key', label:'API Key（Bearer 鉴权）', type:'password', special:true},
+        {k:'drain_secs', label:'停机排空 drain (s)', type:'number'},
+        {k:'update_check', label:'更新检查（每 24h）', type:'checkbox'},
+        {k:'lang', label:'默认语言（如 EN/ZH）', type:'text'}
+    ];
+
+    function srcBadge(source) {
+        var c = source === 'file' ? 'bg-green-100 text-green-700'
+              : 'bg-surface-container-high text-on-surface-variant';
+        var t = source === 'file' ? '已自定义' : source === 'env' ? 'env' : '默认';
+        return ' <span class="badge ' + c + '">' + t + '</span>';
+    }
+
+    function renderSettings() {
+        var st = S.settings;
+        if (!st) return;
+        var grid = $('hot-settings-grid');
+        grid.innerHTML = '';
+        HOT_FIELDS.forEach(function (f) {
+            var v = st.hot[f.k];
+            var cell = document.createElement('div');
+            if (f.type === 'checkbox') {
+                cell.innerHTML = '<label class="flex items-center gap-2 text-[13px] text-on-surface-variant mt-5"><input type="checkbox" id="set-' + f.k + '"' + (v.value ? ' checked' : '') + '/>' + f.label + srcBadge(v.source) + '</label>';
+            } else if (f.special) {
+                cell.innerHTML = '<label class="field-label">' + f.label + srcBadge(v.source) + ' <span class="text-on-surface-variant/60">' + (v.value ? '已设置（值不回显）' : '未设置') + '</span></label>' +
+                    '<div class="flex items-center gap-2">' +
+                    '<input class="field-input" id="set-' + f.k + '" type="password" autocomplete="new-password" placeholder="留空 = 保持；输入新 token 即生效"/>' +
+                    '<label class="flex items-center gap-1 text-[12px] text-on-surface-variant whitespace-nowrap"><input type="checkbox" id="set-api_key-off"/> 关闭鉴权</label></div>';
             } else {
-                dot.className = 'w-2 h-2 rounded-full bg-amber-400 animate-pulse';
-                text.textContent = v.writable ? '待配置' : '待配置（写入已禁用）';
-                timer = timer || setInterval(refresh, 3000);
+                cell.innerHTML = '<label class="field-label">' + f.label + srcBadge(v.source) + '</label>' +
+                    '<input class="field-input" id="set-' + f.k + '" type="' + (f.type === 'number' ? 'number' : 'text') + '" value="' + String(v.value).replace(/"/g, '&quot;') + '"/>';
             }
-        }).catch(function () {
-            text.textContent = '网关无响应';
-            timer = timer || setInterval(refresh, 3000);
+            grid.appendChild(cell);
+            wireDirty(f, cell.querySelector('input'));
+        });
+        var rb = $('rebuild-settings-grid');
+        rb.innerHTML = Object.keys(st.apply_on_system_rebuild).map(function (k) {
+            return '<div><label class="field-label">' + k + '</label><div class="text-[13px] text-on-surface">' + String(st.apply_on_system_rebuild[k].value) + srcBadge(st.apply_on_system_rebuild[k].source) + '</div></div>';
+        }).join('');
+        var rr = $('restart-settings-grid');
+        rr.innerHTML = Object.keys(st.apply_on_restart).map(function (k) {
+            return '<div><label class="field-label">' + k + '</label><div class="text-[13px] text-on-surface">' + String(st.apply_on_restart[k].value) + srcBadge(st.apply_on_restart[k].source) + '</div></div>';
+        }).join('');
+        // 锁定态：输入禁用 + 保存/重启隐藏 + 行内原因（与顶部锁定卡同源）
+        var writable = S.setup && S.setup.writable;
+        grid.querySelectorAll('input').forEach(function (el) { el.disabled = !writable; });
+        $('settings-save').classList.toggle('hidden', !writable);
+        $('restart-btn').classList.toggle('hidden', !writable);
+        var lock = $('settings-lock');
+        lock.classList.toggle('hidden', !!writable);
+        if (!writable) lock.textContent = reasonText(S.setup);
+    }
+
+    // 未保存高亮：输入与已加载值不一致时描琥珀圈（保存/刷新后自动消除）
+    function wireDirty(f, el) {
+        if (!el) return;
+        var ev = f.type === 'checkbox' ? 'change' : 'input';
+        el.addEventListener(ev, function () {
+            var cur = S.settings.hot[f.k];
+            var dirty;
+            if (f.type === 'checkbox') dirty = el.checked !== cur.value;
+            else if (f.special) dirty = el.value.trim() !== '' || $('set-api_key-off').checked;
+            else dirty = el.value.trim() !== '' && el.value.trim() !== String(cur.value);
+            el.classList.toggle('ring-2', dirty);
+            el.classList.toggle('ring-amber-300', dirty);
         });
     }
+
+    function saveSettings() {
+        if (!S.settings) return;
+        var body = {};
+        HOT_FIELDS.forEach(function (f) {
+            var el = $('set-' + f.k);
+            var cur = S.settings.hot[f.k];
+            if (f.type === 'checkbox') {
+                if (el.checked !== cur.value) body[f.k] = el.checked;
+            } else if (f.special) {
+                if ($('set-api_key-off').checked) body[f.k] = '';
+                else { var t = el.value.trim(); if (t) body[f.k] = t; }
+            } else {
+                var v = el.value.trim();
+                if (v === '') return; // 留空 = 保持
+                if (f.type === 'number') v = Number(v);
+                if (v !== cur.value) body[f.k] = v;
+            }
+        });
+        if (!Object.keys(body).length) { $('settings-msg').textContent = '没有改动'; return; }
+        $('settings-msg').textContent = '保存中…';
+        api('PUT', '/api/settings', body).then(function (res) {
+            if (res.ok) {
+                $('settings-msg').textContent = '✓ 已生效并落盘';
+                setTimeout(function () { $('settings-msg').textContent = ''; }, 3000);
+                refresh();
+            } else {
+                $('settings-msg').textContent = errMsg(res, '保存失败');
+            }
+        });
+    }
+
+    function restartGateway() {
+        var d = (S.settings && S.settings.hot && S.settings.hot.drain_secs) ? S.settings.hot.drain_secs.value : 5;
+        if (!confirm('重启网关？排空约 ' + d + ' 秒后进程退出——需要有守护进程（start.sh / launchd / systemd / docker --restart）才会自动拉起。')) return;
+        $('settings-msg').textContent = '重启中…';
+        api('POST', '/api/admin/restart').then(function (res) {
+            if (res.status !== 202) { $('settings-msg').textContent = errMsg(res, '重启请求失败'); return; }
+            var tries = 0;
+            var iv = setInterval(function () {
+                tries++;
+                fetch('/health').then(function (r) {
+                    if (r.ok) { clearInterval(iv); $('settings-msg').textContent = '✓ 网关已重启'; refresh(); }
+                }).catch(function () {});
+                if (tries > 30) { clearInterval(iv); $('settings-msg').textContent = '超时——若没有守护进程，请手动启动网关'; }
+            }, 1000);
+        });
+    }
+
+    $('settings-save').addEventListener('click', saveSettings);
+    $('restart-btn').addEventListener('click', restartGateway);
+
+    // ---------- 启动 + 轮询 ----------
     refresh();
+    setInterval(refresh, 10000);
 })();
 </script>
 </body>

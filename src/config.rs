@@ -51,6 +51,14 @@ pub struct AppConfig {
     /// 文件不存在 → 从本配置的 SAP_* 环境变量合成单系统 `default`（存量路径）；
     /// 存在 → 系统集合完全由该文件定义（见 systems.rs）。
     pub systems_file: std::path::PathBuf,
+    /// 网关设置文件路径（`SAP_GATEWAY_FILE`，默认 `./sap_gateway.toml`）。
+    /// `[gateway]` 表存运行期热改的网关设置（PUT /api/settings 维护），
+    /// 优先级 **文件 > 环境变量 > 默认值**（见 settings.rs overlay_from_file）。
+    /// 独立于 sap_systems.toml——网关设置与系统集合互不牵连。
+    pub gateway_file: std::path::PathBuf,
+    /// 默认语言（`SAP_LANG`，文档/接口读取的 ?lang 缺省；连接语言在
+    /// conn_params 的 LANG 里）。运行期可经 PUT /api/settings 热改。
+    pub lang: String,
     /// 引导式配置（`SAP_SETUP`，默认开启；off/false/0/no 关闭）：
     /// 仅在**未配置任何系统**时允许 `POST /api/setup/system` 写入
     /// sap_systems.toml 并热加载（见 setup.rs）。配置完成后端点自动锁定——
@@ -93,7 +101,8 @@ pub(crate) fn write_private_file(path: &std::path::Path, content: &str) -> Resul
     }
     #[cfg(not(unix))]
     {
-        std::fs::write(path, content).map_err(|e| format!("写文件失败 ({}): {}", path.display(), e))?;
+        std::fs::write(path, content)
+            .map_err(|e| format!("写文件失败 ({}): {}", path.display(), e))?;
         Ok(())
     }
 }
@@ -240,6 +249,10 @@ pub fn load() -> Result<AppConfig, String> {
     let systems_file = std::path::PathBuf::from(
         env::var("SAP_SYSTEMS_FILE").unwrap_or_else(|_| "sap_systems.toml".to_string()),
     );
+    // 网关设置文件（默认工作目录下的 sap_gateway.toml；运行期热设置落盘处）
+    let gateway_file = std::path::PathBuf::from(
+        env::var("SAP_GATEWAY_FILE").unwrap_or_else(|_| "sap_gateway.toml".to_string()),
+    );
 
     // 键为 'static 字面量，值使用环境变量的 String（运行期存活）。
     // 未配置模式 → 空表（系统集合由 setup API 写入 toml 后热加载）。
@@ -252,10 +265,10 @@ pub fn load() -> Result<AppConfig, String> {
             ("CLIENT", client),
             ("USER", user),
             ("PASSWD", passwd),
-            ("LANG", lang),
+            ("LANG", lang.clone()),
         ]
     };
-    Ok(AppConfig {
+    let cfg = AppConfig {
         conn_params,
         listen_addr,
         pool_size,
@@ -272,10 +285,15 @@ pub fn load() -> Result<AppConfig, String> {
         runtime_mode,
         update_check,
         systems_file,
+        gateway_file,
         setup_enabled,
         setup_force,
         open_browser,
-    })
+        lang,
+    };
+    // sap_gateway.toml 的 [gateway] 表覆盖 env（文件 > env > 默认；settings.rs）。
+    // 在此之后 cfg 即"生效配置"——热态、静态快照全部从这里初始化。
+    crate::settings::overlay_from_file(cfg)
 }
 
 #[cfg(test)]
