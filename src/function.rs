@@ -139,7 +139,9 @@ impl RfcFunction {
                 self.handle,
                 name_uc.as_ptr(),
                 value_uc.as_ptr(),
-                value.chars().count() as c_int,
+                // 长度单位是 UTF-16 代码单元：非 BMP 字符（部分 HR 人名生僻字）
+                // 占 2 个单元，chars().count() 会少算一半导致静默截断。
+                value.encode_utf16().count() as c_int,
                 &mut error_info,
             );
             check_rc(rc, &error_info)
@@ -354,7 +356,9 @@ impl RfcRow {
                 self.handle,
                 name_uc.as_ptr(),
                 value_uc.as_ptr(),
-                value.chars().count() as c_int,
+                // 长度单位是 UTF-16 代码单元：非 BMP 字符（部分 HR 人名生僻字）
+                // 占 2 个单元，chars().count() 会少算一半导致静默截断。
+                value.encode_utf16().count() as c_int,
                 &mut error_info,
             );
             check_rc(rc, &error_info)
