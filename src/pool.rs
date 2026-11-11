@@ -52,6 +52,19 @@ fn should_discard(err: &RfcError) -> bool {
     RECONNECT_RC.contains(&err.code)
 }
 
+/// 池等待的实际上限：`min(ACQUIRE_TIMEOUT, budget - ACQUIRE_GRACE)`，
+/// 下限 500ms（极小的 per-request timeout 也不至于让池等待立即失败）。
+/// None（探测/管理路径，无外层超时语义）→ 仅 ACQUIRE_TIMEOUT。
+fn acquire_cap(budget: Option<std::time::Duration>) -> std::time::Duration {
+    budget
+        .map(|b| {
+            ACQUIRE_TIMEOUT
+                .min(b.saturating_sub(ACQUIRE_GRACE))
+                .max(std::time::Duration::from_millis(500))
+        })
+        .unwrap_or(ACQUIRE_TIMEOUT)
+}
+
 /// 默认的空闲校验阈值：连接归还后空闲超过 30s，下次借出前先 ping 一遍。
 /// 热路径（连续调用间隔 < 30s）不产生任何额外开销。
 const DEFAULT_IDLE_VALIDATE: std::time::Duration = std::time::Duration::from_secs(30);
@@ -60,6 +73,10 @@ const DEFAULT_IDLE_VALIDATE: std::time::Duration = std::time::Duration::from_sec
 const WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 /// acquire 的总等待上限：超过则返回错误，避免池耗尽时调用方永久挂起。
 const ACQUIRE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+/// 池等待预算相对外层请求超时的提前量：保证「池耗尽」错误先于外层 504
+/// 到达调用方——否则 ACQUIRE_TIMEOUT(120s) > 默认请求超时(60s)，池耗尽
+/// 永远被误报成"SAP 调用超时"（2026-11-11 REVIEW R4）。
+const ACQUIRE_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// 空闲连接：记录归还时刻，借出时据此判断是否需要先 ping 校验。
 struct IdleConn {
@@ -178,7 +195,7 @@ impl RfcConnectionPool {
     where
         F: FnMut(&RfcConnection) -> Result<R, RfcError>,
     {
-        self.with_connection_opts(true, f)
+        self.with_connection_opts(true, None, f)
     }
 
     /// [`Self::with_connection`] 的可配重试版：`retry_enabled=false` 时只尝试
@@ -187,7 +204,17 @@ impl RfcConnectionPool {
     /// 为什么需要关重试：重试发生在「函数可能已执行、响应丢失」的场景——
     /// 过账类写 BAPI 被重跑就是双执行（2026-11-05 审计 P0）。调用方（写操作）
     /// 应传 false；重试是否发生由 `rfc_call_retries_total` 指标 + warn 日志观察。
-    pub fn with_connection_opts<R, F>(&self, retry_enabled: bool, mut f: F) -> Result<R, RfcError>
+    ///
+    /// `acquire_budget`：调用方（请求层）给池等待的预算上限，取
+    /// `min(ACQUIRE_TIMEOUT, budget - ACQUIRE_GRACE)`——比外层请求超时提前少许
+    /// 放弃，让 503 POOL_EXHAUSTED 先于 504 到达调用方；None = 仅 ACQUIRE_TIMEOUT
+    /// （探测/管理路径，无外层请求超时语义）。
+    pub fn with_connection_opts<R, F>(
+        &self,
+        retry_enabled: bool,
+        acquire_budget: Option<std::time::Duration>,
+        mut f: F,
+    ) -> Result<R, RfcError>
     where
         F: FnMut(&RfcConnection) -> Result<R, RfcError>,
     {
@@ -209,7 +236,7 @@ impl RfcConnectionPool {
                 None => {
                     conn_epoch = self.epoch.load(Ordering::SeqCst);
                     let got = if attempt == 1 {
-                        self.acquire(conn_epoch) // 首轮：复用空闲或按需新建
+                        self.acquire(conn_epoch, acquire_budget) // 首轮：复用空闲或按需新建
                     } else {
                         self.create_and_count() // 重试轮：保证新鲜，不碰空闲栈
                     };
@@ -297,13 +324,20 @@ impl RfcConnectionPool {
     /// 只能等业务调用撞上 `RFC_INVALID_HANDLE`。校验把这次失败提前到借出时，
     /// 业务请求拿到的永远是已确认可达的连接。校验失败 → 丢弃该连接，继续取下一个。
     ///
-    /// 等待有总超时上限（ACQUIRE_TIMEOUT），避免池耗尽时调用方永久挂起。
+    /// 等待有总超时上限（`min(ACQUIRE_TIMEOUT, budget - ACQUIRE_GRACE)`，见
+    /// [`ACQUIRE_GRACE`]），避免池耗尽时调用方永久挂起、或被外层请求超时
+    /// 误报为 504。
     ///
     /// `epoch` 为调用方当前代次：栈里落后代次的连接（reload 之前建立的）
     /// 直接丢弃后继续取，保证借出的连接一定属于当前代次。
-    fn acquire(&self, epoch: u64) -> Result<RfcConnection, RfcError> {
+    fn acquire(
+        &self,
+        epoch: u64,
+        budget: Option<std::time::Duration>,
+    ) -> Result<RfcConnection, RfcError> {
         let mut guard = self.inner.lock().map_err(|e| poison_err("连接池锁", e))?;
-        let deadline = std::time::Instant::now() + ACQUIRE_TIMEOUT;
+        let cap = acquire_cap(budget);
+        let deadline = std::time::Instant::now() + cap;
         loop {
             // 有空闲：pop 出来
             if let Some(entry) = guard.idle.pop() {
@@ -352,16 +386,19 @@ impl RfcConnectionPool {
                     }
                 }
             }
-            // 已达上限且无空闲：等待归还（累计不超过 ACQUIRE_TIMEOUT）
+            // 已达上限且无空闲：等待归还（累计不超过 cap）
             let now = std::time::Instant::now();
             if now >= deadline {
+                // 503 + POOL_EXHAUSTED：与「SAP 调用超时」(504) 区分开，
+                // 池耗尽 = 容量问题，运维应调 SAP_POOL_SIZE 而非排查 SAP 慢
                 return Err(RfcError {
                     code: -1,
+                    status: 503,
+                    key: "POOL_EXHAUSTED".into(),
                     message: format!(
-                        "从连接池获取连接超时（等待 {:?}，池上限 {} 已耗尽）",
-                        ACQUIRE_TIMEOUT, self.max_size
+                        "连接池已耗尽（池上限 {}，等待 {:?} 未获连接）；调大 SAP_POOL_SIZE 或减少并发",
+                        self.max_size, cap
                     ),
-                    ..Default::default()
                 });
             }
             let wait_slice = deadline.saturating_duration_since(now).min(WAIT_TIMEOUT);
@@ -552,5 +589,40 @@ mod tests {
             };
             assert!(!should_discard(&err), "code={} 不应触发丢弃", rc);
         }
+    }
+
+    #[test]
+    fn acquire_cap_respects_budget_and_grace() {
+        use std::time::Duration;
+        // 无预算（探测/管理路径）→ 仅硬上限
+        assert_eq!(acquire_cap(None), ACQUIRE_TIMEOUT);
+        // 默认请求超时 60s → 提前 ACQUIRE_GRACE 放弃，保证先于外层 504
+        assert_eq!(
+            acquire_cap(Some(Duration::from_secs(60))),
+            Duration::from_secs(59)
+        );
+        // 超大预算 → 仍受 ACQUIRE_TIMEOUT 硬上限约束
+        assert_eq!(
+            acquire_cap(Some(Duration::from_secs(1800))),
+            ACQUIRE_TIMEOUT
+        );
+        // 极小预算 → 不低于 500ms 下限（不至于立即失败）
+        assert_eq!(
+            acquire_cap(Some(Duration::from_secs(1))),
+            Duration::from_millis(500)
+        );
+    }
+
+    #[test]
+    fn pool_exhausted_error_is_not_retried() {
+        // POOL_EXHAUSTED 用 code=-1，不在 RECONNECT_RC 里：
+        // with_connection_opts 不得对池耗尽做退避重试（否则等待预算被放大 3 倍）
+        let err = RfcError {
+            code: -1,
+            status: 503,
+            key: "POOL_EXHAUSTED".into(),
+            ..Default::default()
+        };
+        assert!(!should_discard(&err), "POOL_EXHAUSTED 不应触发重试");
     }
 }

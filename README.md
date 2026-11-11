@@ -172,10 +172,10 @@ curl -X POST http://127.0.0.1:3000/api/rfc \
 
 | Item | Notes |
 |---|---|
-| Concurrency | Multi-connection pool (default 8, configurable via `SAP_POOL_SIZE`); SAP calls from different requests run in parallel; when the pool is exhausted, `acquire` waits up to 120s. Connections idle longer than `SAP_POOL_IDLE_VALIDATE_SECS` (default 30s) are `RFC_PING`-validated before reuse — zombie connections discarded by SAP-side restarts are caught at checkout instead of poisoning the first requests. Connection/create failures are retried by error code (up to 3 rounds with 300ms backoff; retries always use freshly created connections), making SAP warm-up windows (license check, half-ready CPIC) transparent to callers |
+| Concurrency | Multi-connection pool (default 8, configurable via `SAP_POOL_SIZE`); SAP calls from different requests run in parallel; when the pool is exhausted, `acquire` waits up to `min(120s, request timeout - 1s)` and then fails with `503 POOL_EXHAUSTED` (distinct from the 504 of a slow SAP call). Connections idle longer than `SAP_POOL_IDLE_VALIDATE_SECS` (default 30s) are `RFC_PING`-validated before reuse — zombie connections discarded by SAP-side restarts are caught at checkout instead of poisoning the first requests. Connection/create failures are retried by error code (up to 3 rounds with 300ms backoff; retries always use freshly created connections), making SAP warm-up windows (license check, half-ready CPIC) transparent to callers |
 | Character set | Bridges SAP UC via UTF-16; UTF-8 input and output |
 | Platforms | Windows/Linux/macOS × x86_64/aarch64 (`build.rs` auto-selects the SDK subdirectory) |
-| RFC call timeout | The connection-pool layer has an acquire timeout (120s); a single RFC call has no execution timeout yet |
+| RFC call timeout | Default 60s per call (`SAP_REQUEST_TIMEOUT_SECS`); `/api/rfc` accepts a per-request `timeout_secs` override; on timeout the call returns 504. The connection pool has its own acquire cap |
 
 ---
 
@@ -391,6 +391,8 @@ The caller decides the type via the JSON literal or an explicit `type`; the serv
 ```
 
 > 💡 **Type control for table/structure outputs**: fields are read as strings by default (backwards compatible). Adding `"auto":true` to a field makes the server pick the getter by the DDIC true type (INT→integer, FLOAT→float, INT8→i64, BYTE/XSTRING→Base64, otherwise string), preserving numeric/binary semantics.
+
+> Top-level keys outside the contract (e.g. a typo like `table_input`) are **not rejected** but echoed back in the response's `unknown_fields` array — check it when a parameter seems to have no effect.
 
 Fields you don't read (e.g. you didn't pass `table_outputs`) do **not** appear in the response (the `tables` object is empty).
 

@@ -263,7 +263,7 @@ where
     let hook_sys = Arc::clone(&sys);
     let mut f = f;
     let join = tokio::task::spawn_blocking(move || {
-        pool.with_connection(|conn| {
+        pool.with_connection_opts(true, Some(timeout), |conn| {
             let r = f(conn);
             if r.is_ok() && hook_sys.sysid().is_none() {
                 match conn.system_info() {
@@ -347,7 +347,7 @@ where
         // 无法从外面取消——堆积只能靠这个 gauge 暴露（tokio 阻塞池 512 线程
         // 耗尽 = 全部 RFC 工作冻结，含 /ready 与探测）
         gauge!("sap_blocking_tasks_current", "system" => hook_sys.name.clone()).increment(1);
-        let r = pool.with_connection_opts(retry_enabled, |conn| {
+        let r = pool.with_connection_opts(retry_enabled, Some(timeout), |conn| {
             let r = f(conn);
             if r.is_ok() && hook_sys.sysid().is_none() {
                 match conn.system_info() {

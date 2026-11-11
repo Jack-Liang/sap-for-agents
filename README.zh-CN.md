@@ -173,10 +173,10 @@ curl -X POST http://127.0.0.1:3000/api/rfc \
 
 | 项 | 说明 |
 |---|---|
-| 并发 | 多连接池（默认 8，`SAP_POOL_SIZE` 可配），不同请求可并行执行 SAP 调用；池耗尽时 acquire 等待上限 120s。空闲超过 `SAP_POOL_IDLE_VALIDATE_SECS`（默认 30s）的连接借出前先 `RFC_PING` 校验——SAP 端重启造成的僵尸连接在借出时即被丢弃，不再污染空闲后的首批请求。连接/建连失败按错误码有界重试（最多 3 轮、每轮 300ms 退避，重试只用新建连接），SAP 暖机窗口（license 校验等）的瞬断对调用方透明 |
+| 并发 | 多连接池（默认 8，`SAP_POOL_SIZE` 可配），不同请求可并行执行 SAP 调用；池耗尽时 acquire 等待上限 `min(120s, 请求超时 - 1s)`，随后返回 `503 POOL_EXHAUSTED`（与 SAP 慢的 504 区分开）。空闲超过 `SAP_POOL_IDLE_VALIDATE_SECS`（默认 30s）的连接借出前先 `RFC_PING` 校验——SAP 端重启造成的僵尸连接在借出时即被丢弃，不再污染空闲后的首批请求。连接/建连失败按错误码有界重试（最多 3 轮、每轮 300ms 退避，重试只用新建连接），SAP 暖机窗口（license 校验等）的瞬断对调用方透明 |
 | 字符集 | 通过 UTF-16 桥接 SAP UC，UTF-8 输入输出 |
 | 平台 | Windows/Linux/macOS × x86_64/aarch64（`build.rs` 自动选 SDK 子目录） |
-| RFC 调用超时 | 连接池层有 acquire 超时（120s）；单次 RFC 调用暂无执行超时 |
+| RFC 调用超时 | 单次调用默认 60s（`SAP_REQUEST_TIMEOUT_SECS`），`/api/rfc` 可用 `timeout_secs` per-request 覆盖；超时返回 504。连接池另有 acquire 上限 |
 
 ---
 
@@ -391,6 +391,8 @@ curl -H "Authorization: Bearer $SAP_API_KEY" \
 ```
 
 > 💡 **表/结构体输出的类型控制**：字段默认按字符串读（向后兼容）。给字段加 `"auto":true` 后，服务端按 DDIC 真实类型选择 getter（INT→整数、FLOAT→浮点、INT8→i64、BYTE/XSTRING→Base64、其余→字符串），保留数值/二进制语义。
+
+> 契约之外的顶层键（如拼错的 `table_input`）**不会被拒绝**，但会在响应的 `unknown_fields` 数组里回显——参数似乎没生效时先查它。
 
 未读取的字段（如没传 `table_outputs`）在响应中对应键**不出现**（`tables` 为空对象）。
 
