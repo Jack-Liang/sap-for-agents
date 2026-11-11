@@ -60,6 +60,4 @@ An unauthorized call returning `403` confirms the privilege boundary is in effec
 - SAP's authorization system (`S_RFC`) aggregates by **function group** (a few dozen rules vs. thousands of functions), with a granularity aligned to business capabilities.
 - A gateway-layer allowlist is an optional "second gate" (L2, filtering by group prefix). L1 (SAP authorizations) is the **first and most effective** layer.
 
-## Gateway-Layer Supplement (Optional L2)
-
-If you want "an extra gate at the gateway even when the SAP account has broad privileges," you can filter by function group prefix by configuring `SAP_ALLOWED_GROUPS`. In most cases L1 is sufficient; apply L2 as the situation requires.
+> Note: the gateway currently does NOT implement an L2 filter; the privilege boundary rests entirely on SAP-side authorizations.
