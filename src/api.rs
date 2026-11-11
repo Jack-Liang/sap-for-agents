@@ -307,6 +307,39 @@ pub struct InvokeResponse {
     /// BAPI 消息字段语义固定为字符串，保持 String 类型。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub return_table: Option<Vec<HashMap<String, String>>>,
+    /// 请求体里不属于 InvokeRequest 的顶层键（serde 静默忽略它们，调用方
+    /// 常因拼写错误误以为参数已生效）——HTTP 层回显警告；空则不出现。
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub unknown_fields: Vec<String>,
+}
+
+/// InvokeRequest 的合法顶层键（与 serde 字段一致；新增字段时同步）。
+const KNOWN_REQUEST_KEYS: &[&str] = &[
+    "func_name",
+    "inputs",
+    "table_inputs",
+    "struct_inputs",
+    "int_outputs",
+    "string_outputs",
+    "auto_outputs",
+    "table_outputs",
+    "struct_outputs",
+    "read_return",
+    "timeout_secs",
+    "retry",
+];
+
+/// 找出请求体里不属于 InvokeRequest 的顶层键（2026-11-11 REVIEW R10：
+/// 未知键被 serde 静默忽略，拼写错误表现为"调用成功但参数没生效"）。
+pub fn unknown_request_keys(body: &serde_json::Value) -> Vec<String> {
+    match body.as_object() {
+        Some(map) => map
+            .keys()
+            .filter(|k| !KNOWN_REQUEST_KEYS.contains(&k.as_str()))
+            .cloned()
+            .collect(),
+        None => Vec::new(),
+    }
 }
 
 /// 默认长度（元数据未命中且调用方未指定时的回退值）
@@ -662,6 +695,7 @@ where
         tables,
         structs,
         return_table,
+        unknown_fields: Vec::new(),
     })
 }
 
@@ -1406,5 +1440,38 @@ mod tests {
         // 正常值不受影响
         let m: MaxLen = serde_json::from_str("255").unwrap();
         assert_eq!(m.resolve(), Some(255));
+    }
+
+    #[test]
+    fn unknown_request_keys_flags_typos_only() {
+        // 合法键不报；拼写错误（table_input）被点名
+        let body = serde_json::json!({
+            "func_name": "STFC_CONNECTION",
+            "inputs": {"REQUTEXT": "hi"},
+            "table_input": {},
+            "retry": false
+        });
+        assert_eq!(unknown_request_keys(&body), vec!["table_input"]);
+        // 全合法 → 空
+        let ok = serde_json::json!({"func_name": "X", "read_return": true, "timeout_secs": 30});
+        assert!(unknown_request_keys(&ok).is_empty());
+        // 非对象 → 空（契约错误由反序列化路径报）
+        assert!(unknown_request_keys(&serde_json::json!([])).is_empty());
+    }
+
+    #[test]
+    fn invoke_response_omits_empty_unknown_fields() {
+        // 无未知键时响应不出现 unknown_fields（向后兼容）
+        let resp = InvokeResponse {
+            func: "X".into(),
+            scalars: Default::default(),
+            tables: Default::default(),
+            structs: Default::default(),
+            return_table: None,
+            unknown_fields: Vec::new(),
+        };
+        assert!(!serde_json::to_string(&resp)
+            .unwrap()
+            .contains("unknown_fields"));
     }
 }

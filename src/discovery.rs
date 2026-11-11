@@ -1070,6 +1070,7 @@ mod tests {
             scalars: Default::default(),
             structs: Default::default(),
             return_table: None,
+            unknown_fields: Vec::new(),
             tables: HashMap::from([
                 (
                     "IMPORT_PARAMETER".to_string(),

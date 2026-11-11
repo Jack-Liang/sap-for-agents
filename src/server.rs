@@ -1183,17 +1183,28 @@ fn mask_value(key: &str, value: &ScalarValue) -> String {
 async fn invoke_handler(
     sap: Sap,
     axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
-    req: Result<Json<InvokeRequest>, axum::extract::rejection::JsonRejection>,
+    req: Result<Json<serde_json::Value>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Json<InvokeResponse>, RfcError> {
     let caller_ip = addr.ip().to_string();
-    // JSON 解析/反序列化失败 → 统一错误格式（status 取 axum 语义码，body_text 作 message）
-    let Json(req) = req.map_err(|r| RfcError {
+    // JSON 解析失败 → 统一错误格式（status 取 axum 语义码，body_text 作 message）
+    let Json(body) = req.map_err(|r| RfcError {
         code: -1,
         status: r.status().as_u16(),
         message: r.body_text(),
         key: "JSON_INVALID".into(),
     })?;
-    run_invoke_and_log(sap.arc(), caller_ip, req, "rfc", None).await
+    // 未知顶层键警告回显（serde 静默忽略它们，拼写错误表现为"参数没生效"）；
+    // 只警告不拒绝——硬拒绝会破坏一直在传冗余键的存量调用方
+    let unknowns = crate::api::unknown_request_keys(&body);
+    let req: InvokeRequest = serde_json::from_value(body).map_err(|e| RfcError {
+        code: -1,
+        status: 400,
+        message: format!("请求体与 /api/rfc 契约不符: {e}"),
+        key: "JSON_INVALID".into(),
+    })?;
+    let mut resp = run_invoke_and_log(sap.arc(), caller_ip, req, "rfc", None).await?;
+    resp.0.unknown_fields = unknowns;
+    Ok(resp)
 }
 
 /// POST /api/functions/{name}/invoke —— 类型化调用（函数名来自路径，请求体免填 func_name）。
@@ -1224,6 +1235,7 @@ async fn function_invoke_handler(
         key: "JSON_INVALID".into(),
     })?;
     // 函数名以路径为准（body 里的 func_name 被覆盖）
+    let unknowns = crate::api::unknown_request_keys(&body);
     body["func_name"] = serde_json::json!(func);
     let req: InvokeRequest = serde_json::from_value(body).map_err(|e| RfcError {
         code: -1,
@@ -1231,7 +1243,9 @@ async fn function_invoke_handler(
         message: format!("请求体与 /api/rfc 契约不符: {e}"),
         key: "JSON_INVALID".into(),
     })?;
-    run_invoke_and_log(sap.arc(), caller_ip, req, "functions-invoke", None).await
+    let mut resp = run_invoke_and_log(sap.arc(), caller_ip, req, "functions-invoke", None).await?;
+    resp.0.unknown_fields = unknowns;
+    Ok(resp)
 }
 
 // ========================================================================

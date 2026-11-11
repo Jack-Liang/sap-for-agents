@@ -689,6 +689,7 @@ mod tests {
             tables,
             structs,
             return_table: None,
+            unknown_fields: Vec::new(),
         }
     }
 
