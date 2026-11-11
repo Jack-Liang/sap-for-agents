@@ -72,7 +72,8 @@ pub fn tools_manifest() -> Vec<Value> {
                 "auto_outputs": { "type": "array", "description": "EXPORT scalar params to read by true type", "items": { "type": "string" } },
                 "table_outputs": { "type": "object", "description": "EXPORT tables to traverse → field list" },
                 "read_return": { "type": "boolean", "description": "Auto-read the BAPI RETURN table" },
-                "timeout_secs": { "type": "integer", "description": "Per-call timeout override (≥1)" }
+                "timeout_secs": { "type": "integer", "description": "Per-call timeout override (≥1)" },
+                "retry": { "type": "boolean", "description": "Auto-retry communication-class errors on a fresh connection (default true). Pass false for posting-type write BAPIs to prevent double execution when the response is lost" }
             }, "required": ["func_name"] }
         }),
         json!({
@@ -826,6 +827,12 @@ mod tests {
         }
         let invoke = tools.iter().find(|t| t["name"] == "invoke_rfc").unwrap();
         assert_eq!(invoke["inputSchema"]["required"][0], "func_name");
+        // retry 必须出现在 schema 里：写 BAPI 调用方需要显式传 false 防双执行
+        // （字段本就存在于 InvokeRequest，仅 schema 曾漏声明）
+        assert!(
+            invoke["inputSchema"]["properties"]["retry"].is_object(),
+            "invoke_rfc 缺 retry 属性"
+        );
     }
 
     #[test]
