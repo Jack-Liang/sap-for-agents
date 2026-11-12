@@ -79,9 +79,17 @@ jobs:
   # advisory 库。无需 Rust 工具链与 SAP SDK，只读 lock 文件。
   audit:
     runs-on: ubuntu-latest
+    # audit-check 用 token 写 check-run 汇报结果——workflow 级最小权限
+    # （contents: read）下会 403 "Resource not accessible by integration"，
+    # 故仅此 job 提升 checks: write，其余 job 不受影响。
+    permissions:
+      checks: write
+      contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      # SHA 对应 v2.0.0（与其他 action 同样按 SHA 固定）
-      - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
+      # SHA 固定在 main 的 node24 提交（858dc40，2026-03-20）：v2.0.0 还是
+      # node20 运行时（已废弃，只产生警告）；该提交仅改 node 运行时与文档，
+      # 无逻辑变化。上游发新版后可换回正式 tag 的 SHA。
+      - uses: rustsec/audit-check@858dc40f52ca2b8570b7a997c1c4e35c6fc9a432
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
