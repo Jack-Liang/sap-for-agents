@@ -7,6 +7,12 @@
 //!
 //! 用的都是安全只读 RFC（STFC_CONNECTION、RFC_FUNCTION_SEARCH、BAPI_USER_GETLIST），
 //! 不会修改 SAP 数据。
+//!
+//! ⚠️ 运行策略（2026-11-18 实证）：在退化的 A4H trial（ICM 会话抖动）上，
+//! ⚠️ 63 个测试马拉松式连跑会让 write-heavy 用例集体撞 ICM "Service cannot
+//! ⚠️ be reached"（连 SIGKILL 已改 SIGTERM 排水也扛不住纯写入量）。请分批
+//! ⚠️ 串行跑：`--test-threads=1` + 按前缀过滤（如先 objects 再 package 再
+//! ⚠️ mcp），批间静默 1-2 分钟；失败用例单独重跑即绿即正确。
 
 mod common;
 
@@ -23,7 +29,29 @@ struct ServerHandle {
 
 impl Drop for ServerHandle {
     fn drop(&mut self) {
-        // 强制 kill 子进程（SIGKILL），再 wait 回收
+        // SIGTERM 优雅停机（网关有 drain 路径：在途请求跑完、ADT 会话随进程
+        // 干净收尾）——SIGKILL 会把在途 stateful ADT 会话留成孤儿，trial ICM
+        // 被连环孤儿会话拖进 "Service cannot be reached" 写失败抖动（2026-11-18
+        // 实证：全套件连跑两次即触发）。SIGTERM 后短暂等待，仍存活才 SIGKILL。
+        #[cfg(unix)]
+        {
+            let _ = Command::new("kill")
+                .arg("-TERM")
+                .arg(self.child.id().to_string())
+                .output();
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = self.child.kill();
+        }
+        let deadline = Instant::now() + Duration::from_secs(8);
+        while Instant::now() < deadline {
+            match self.child.try_wait() {
+                Ok(Some(_)) => return,
+                Ok(None) => std::thread::sleep(Duration::from_millis(100)),
+                Err(_) => break,
+            }
+        }
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
