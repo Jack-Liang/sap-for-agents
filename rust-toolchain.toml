@@ -1,0 +1,8 @@
+# 工具链锁定：本地与 CI（dtolnay/rust-toolchain 无 toolchain 输入时读本文件）
+# 强制同版本——clippy 新 lint 只在主动升级本文件时才影响 CI（2026-11-18 实证：
+# 浮动 stable 让 CI 1.100 的 unnecessary_sort_by 在本地 1.94 不可见，推送即红）。
+# 升级方式：改 channel 一行 → 本地 rustup update → 全量 clippy 过一遍再推。
+[toolchain]
+channel = "1.100.0"
+profile = "minimal"
+components = ["clippy"]
