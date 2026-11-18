@@ -176,7 +176,8 @@ async fn runtime_mode_guard(
 }
 
 /// 只读模式下该请求是否应被拦截（纯函数，便于单测）。
-fn is_read_only_blocked(method: &axum::http::Method, path: &str) -> bool {
+fn is_read_only_blocked(method: &axum::http::Method, uri: &axum::http::Uri) -> bool {
+    let path = uri.path();
     if path.starts_with("/api/adt/") {
         return crate::adt::is_write_method(method);
     }
@@ -190,6 +191,27 @@ fn is_read_only_blocked(method: &axum::http::Method, path: &str) -> bool {
             let last = path.rsplit('/').next();
             return last == Some("replace") || last == Some("create");
         }
+    }
+    // 导入是整批写操作；唯一例外 dry_run=true（零写入预检，handler 内有
+    // 二次校验兜底：dry_run 时绝不触碰写管线）
+    if path.starts_with("/api/import/") && *method == axum::http::Method::POST {
+        return !uri
+            .query()
+            .map(|q| {
+                q.split('&')
+                    .any(|kv| kv == "dry_run=true" || kv.starts_with("dry_run=true&"))
+            })
+            .unwrap_or(false);
+    }
+    // sapcli 借鉴批次（v0.21）：abap run 创建临时对象（随后删掉——但创建
+    // 本身就是写，只读系统一个对象都不该生出来）；CTS create/release/delete
+    // 是传输域写操作。aunit/atc/osql/search 是执行或只读，不拦（同 /api/rfc 哲学）。
+    // 注：path 可能带作用域前缀（/api/s/{sys}/…），用后缀匹配两种形态。
+    if *method == axum::http::Method::POST && path.ends_with("/abap/run") {
+        return true;
+    }
+    if path.contains("/cts/") && *method != axum::http::Method::GET {
+        return true;
     }
     false
 }
@@ -214,7 +236,7 @@ async fn read_only_guard(
         // v0.20：全局只读热开关（PUT /api/settings）——与系统级取 OR，
         // 系统级 read_only 不能被全局放开
         || crate::settings::current().read_only;
-    if read_only && is_read_only_blocked(req.method(), req.uri().path()) {
+    if read_only && is_read_only_blocked(req.method(), req.uri()) {
         return Err(RfcError {
             code: -1,
             status: 403,
@@ -447,6 +469,15 @@ pub fn app(state: SharedState) -> Router {
         .merge(crate::registry::router())
         // 交付端口（v0.13：注册表条目的平坦化调用，消费方免学 SAP 方言）
         .merge(crate::invoke::router())
+        // 包级导出（abapGit 风格文件树 zip）：GET /api/export/package/{devclass}
+        .merge(crate::export::router())
+        // 包级导入（abapGit 反序列化模型移植）：POST /api/import/package/{devclass}
+        .merge(crate::import::router())
+        // sapcli 借鉴批次（v0.21）：agent 运行面
+        .merge(crate::explore::router())
+        .merge(crate::cts::router())
+        .merge(crate::run::router())
+        .merge(crate::checks::router())
         // ABAP 对象写入编排（锁→写→解锁→激活一体；replace/syntax 见 dispatcher）
         .route(
             "/api/objects/{*path}",
@@ -728,6 +759,9 @@ async fn systems_handler(
                 "name": s.name,
                 "default": default.as_ref().is_some_and(|d| Arc::ptr_eq(s, d)),
                 "read_only": s.read_only,
+                // 连接鉴权形态（basic | sso2 | snc | sso2+snc）——agent 据此
+                // 判断该系统是密码/票据/SNC 登录（sapcli 借鉴 B1）
+                "auth": s.auth,
                 "adt": s.adt.is_some(),
                 "sysid": s.sysid(),
                 "quarantined": s.is_quarantined(),
@@ -2295,10 +2329,11 @@ fn split_object_path_opts(
         let (n, a) = rest.rsplit_once('/').ok_or_else(|| bad("缺少动作段"))?;
         let act = match a {
             "source" => "source",
+            "meta" => "meta",
             "replace" => "replace",
             "syntax" => "syntax",
             "create" => "create",
-            _ => return Err(bad("动作须为 source/replace/syntax/create")),
+            _ => return Err(bad("动作须为 source/meta/replace/syntax/create")),
         };
         (n, act)
     };
@@ -2484,38 +2519,54 @@ async fn object_write_handler(
 async fn object_get_handler(
     sap: Sap,
     axum::extract::Path(path): axum::extract::Path<String>,
+    axum::extract::Query(q): axum::extract::Query<ObjectMetaQuery>,
 ) -> Result<Json<serde_json::Value>, RfcError> {
     let (obj_type, name, action) = split_object_path(&path)?;
-    if action != "source" {
-        return Err(RfcError {
-            code: -1,
-            status: 400,
-            message: "GET 仅支持 /source".into(),
-            key: "METHOD_ACTION_MISMATCH".into(),
-        });
-    }
     validate_object_name(&name)?;
-    if !obj_type.has_source() {
-        return Err(RfcError {
+    match action {
+        // 元数据动词：存在性/锁/active/changed_by 一次往返（package 也开放）
+        "meta" => {
+            let v = crate::export::read_object_meta(sap.arc(), obj_type, &name, q.group).await?;
+            Ok(Json(v))
+        }
+        "source" => {
+            if !obj_type.has_source() {
+                return Err(RfcError {
+                    code: -1,
+                    status: 400,
+                    message: "该对象类型无源码资源（package 只有元数据）".into(),
+                    key: "NO_SOURCE_RESOURCE".into(),
+                });
+            }
+            let sys = sap.arc();
+            let group = resolve_group_if_needed(&sys, obj_type, &name, None).await?;
+            let adt = sap.adt.as_ref().ok_or_else(crate::adt::adt_disabled)?;
+            let source = crate::objects::read_current_source(adt, obj_type, &name, &group).await?;
+            Ok(Json(serde_json::json!({
+                "type": obj_type.api_name(),
+                "name": name.trim().to_uppercase(),
+                "group": (obj_type.needs_group() && !group.is_empty()).then(|| group.to_uppercase()),
+                "count": source.split('\n').count(),
+                "lines": source.split('\n').map(str::to_string).collect::<Vec<_>>(),
+                "source": source,
+                "source_via": "adt",
+            })))
+        }
+        _ => Err(RfcError {
             code: -1,
             status: 400,
-            message: "该对象类型无源码资源（package 只有元数据）".into(),
-            key: "NO_SOURCE_RESOURCE".into(),
-        });
+            message: "GET 仅支持 /source 与 /meta".into(),
+            key: "METHOD_ACTION_MISMATCH".into(),
+        }),
     }
-    let sys = sap.arc();
-    let group = resolve_group_if_needed(&sys, obj_type, &name, None).await?;
-    let adt = sap.adt.as_ref().ok_or_else(crate::adt::adt_disabled)?;
-    let source = crate::objects::read_current_source(adt, obj_type, &name, &group).await?;
-    Ok(Json(serde_json::json!({
-        "type": obj_type.api_name(),
-        "name": name.trim().to_uppercase(),
-        "group": (obj_type.needs_group() && !group.is_empty()).then(|| group.to_uppercase()),
-        "count": source.split('\n').count(),
-        "lines": source.split('\n').map(str::to_string).collect::<Vec<_>>(),
-        "source": source,
-        "source_via": "adt",
-    })))
+}
+
+/// GET /api/objects/{type}/{name}/meta 的查询参数。
+#[derive(serde::Deserialize, Default)]
+struct ObjectMetaQuery {
+    /// func 的组名提示（缺省自动反解）
+    #[serde(default)]
+    group: Option<String>,
 }
 
 /// DELETE /api/objects/{type}/{name}[?group=&transport=] —— 删除对象。
@@ -3042,51 +3093,103 @@ mod tests {
     #[test]
     fn read_only_blocks_gateway_writes_only() {
         use axum::http::Method;
+        // 签名收口为 &Uri（导入 dry_run 的 query 豁免需要查询串）：
+        // 测试用字符串 → Uri 的小工具
+        fn uri(s: &str) -> axum::http::Uri {
+            s.parse().unwrap()
+        }
         // 拦：objects 全量写 + replace + create + DELETE + ADT 写方法
         assert!(is_read_only_blocked(
             &Method::PUT,
-            "/api/objects/prog/Z/report/source"
+            &uri("/api/objects/prog/Z/report/source")
         ));
         assert!(is_read_only_blocked(
             &Method::POST,
-            "/api/objects/prog/Z/replace"
+            &uri("/api/objects/prog/Z/replace")
         ));
         assert!(is_read_only_blocked(
             &Method::POST,
-            "/api/objects/prog/Z/create"
-        ));
-        assert!(is_read_only_blocked(&Method::DELETE, "/api/objects/prog/Z"));
-        assert!(is_read_only_blocked(
-            &Method::DELETE,
-            "/api/objects/func/Z_FM?group=ZG"
-        ));
-        assert!(is_read_only_blocked(
-            &Method::POST,
-            "/api/adt/oo/classes/zcl_foo/source/main"
+            &uri("/api/objects/prog/Z/create")
         ));
         assert!(is_read_only_blocked(
             &Method::DELETE,
-            "/api/adt/oo/classes/zcl_foo"
+            &uri("/api/objects/prog/Z")
+        ));
+        assert!(is_read_only_blocked(
+            &Method::DELETE,
+            &uri("/api/objects/func/Z_FM?group=ZG")
+        ));
+        assert!(is_read_only_blocked(
+            &Method::POST,
+            &uri("/api/adt/oo/classes/zcl_foo/source/main")
+        ));
+        assert!(is_read_only_blocked(
+            &Method::DELETE,
+            &uri("/api/adt/oo/classes/zcl_foo")
         ));
         // 放行：syntax（不落库）、objects 读（GET source）、ADT 读、rfc、其他端点
         assert!(!is_read_only_blocked(
             &Method::POST,
-            "/api/objects/prog/Z/syntax"
+            &uri("/api/objects/prog/Z/syntax")
         ));
         assert!(!is_read_only_blocked(
             &Method::GET,
-            "/api/objects/prog/Z/source"
+            &uri("/api/objects/prog/Z/source")
         ));
         assert!(!is_read_only_blocked(
             &Method::GET,
-            "/api/adt/runtime/dumps"
+            &uri("/api/adt/runtime/dumps")
         ));
-        assert!(!is_read_only_blocked(&Method::POST, "/api/rfc"));
+        assert!(!is_read_only_blocked(&Method::POST, &uri("/api/rfc")));
         assert!(!is_read_only_blocked(
             &Method::POST,
-            "/api/functions/search"
+            &uri("/api/functions/search")
         ));
-        assert!(!is_read_only_blocked(&Method::POST, "/api/table/read"));
+        // —— sapcli 借鉴批次（v0.21）——
+        // 拦：abap run（创建临时对象）、CTS create/release/delete
+        assert!(is_read_only_blocked(&Method::POST, &uri("/api/abap/run")));
+        assert!(is_read_only_blocked(
+            &Method::POST,
+            &uri("/api/s/prd/abap/run")
+        ));
+        assert!(is_read_only_blocked(
+            &Method::POST,
+            &uri("/api/cts/requests")
+        ));
+        assert!(is_read_only_blocked(
+            &Method::POST,
+            &uri("/api/cts/requests/A4HK900123/release")
+        ));
+        assert!(is_read_only_blocked(
+            &Method::DELETE,
+            &uri("/api/cts/requests/A4HK900123")
+        ));
+        assert!(is_read_only_blocked(
+            &Method::POST,
+            &uri("/api/s/prd/cts/requests")
+        ));
+        // 放行：aunit/atc 执行与只读端点、CTS GET
+        assert!(!is_read_only_blocked(
+            &Method::POST,
+            &uri("/api/tests/aunit")
+        ));
+        assert!(!is_read_only_blocked(&Method::POST, &uri("/api/atc/run")));
+        assert!(!is_read_only_blocked(
+            &Method::POST,
+            &uri("/api/table/osql")
+        ));
+        assert!(!is_read_only_blocked(
+            &Method::GET,
+            &uri("/api/objects/search?q=X")
+        ));
+        assert!(!is_read_only_blocked(
+            &Method::GET,
+            &uri("/api/cts/requests/A4HK900123")
+        ));
+        assert!(!is_read_only_blocked(
+            &Method::POST,
+            &uri("/api/table/read")
+        ));
     }
 
     #[test]
@@ -3339,6 +3442,14 @@ mod tests {
                 adt_base_url: Some(String::new()),
                 adt_user: None,
                 adt_passwd: None,
+                adt_cert: None,
+                adt_key: None,
+                adt_ca: None,
+                adt_sso2: None,
+                adt_oauth_token_url: None,
+                adt_oauth_client_id: None,
+                adt_oauth_client_secret: None,
+                adt_auth_plugin: None,
                 read_only: None,
                 passwd_ref: None,
             },
@@ -3352,6 +3463,14 @@ mod tests {
                 adt_base_url: Some(String::new()),
                 adt_user: None,
                 adt_passwd: None,
+                adt_cert: None,
+                adt_key: None,
+                adt_ca: None,
+                adt_sso2: None,
+                adt_oauth_token_url: None,
+                adt_oauth_client_id: None,
+                adt_oauth_client_secret: None,
+                adt_auth_plugin: None,
                 read_only: Some(true),
                 passwd_ref: None,
             },

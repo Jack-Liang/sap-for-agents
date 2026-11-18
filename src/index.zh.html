@@ -320,6 +320,51 @@ tailwind.config = {
                     <code class="font-code-sm text-code-sm text-on-surface flex-grow">/api/objects/{type}/{name}/replace</code>
                     <span class="font-body-sm text-body-sm text-on-surface-variant whitespace-nowrap">AI 式查找替换编辑</span>
                 </li>
+                <li class="flex items-center gap-md py-sm border-b border-outline-variant/30 last:border-0">
+                    <span class="font-code-sm text-code-sm px-sm py-xs rounded method-get w-16 text-center">GET</span>
+                    <code class="font-code-sm text-code-sm text-on-surface flex-grow">/api/objects/{type}/{name}/meta</code>
+                    <span class="font-body-sm text-body-sm text-on-surface-variant whitespace-nowrap">写前探测：存在 / 锁 / 激活态</span>
+                </li>
+                <li class="flex items-center gap-md py-sm border-b border-outline-variant/30 last:border-0">
+                    <span class="font-code-sm text-code-sm px-sm py-xs rounded method-get w-16 text-center">GET</span>
+                    <code class="font-code-sm text-code-sm text-on-surface flex-grow">/api/export/package/{devclass}</code>
+                    <span class="font-body-sm text-body-sm text-on-surface-variant whitespace-nowrap">包快照 → abapGit 风格 zip</span>
+                </li>
+                <li class="flex items-center gap-md py-sm border-b border-outline-variant/30 last:border-0">
+                    <span class="font-code-sm text-code-sm px-sm py-xs rounded method-post w-16 text-center">POST</span>
+                    <code class="font-code-sm text-code-sm text-on-surface flex-grow">/api/import/package/{devclass}</code>
+                    <span class="font-body-sm text-body-sm text-on-surface-variant whitespace-nowrap">导入包 zip（两阶段激活）</span>
+                </li>
+                <li class="flex items-center gap-md py-sm border-b border-outline-variant/30 last:border-0">
+                    <span class="font-code-sm text-code-sm px-sm py-xs rounded method-get w-16 text-center">GET</span>
+                    <code class="font-code-sm text-code-sm text-on-surface flex-grow">/api/objects/search?q=</code>
+                    <span class="font-body-sm text-body-sm text-on-surface-variant whitespace-nowrap">ADT 全对象类型快搜</span>
+                </li>
+                <li class="flex items-center gap-md py-sm border-b border-outline-variant/30 last:border-0">
+                    <span class="font-code-sm text-code-sm px-sm py-xs rounded method-post w-16 text-center">POST</span>
+                    <code class="font-code-sm text-code-sm text-on-surface flex-grow">/api/table/osql</code>
+                    <span class="font-body-sm text-body-sm text-on-surface-variant whitespace-nowrap">OpenSQL SELECT 直查（数据预览）</span>
+                </li>
+                <li class="flex items-center gap-md py-sm border-b border-outline-variant/30 last:border-0">
+                    <span class="font-code-sm text-code-sm px-sm py-xs rounded method-post w-16 text-center">POST</span>
+                    <code class="font-code-sm text-code-sm text-on-surface flex-grow">/api/abap/run</code>
+                    <span class="font-body-sm text-body-sm text-on-surface-variant whitespace-nowrap">临时执行 ABAP 片段（classrun 类）</span>
+                </li>
+                <li class="flex items-center gap-md py-sm border-b border-outline-variant/30 last:border-0">
+                    <span class="font-code-sm text-code-sm px-sm py-xs rounded method-post w-16 text-center">POST</span>
+                    <code class="font-code-sm text-code-sm text-on-surface flex-grow">/api/tests/aunit</code>
+                    <span class="font-body-sm text-body-sm text-on-surface-variant whitespace-nowrap">跑 ABAP Unit 测试（json / junit4）</span>
+                </li>
+                <li class="flex items-center gap-md py-sm border-b border-outline-variant/30 last:border-0">
+                    <span class="font-code-sm text-code-sm px-sm py-xs rounded method-post w-16 text-center">POST</span>
+                    <code class="font-code-sm text-code-sm text-on-surface flex-grow">/api/atc/run</code>
+                    <span class="font-body-sm text-body-sm text-on-surface-variant whitespace-nowrap">跑 ATC 代码检查，findings 结构化返回</span>
+                </li>
+                <li class="flex items-center gap-md py-sm border-b border-outline-variant/30 last:border-0">
+                    <span class="font-code-sm text-code-sm px-sm py-xs rounded method-post w-16 text-center">POST</span>
+                    <code class="font-code-sm text-code-sm text-on-surface flex-grow">/api/cts/requests</code>
+                    <span class="font-body-sm text-body-sm text-on-surface-variant whitespace-nowrap">创建/释放/删除 CTS 传输请求</span>
+                </li>
             </ul>
         </div>
 

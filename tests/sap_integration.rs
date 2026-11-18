@@ -63,8 +63,33 @@ fn start_server_with_env(extra: &[(&str, &str)]) -> ServerHandle {
 
     cmd.env("SAP_LISTEN_ADDR", &listen_addr)
         .env("RUST_LOG", "warn") // 减少日志噪音
+        // 封闭运行态：屏蔽仓库根的真实 sap_systems.toml / sap_gateway.toml
+        //（v0.20 起 toml 优先于 env——不屏蔽的话默认系统会变成 toml 里的
+        // 非测试系统（如 ed1），所有 RFC/ADT 测试对不上目标）。
+        // 同时生成单系统 "a4h" 的临时 toml：套件里 /api/s/a4h 作用域测试
+        // 依赖这个名字；密码走 ${SAP_PASSWD} 插值（不落明文）。
+        .env(
+            "SAP_GATEWAY_FILE",
+            format!("/tmp/sfa-it-gateway-{}.toml", port),
+        )
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    {
+        let systems_path = format!("/tmp/sfa-it-systems-{}.toml", port);
+        let ashost = std::env::var("SAP_ASHOST").unwrap_or_else(|_| "localhost".into());
+        let sysnr = std::env::var("SAP_SYSNR").unwrap_or_else(|_| "00".into());
+        let client = std::env::var("SAP_CLIENT").unwrap_or_else(|_| "001".into());
+        let user = std::env::var("SAP_USER").unwrap_or_else(|_| "DEVELOPER".into());
+        std::fs::write(
+            &systems_path,
+            format!(
+                "[systems.a4h]\nashost = \"{}\"\nsysnr = \"{}\"\nclient = \"{}\"\nuser = \"{}\"\npasswd = \"${{SAP_PASSWD}}\"\ndefault = true\n",
+                ashost, sysnr, client, user
+            ),
+        )
+        .expect("写临时 systems toml 失败");
+        cmd.env("SAP_SYSTEMS_FILE", &systems_path);
+    }
     for (k, v) in extra {
         cmd.env(k, v);
     }
@@ -1550,6 +1575,7 @@ fn flat_invoke_and_registry_catalog() {
         .put(format!("{}/api/registry/stfc-echo", _s.base_url))
         .json(&serde_json::json!({
             "func_name": "STFC_CONNECTION",
+            "system": "a4h",
             "intent": "connectivity check echo",
             "status": "published"
         }))
@@ -1605,7 +1631,7 @@ fn flat_invoke_and_registry_catalog() {
     let resp = http_client()
         .put(format!("{}/api/registry/bapi-users", _s.base_url))
         .json(&serde_json::json!({
-            "func_name": "BAPI_USER_GETLIST", "status": "published", "max_rows": 5
+            "func_name": "BAPI_USER_GETLIST", "system": "a4h", "status": "published", "max_rows": 5
         }))
         .send()
         .unwrap();
@@ -1694,6 +1720,9 @@ fn registry_file_with_stfc(path: &str) {
             "entries": [{
                 "alias": "stfc-echo",
                 "func_name": "STFC_CONNECTION",
+                // 对齐 start_server_with_env 的临时单系统名（[systems.a4h]）——
+                // 条目缺省 system="default" 在新夹具下 resolve 不到 → 409
+                "system": "a4h",
                 "intent": "echo check",
                 "status": "published",
                 "origin": "manual",
@@ -1788,6 +1817,7 @@ fn doc_field_flows_into_catalog_and_audits_invoke() {
         .put(format!("{}/api/registry/stfc-echo", _s.base_url))
         .json(&serde_json::json!({
             "func_name": "STFC_CONNECTION",
+            "system": "a4h",
             "intent": "echo check",
             "doc": "## Usage\n\nPass `requtext`; the same text comes back as `ECHOTEXT`.",
             "status": "published"
@@ -2048,4 +2078,765 @@ fn signature_change_write_hook_self_heals() {
         .send()
         .unwrap();
     assert_eq!(resp.status(), 200, "清理注册表应成功");
+}
+
+// ========================================================================
+// 包导出与对象元数据动词（abapGit 吸收 MVP）
+// ========================================================================
+
+/// 对象 meta 动词：存在性 / 锁 / active / changed_by 一次往返。
+#[test]
+#[ignore]
+fn object_meta_reports_exists_lock_and_author() {
+    let _s = start_server();
+    // 作用域形式：套件默认系统是远程 ED1（可能不可达），固定打到本机 a4h
+    let sbase = format!("{}/api/s/a4h", _s.base_url);
+    let name = format!("ZMETA_T{}", std::process::id() % 10000);
+
+    // 前置：创建并激活一个临时程序（写编排会激活 → REPOSRC A 行）
+    let resp = http_client()
+        .put(format!("{}/objects/prog/{}/source", sbase, name))
+        .json(&serde_json::json!({
+            "source": "REPORT zmeta.\nWRITE 'meta test'.",
+            "create": true, "description": "meta verb test"
+        }))
+        .send()
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        200,
+        "临时程序应创建成功: {}",
+        resp.text().unwrap()
+    );
+    let body: serde_json::Value = resp.json().unwrap();
+    assert_eq!(body["activated"]["success"], true);
+
+    // meta：刚激活的应 exists / 未锁 / active / 有作者（REPOSRC）
+    let meta: serde_json::Value = http_client()
+        .get(format!("{}/objects/prog/{}/meta", sbase, name))
+        .send()
+        .unwrap()
+        .json()
+        .unwrap();
+    assert_eq!(meta["exists"], true, "meta.exists: {meta}");
+    assert_eq!(meta["locked"], false, "刚创建的临时对象不应被锁: {meta}");
+    assert_eq!(meta["lock_mode"], "adt_lock");
+    assert_eq!(meta["active"], true, "激活后应无未激活版本: {meta}");
+    assert_eq!(meta["active_check"], "adt");
+    assert!(
+        meta["changed_by"].as_str().is_some_and(|s| !s.is_empty()),
+        "REPOSRC 应给出最后修改者: {meta}"
+    );
+    assert_eq!(meta["changed_by_via"], "adt");
+    assert_eq!(meta["name"], name.to_uppercase());
+
+    // 不存在的对象：exists=false 短路（不报错）
+    let meta: serde_json::Value = http_client()
+        .get(format!(
+            "{}/objects/prog/ZNO_SUCH_PROG_META_999/meta",
+            sbase
+        ))
+        .send()
+        .unwrap()
+        .json()
+        .unwrap();
+    assert_eq!(meta["exists"], false);
+    assert_eq!(meta["changed_by"], serde_json::Value::Null);
+
+    // 清理
+    let resp = http_client()
+        .delete(format!("{}/objects/prog/{}", sbase, name))
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 200, "清理删除应成功");
+}
+
+/// 包导出：建临时包 + 临时程序 → manifest 与 zip 的文件树/内容断言 → 清理。
+#[test]
+#[ignore]
+fn package_export_zip_roundtrip() {
+    let _s = start_server();
+    // 作用域形式：套件默认系统是远程 ED1（可能不可达），固定打到本机 a4h
+    let sbase = format!("{}/api/s/a4h", _s.base_url);
+    let pkg = format!("ZEXP_T{}", std::process::id() % 10000);
+    let cls = format!("{}CLS", pkg);
+    // 预清理：此前失败运行可能留下同名额包（创建会 409 OBJECT_EXISTS）
+    let _ = http_client()
+        .delete(format!("{}/objects/package/{}", sbase, pkg))
+        .send()
+        .unwrap();
+
+    // ① 建临时包（$TMP 下；显式 LOCAL——默认软件组件候选 ZLOCAL 是 J 型，
+    // 本系统禁 PROG：实测 "Objects of type PROG are not permitted in
+    // software components of type J"）
+    let resp = http_client()
+        .post(format!("{}/objects/package/{}/create", sbase, pkg))
+        .json(&serde_json::json!(
+            {"description": "export zip test", "software_component": "LOCAL"}
+        ))
+        .send()
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        200,
+        "临时包应创建成功: {}",
+        resp.text().unwrap()
+    );
+
+    // ② 包内建类（ZLOCAL J 型组件禁 PROG，class 可用——错误信息实证）。
+    // 源码类名必须与对象名一致（ADT 保存扫描拒绝名不副实）。
+    let cls_low = cls.to_lowercase();
+    let resp = http_client()
+        .put(format!("{}/objects/class/{}/source", sbase, cls))
+        .json(&serde_json::json!({
+            "source": format!(
+                "CLASS {c} DEFINITION PUBLIC FINAL CREATE PUBLIC.\n  PUBLIC SECTION.\n    METHODS say RETURNING VALUE(rv) TYPE string.\nENDCLASS.\nCLASS {c} IMPLEMENTATION.\n  METHOD say.\n    rv = 'export me'.\n  ENDMETHOD.\nENDCLASS.",
+                c = cls_low
+            ),
+            "create": true, "description": "export zip test",
+            "devclass": pkg
+        }))
+        .send()
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        200,
+        "包内类应创建成功: {}",
+        resp.text().unwrap()
+    );
+
+    // ③ manifest 模式：JSON 清单有该程序条目（不读源码）
+    let manifest: serde_json::Value = http_client()
+        .get(format!("{}/export/package/{}?manifest=true", sbase, pkg))
+        .send()
+        .unwrap()
+        .json()
+        .unwrap();
+    assert_eq!(manifest["format"], "sap-for-agents-export/1");
+    assert_eq!(manifest["folder_logic"], "full");
+    let objs = manifest["objects"].as_array().unwrap();
+    let cls_entry = objs
+        .iter()
+        .find(|o| o["name"] == cls.to_uppercase() && o["type"] == "class")
+        .expect("清单应含临时类条目");
+    assert_eq!(cls_entry["status"], "exported");
+    assert_eq!(cls_entry["package"], pkg.to_uppercase());
+    assert!(
+        objs.iter().any(|o| o["type"] == "package"
+            || o["name"].as_str().is_some_and(|n| n.starts_with("ZEXP_T"))),
+        "清单应含包节点（DEVC/DEVC.xml 记录在 packages 数组）"
+    );
+    assert!(
+        manifest["packages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p["devclass"] == pkg.to_uppercase()),
+        "packages 数组应有临时包"
+    );
+
+    // ④ zip：文件树结构 + 源码内容与 /source 读一致
+    use std::io::Read as _;
+    let resp = http_client()
+        .get(format!("{}/export/package/{}", sbase, pkg))
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.headers()["content-type"].to_str().unwrap(),
+        "application/zip"
+    );
+    let bytes = resp.bytes().unwrap();
+    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).expect("zip 应可解析");
+    let names: Vec<String> = (0..archive.len())
+        .map(|i| archive.by_index(i).unwrap().name().to_string())
+        .collect();
+    let pkg_folder = pkg.to_lowercase();
+    assert!(
+        names.iter().any(|n| n == ".abapgit.xml"),
+        "zip 应含 .abapgit.xml: {names:?}"
+    );
+    assert!(
+        names.iter().any(|n| n == "export_manifest.json"),
+        "zip 应含 export_manifest.json: {names:?}"
+    );
+    assert!(
+        names
+            .iter()
+            .any(|n| *n == format!("src/{}/package.devc.xml", pkg_folder)),
+        "zip 应含 package.devc.xml: {names:?}"
+    );
+    let cls_file = format!("src/{}/{}.clas.abap", pkg_folder, cls.to_lowercase());
+    assert!(
+        names.iter().any(|n| n == &cls_file),
+        "zip 应含类源码: {names:?}"
+    );
+    // 内容一致性：zip 内源码 == /api/objects/.../source
+    let expected: serde_json::Value = http_client()
+        .get(format!("{}/objects/class/{}/source", sbase, cls))
+        .send()
+        .unwrap()
+        .json()
+        .unwrap();
+    let expected_src = expected["source"].as_str().unwrap();
+    let mut content = String::new();
+    archive
+        .by_name(&cls_file)
+        .unwrap()
+        .read_to_string(&mut content)
+        .unwrap();
+    assert_eq!(
+        content.trim_end(),
+        expected_src.trim_end(),
+        "zip 内源码应与 /source 读一致"
+    );
+
+    // ⑤ 不存在的包 → 404 PACKAGE_NOT_FOUND
+    let resp = http_client()
+        .get(format!("{}/export/package/ZNO_SUCH_PKG_EXPORT_999", sbase))
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+    let body: serde_json::Value = resp.json().unwrap();
+    assert_eq!(body["error"]["key"], "PACKAGE_NOT_FOUND");
+
+    // ⑥ 清理：删类 → 删包
+    let resp = http_client()
+        .delete(format!("{}/objects/class/{}", sbase, cls))
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 200, "清理类应成功: {}", resp.text().unwrap());
+    let resp = http_client()
+        .delete(format!("{}/objects/package/{}", sbase, pkg))
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 200, "清理包应成功: {}", resp.text().unwrap());
+}
+
+/// 导出→导入 round-trip：建包 A（类+程序）→ export A → 删 A 内对象（SAP 对象名
+/// 全局唯一——同名还在时导入只能原地更新）→ dry_run 零写入预检 → 真导入进包 B
+/// （两阶段激活）→ 断言 B 内源码一致且活跃 → overwrite=false 跳过 → 覆盖导入原地更新。
+#[test]
+#[ignore]
+fn package_export_import_roundtrip() {
+    let _s = start_server();
+    // 作用域形式：套件默认系统是远程 ED1（可能不可达），固定打到本机 a4h
+    let sbase = format!("{}/api/s/a4h", _s.base_url);
+    let pkg_a = format!("ZRTA_{}", std::process::id() % 10000);
+    let pkg_b = format!("ZRTB_{}", std::process::id() % 10000);
+    let cls = format!("{}CLS", pkg_a);
+    let itf = format!("{}ITF", pkg_a);
+    let cls_src = format!(
+        "CLASS {c} DEFINITION PUBLIC FINAL CREATE PUBLIC.\n  PUBLIC SECTION.\n    METHODS hi RETURNING VALUE(rv) TYPE string.\nENDCLASS.\nCLASS {c} IMPLEMENTATION.\n  METHOD hi.\n    rv = 'roundtrip'.\n  ENDMETHOD.\nENDCLASS.",
+        c = cls.to_lowercase()
+    );
+    let itf_src = format!(
+        "INTERFACE {i} PUBLIC.\n  METHODS hi RETURNING VALUE(rv) TYPE string.\nENDINTERFACE.",
+        i = itf.to_lowercase()
+    );
+    // ① 建包 A、B + A 内类与程序（显式 LOCAL：ZLOCAL J 型禁 PROG）
+    for pkg in [&pkg_a, &pkg_b] {
+        let resp = http_client()
+            .post(format!("{}/objects/package/{}/create", sbase, pkg))
+            .json(&serde_json::json!(
+                {"description": "roundtrip", "software_component": "LOCAL"}
+            ))
+            .send()
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            200,
+            "建包 {} 应成功: {}",
+            pkg,
+            resp.text().unwrap()
+        );
+    }
+    for (t, n, src) in [
+        ("class", cls.clone(), cls_src.clone()),
+        ("intf", itf.clone(), itf_src.clone()),
+    ] {
+        let resp = http_client()
+            .put(format!("{}/objects/{}/{}/source", sbase, t, n))
+            .json(&serde_json::json!({
+                "source": src, "create": true, "description": "roundtrip",
+                "devclass": pkg_a
+            }))
+            .send()
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            200,
+            "建 {} {} 应成功: {}",
+            t,
+            n,
+            resp.text().unwrap()
+        );
+    }
+
+    // ② 导出包 A → zip
+    let resp = http_client()
+        .get(format!("{}/export/package/{}", sbase, pkg_a))
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let zip = resp.bytes().unwrap();
+
+    // ③ 删 A 内对象腾出名字（导入的真实前提：SAP 名字全局唯一）
+    for (t, n) in [("class", &cls), ("intf", &itf)] {
+        let resp = http_client()
+            .delete(format!("{}/objects/{}/{}", sbase, t, n))
+            .send()
+            .unwrap();
+        assert_eq!(resp.status(), 200, "腾名删除 {} {} 应成功", t, n);
+    }
+
+    // ④ dry_run 导入进包 B：零写入（名字已腾空 → 计划 created）
+    let resp = http_client()
+        .post(format!("{}/import/package/{}?dry_run=true", sbase, pkg_b))
+        .header("Content-Type", "application/zip")
+        .body(zip.clone())
+        .send()
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        200,
+        "dry_run 应成功: {}",
+        resp.text().unwrap()
+    );
+    let plan: serde_json::Value = resp.json().unwrap();
+    assert_eq!(plan["dry_run"], true);
+    assert_eq!(plan["target"], pkg_b.to_uppercase());
+    let objs = plan["objects"].as_array().unwrap();
+    assert_eq!(objs.len(), 2, "dry_run 计划应含类与程序: {}", plan);
+    assert!(objs
+        .iter()
+        .all(|o| o["action"] == "created" && o["exists"] == false));
+
+    // 零写入断言：dry_run 后 B 内仍无对象
+    let meta: serde_json::Value = http_client()
+        .get(format!("{}/objects/class/{}/meta", sbase, cls))
+        .send()
+        .unwrap()
+        .json()
+        .unwrap();
+    assert_eq!(meta["exists"], false, "dry_run 不得写入: {meta}");
+
+    // ⑤ 真导入进包 B（两阶段激活）
+    let resp = http_client()
+        .post(format!("{}/import/package/{}", sbase, pkg_b))
+        .header("Content-Type", "application/zip")
+        .body(zip.clone())
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 200, "导入应成功: {}", resp.text().unwrap());
+    let result: serde_json::Value = resp.json().unwrap();
+    assert_eq!(result["dry_run"], false);
+    let objs = result["objects"].as_array().unwrap();
+    assert_eq!(objs.len(), 2);
+    assert!(
+        objs.iter().all(|o| o["action"] == "created"),
+        "应全部新建: {}",
+        result
+    );
+    assert!(
+        objs.iter().all(|o| o["activated"] == "activated"),
+        "两阶段激活应全绿: {}",
+        result
+    );
+    assert_eq!(result["summary"]["failed"], 0);
+    // 包重映射：对象落在包 B
+    assert!(
+        objs.iter().all(|o| o["package"] == pkg_b.to_uppercase()),
+        "包应重映射到 B: {}",
+        result
+    );
+
+    // ⑥ 内容一致 + 活跃：B 内类源码与原文一致，meta active=true
+    let imported: serde_json::Value = http_client()
+        .get(format!("{}/objects/class/{}/source", sbase, cls))
+        .send()
+        .unwrap()
+        .json()
+        .unwrap();
+    assert_eq!(
+        imported["source"].as_str().unwrap().trim_end(),
+        cls_src.trim_end(),
+        "导入后源码应与原文一致"
+    );
+    let meta: serde_json::Value = http_client()
+        .get(format!("{}/objects/class/{}/meta", sbase, cls))
+        .send()
+        .unwrap()
+        .json()
+        .unwrap();
+    assert_eq!(meta["exists"], true);
+    assert_eq!(meta["active"], true, "导入+激活后应为活跃版本: {meta}");
+
+    // ⑦ overwrite=false：第二次导入 → skipped_exists
+    let resp = http_client()
+        .post(format!(
+            "{}/import/package/{}?overwrite=false",
+            sbase, pkg_b
+        ))
+        .header("Content-Type", "application/zip")
+        .body(zip.clone())
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let again: serde_json::Value = resp.json().unwrap();
+    let objs = again["objects"].as_array().unwrap();
+    assert!(
+        objs.iter().all(|o| o["action"] == "skipped_exists"),
+        "overwrite=false 应跳过已存在对象: {}",
+        again
+    );
+
+    // ⑧ 覆盖导入（默认 overwrite）：对象已存在 → 原地更新（real_package 透明化）
+    let resp = http_client()
+        .post(format!("{}/import/package/{}", sbase, pkg_b))
+        .header("Content-Type", "application/zip")
+        .body(zip)
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let again: serde_json::Value = resp.json().unwrap();
+    let objs = again["objects"].as_array().unwrap();
+    assert!(
+        objs.iter().all(|o| o["action"] == "updated"),
+        "覆盖导入应原地更新: {}",
+        again
+    );
+    assert!(
+        objs.iter()
+            .all(|o| o["real_package"] == pkg_b.to_uppercase()),
+        "real_package 应如实回显实际所在包: {}",
+        again
+    );
+
+    // ⑨ 清理：删 B 内对象 → 删两包
+    for (t, n) in [("class", &cls), ("intf", &itf)] {
+        let _ = http_client()
+            .delete(format!("{}/objects/{}/{}", sbase, t, n))
+            .send()
+            .unwrap();
+    }
+    for pkg in [&pkg_a, &pkg_b] {
+        let resp = http_client()
+            .delete(format!("{}/objects/package/{}", sbase, pkg))
+            .send()
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            200,
+            "清理包 {} 应成功: {}",
+            pkg,
+            resp.text().unwrap()
+        );
+    }
+}
+
+// ========================================================================
+// sapcli 借鉴批次（v0.21）：agent 运行面 —— abap run / aunit / atc /
+// cts / objects search / table osql。全部 ADT 通道。
+// ========================================================================
+
+/// GET /api/objects/search?q=BAPIRET —— 跨类型快搜命中结构/DDIC
+#[test]
+#[ignore]
+fn objects_search_finds_bapiret() {
+    let _s = start_server();
+    let resp = http_client()
+        .get(format!("{}/api/objects/search?q=BAPIRET", _s.base_url))
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let v: serde_json::Value = resp.json().unwrap();
+    assert_eq!(v["query"], "BAPIRET*");
+    assert!(v["count"].as_u64().unwrap_or(0) > 0, "至少命中一个: {v}");
+    let hits = v["objects"].as_array().unwrap();
+    assert!(
+        hits.iter()
+            .any(|h| h["name"].as_str().unwrap_or("").starts_with("BAPIRET")),
+        "首条命中应以 BAPIRET 开头: {hits:?}"
+    );
+    // 每条带 type + uri（供 /api/adt 直读）
+    for h in hits.iter().take(3) {
+        assert!(
+            h["typ"].as_str().is_some_and(|s| !s.is_empty()),
+            "typ 缺失: {h}"
+        );
+        assert!(
+            h["uri"].as_str().is_some_and(|s| !s.is_empty()),
+            "uri 缺失: {h}"
+        );
+    }
+    // 缺参 → 400
+    let resp = http_client()
+        .get(format!("{}/api/objects/search", _s.base_url))
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+}
+
+/// POST /api/table/osql —— OpenSQL 直查 T000（池表 RFC_READ_TABLE 拒读的对照面）
+#[test]
+#[ignore]
+fn table_osql_reads_t000() {
+    let _s = start_server();
+    let resp = http_client()
+        .post(format!("{}/api/table/osql", _s.base_url))
+        .json(&serde_json::json!({"sql": "select mandt, cccategory from t000", "rows": 10}))
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 200, "{}", resp.text().unwrap());
+    let v: serde_json::Value = resp.json().unwrap();
+    assert_eq!(v["columns"][0]["name"], "MANDT");
+    assert_eq!(v["columns"][1]["name"], "CCCATEGORY");
+    assert!(
+        v["row_count"].as_u64().unwrap_or(0) >= 1,
+        "T000 至少一个 client: {v}"
+    );
+    // 非 SELECT 拒收
+    let resp = http_client()
+        .post(format!("{}/api/table/osql", _s.base_url))
+        .json(&serde_json::json!({"sql": "update t000 set cccategory='X'"}))
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+}
+
+/// POST /api/abap/run —— 临时类执行回显 + finally 删除验证
+#[test]
+#[ignore]
+fn abap_run_executes_and_cleans_up() {
+    let _s = start_server();
+    let resp = http_client()
+        .post(format!("{}/api/abap/run", _s.base_url))
+        .json(&serde_json::json!({
+            "source": "out->write( |HELLO_FROM_ABAPRUN { sy-uname } | )."
+        }))
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 200, "{}", resp.text().unwrap());
+    let v: serde_json::Value = resp.json().unwrap();
+    assert_eq!(v["ok"], true, "执行应成功: {v}");
+    assert!(
+        v["output"]
+            .as_str()
+            .unwrap_or("")
+            .contains("HELLO_FROM_ABAPRUN"),
+        "输出应含回显: {v}"
+    );
+    let class = v["class"].as_str().unwrap().to_string();
+    assert_eq!(v["deleted"], true, "临时类应被删除: {v}");
+    // meta 验证：exists:false
+    let meta: serde_json::Value = http_client()
+        .get(format!("{}/api/objects/class/{}/meta", _s.base_url, class))
+        .send()
+        .unwrap()
+        .json()
+        .unwrap();
+    assert_eq!(meta["exists"], false, "删除后应不存在: {meta}");
+
+    // 语法错 → ok:false + step=syntax_check + issues
+    let resp = http_client()
+        .post(format!("{}/api/abap/run", _s.base_url))
+        .json(&serde_json::json!({"source": "this is not abap at all !!!"}))
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let v: serde_json::Value = resp.json().unwrap();
+    assert_eq!(v["ok"], false);
+    assert_eq!(v["step"], "syntax_check");
+    assert!(
+        !v["issues"].as_array().unwrap().is_empty(),
+        "应有 issues: {v}"
+    );
+    assert_eq!(v["deleted"], true, "失败同样要清理");
+}
+
+/// POST /api/tests/aunit —— 对带单测的标准类跑一轮（格式契约验证）
+#[test]
+#[ignore]
+fn aunit_run_on_standard_class() {
+    let _s = start_server();
+    // json 格式：summary + programs 结构
+    let resp = http_client()
+        .post(format!("{}/api/tests/aunit", _s.base_url))
+        .json(&serde_json::json!({
+            "objects": [{"type": "class", "name": "CL_ABAP_TYPEDESCR"}]
+        }))
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 200, "{}", resp.text().unwrap());
+    let v: serde_json::Value = resp.json().unwrap();
+    assert!(
+        v["run_id"].as_str().is_some_and(|s| !s.is_empty()),
+        "run_id 缺失: {v}"
+    );
+    assert!(v["summary"]["tests"].is_u64(), "tests 应为数字: {v}");
+    assert!(v["programs"].is_array(), "programs 应为数组: {v}");
+
+    // junit4：原样 XML
+    let resp = http_client()
+        .post(format!("{}/api/tests/aunit", _s.base_url))
+        .json(&serde_json::json!({
+            "objects": [{"type": "class", "name": "CL_ABAP_TYPEDESCR"}],
+            "format": "junit4"
+        }))
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let ct = resp
+        .headers()
+        .get("content-type")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(ct.contains("junit"), "content-type 应为 junit: {ct}");
+    let body = resp.text().unwrap();
+    assert!(body.contains("<testsuites"), "junit 根元素: {body}");
+
+    // package+普通对象混用 → 400
+    let resp = http_client()
+        .post(format!("{}/api/tests/aunit", _s.base_url))
+        .json(&serde_json::json!({
+            "objects": [
+                {"type": "package", "name": "$TMP"},
+                {"type": "class", "name": "CL_ABAP_TYPEDESCR"}
+            ]
+        }))
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+}
+
+/// POST /api/atc/run —— 系统变体跑一个小对象（findings 数不锚定，验证 schema）。
+/// A4H 实测小类 ~60s（variant=ZABAP_CLOUD_DEVELOPMENT）——用专属 240s 客户端。
+#[test]
+#[ignore]
+fn atc_run_schema_holds() {
+    let _s = start_server();
+    let slow = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(240))
+        .build()
+        .unwrap();
+    let resp = slow
+        .post(format!("{}/api/atc/run", _s.base_url))
+        .json(&serde_json::json!({
+            "objects": [{"type": "class", "name": "ZCL_ABAPGIT_AFF_REGISTRY"}],
+            "max_verdicts": 50
+        }))
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 200, "{}", resp.text().unwrap());
+    let v: serde_json::Value = resp.json().unwrap();
+    assert!(
+        v["variant"].as_str().is_some_and(|s| !s.is_empty()),
+        "variant 缺失: {v}"
+    );
+    assert!(v["worklist_id"].as_str().is_some_and(|s| !s.is_empty()));
+    assert!(v["objects"].is_array());
+    assert!(v["total_findings"].as_u64().unwrap_or(9999) < 9999);
+    // by_priority 是对象
+    assert!(v["by_priority"].is_object());
+}
+
+/// CTS create → get → release → delete 闭环。
+/// 已释放的请求 SAP 拒绝删除（ADT_TM_COMMON_EXCEPTION）——所以顺序是：
+/// ① 请求 A：create → get → delete（未释放，验证 CRUD 与清理）；
+/// ② 请求 B：create → release（验证释放；已释放请求**留在 trial 系统**，
+///    每次跑残留一个——trial 无传输域风险，文档注明）。
+#[test]
+#[ignore]
+fn cts_request_lifecycle() {
+    let _s = start_server();
+    let create = |desc: &str| {
+        http_client()
+            .post(format!("{}/api/cts/requests", _s.base_url))
+            .json(&serde_json::json!({"type": "workbench", "description": desc}))
+            .send()
+            .unwrap()
+    };
+    // —— ① CRUD（不含 release）——
+    let resp = create("sap-for-agents integration test");
+    let status = resp.status();
+    if status == 502 || status == 503 {
+        // 无传输域配置的系统（trial 常见）：创建被 SAP 拒绝——契约仍应可读
+        let text = resp.text().unwrap();
+        assert!(
+            text.contains("error") || text.contains("message"),
+            "错误契约: {text}"
+        );
+        return;
+    }
+    assert_eq!(status, 200, "{}", resp.text().unwrap());
+    let created: serde_json::Value = resp.json().unwrap();
+    let number = created["number"].as_str().unwrap().to_string();
+    assert!(!number.is_empty());
+
+    let got: serde_json::Value = http_client()
+        .get(format!("{}/api/cts/requests/{}", _s.base_url, number))
+        .send()
+        .unwrap()
+        .json()
+        .unwrap();
+    assert_eq!(got["number"], number.as_str());
+    assert_eq!(got["description"], "sap-for-agents integration test");
+    assert_eq!(got["status"], "D");
+    assert_eq!(got["released"], false);
+
+    let del: serde_json::Value = http_client()
+        .delete(format!("{}/api/cts/requests/{}", _s.base_url, number))
+        .send()
+        .unwrap()
+        .json()
+        .unwrap();
+    assert_eq!(del["deleted"], true, "删除应成功: {del}");
+    let resp = http_client()
+        .get(format!("{}/api/cts/requests/{}", _s.base_url, number))
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+
+    // —— ② release（残留一个已释放请求，见函数注释）——
+    let resp = create("sap-for-agents integration test (release check)");
+    assert_eq!(resp.status(), 200);
+    let created2: serde_json::Value = resp.json().unwrap();
+    let number2 = created2["number"].as_str().unwrap().to_string();
+    let rel: serde_json::Value = http_client()
+        .post(format!(
+            "{}/api/cts/requests/{}/release",
+            _s.base_url, number2
+        ))
+        .send()
+        .unwrap()
+        .json()
+        .unwrap();
+    // 契约验证：业务失败也是 200 + released:false + status_text（A4H trial 实测
+    // 偶发 abortrelapifail——STMS 侧问题，网关如实透出而非报错）；成功则
+    // released:true。两种形态都算通过。
+    assert!(rel["released"].is_boolean(), "released 应为布尔: {rel}");
+    if rel["released"] == serde_json::json!(true) {
+        let got2: serde_json::Value = http_client()
+            .get(format!("{}/api/cts/requests/{}", _s.base_url, number2))
+            .send()
+            .unwrap()
+            .json()
+            .unwrap();
+        assert_eq!(got2["status"], "R");
+        assert_eq!(got2["released"], true);
+    }
+}
+
+/// 未知传输请求号 → 400（客户端侧白名单校验先行）
+#[test]
+#[ignore]
+fn cts_invalid_number_rejected() {
+    let _s = start_server();
+    let resp = http_client()
+        .get(format!("{}/api/cts/requests/bad%20name!", _s.base_url))
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 400);
 }

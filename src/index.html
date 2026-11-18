@@ -319,6 +319,51 @@ tailwind.config = {
                     <code class="font-code-sm text-code-sm text-on-surface flex-grow">/api/objects/{type}/{name}/replace</code>
                     <span class="font-body-sm text-body-sm text-on-surface-variant whitespace-nowrap">AI-style find-and-replace</span>
                 </li>
+                <li class="flex items-center gap-md py-sm border-b border-outline-variant/30 last:border-0">
+                    <span class="font-code-sm text-code-sm px-sm py-xs rounded method-get w-16 text-center">GET</span>
+                    <code class="font-code-sm text-code-sm text-on-surface flex-grow">/api/objects/{type}/{name}/meta</code>
+                    <span class="font-body-sm text-body-sm text-on-surface-variant whitespace-nowrap">Probe exists / locked / active before write</span>
+                </li>
+                <li class="flex items-center gap-md py-sm border-b border-outline-variant/30 last:border-0">
+                    <span class="font-code-sm text-code-sm px-sm py-xs rounded method-get w-16 text-center">GET</span>
+                    <code class="font-code-sm text-code-sm text-on-surface flex-grow">/api/export/package/{devclass}</code>
+                    <span class="font-body-sm text-body-sm text-on-surface-variant whitespace-nowrap">Package → abapGit-style zip snapshot</span>
+                </li>
+                <li class="flex items-center gap-md py-sm border-b border-outline-variant/30 last:border-0">
+                    <span class="font-code-sm text-code-sm px-sm py-xs rounded method-post w-16 text-center">POST</span>
+                    <code class="font-code-sm text-code-sm text-on-surface flex-grow">/api/import/package/{devclass}</code>
+                    <span class="font-body-sm text-body-sm text-on-surface-variant whitespace-nowrap">Import a package zip (two-phase activation)</span>
+                </li>
+                <li class="flex items-center gap-md py-sm border-b border-outline-variant/30 last:border-0">
+                    <span class="font-code-sm text-code-sm px-sm py-xs rounded method-get w-16 text-center">GET</span>
+                    <code class="font-code-sm text-code-sm text-on-surface flex-grow">/api/objects/search?q=</code>
+                    <span class="font-body-sm text-body-sm text-on-surface-variant whitespace-nowrap">ADT quick search across all object types</span>
+                </li>
+                <li class="flex items-center gap-md py-sm border-b border-outline-variant/30 last:border-0">
+                    <span class="font-code-sm text-code-sm px-sm py-xs rounded method-post w-16 text-center">POST</span>
+                    <code class="font-code-sm text-code-sm text-on-surface flex-grow">/api/table/osql</code>
+                    <span class="font-body-sm text-body-sm text-on-surface-variant whitespace-nowrap">OpenSQL SELECT via data preview</span>
+                </li>
+                <li class="flex items-center gap-md py-sm border-b border-outline-variant/30 last:border-0">
+                    <span class="font-code-sm text-code-sm px-sm py-xs rounded method-post w-16 text-center">POST</span>
+                    <code class="font-code-sm text-code-sm text-on-surface flex-grow">/api/abap/run</code>
+                    <span class="font-body-sm text-body-sm text-on-surface-variant whitespace-nowrap">Run an ABAP snippet (temp classrun class)</span>
+                </li>
+                <li class="flex items-center gap-md py-sm border-b border-outline-variant/30 last:border-0">
+                    <span class="font-code-sm text-code-sm px-sm py-xs rounded method-post w-16 text-center">POST</span>
+                    <code class="font-code-sm text-code-sm text-on-surface flex-grow">/api/tests/aunit</code>
+                    <span class="font-body-sm text-body-sm text-on-surface-variant whitespace-nowrap">Run ABAP Unit tests (json / junit4)</span>
+                </li>
+                <li class="flex items-center gap-md py-sm border-b border-outline-variant/30 last:border-0">
+                    <span class="font-code-sm text-code-sm px-sm py-xs rounded method-post w-16 text-center">POST</span>
+                    <code class="font-code-sm text-code-sm text-on-surface flex-grow">/api/atc/run</code>
+                    <span class="font-body-sm text-body-sm text-on-surface-variant whitespace-nowrap">Run ATC checks, findings as JSON</span>
+                </li>
+                <li class="flex items-center gap-md py-sm border-b border-outline-variant/30 last:border-0">
+                    <span class="font-code-sm text-code-sm px-sm py-xs rounded method-post w-16 text-center">POST</span>
+                    <code class="font-code-sm text-code-sm text-on-surface flex-grow">/api/cts/requests</code>
+                    <span class="font-body-sm text-body-sm text-on-surface-variant whitespace-nowrap">Create / release / delete CTS requests</span>
+                </li>
             </ul>
         </div>
 

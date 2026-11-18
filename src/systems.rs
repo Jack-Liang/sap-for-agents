@@ -56,6 +56,22 @@ pub struct SystemSpec {
     pub adt_user: Option<String>,
     /// ADT 认证密码覆盖（None = 同该系统连接 PASSWD）。
     pub adt_passwd: Option<String>,
+    // —— ADT 现代鉴权（sapcli 借鉴 B2）：与 Basic 正交的三条通道 ——
+    /// TLS 客户端证书 PEM 路径（mTLS；单独文件或与 key 合并单文件）
+    pub adt_cert: Option<String>,
+    /// TLS 私钥 PEM 路径（None = cert 单文件内含私钥）；加密私钥启动期拒收
+    pub adt_key: Option<String>,
+    /// 自定义 CA bundle 路径（私有 CA 的 https 端点）
+    pub adt_ca: Option<String>,
+    /// SAP 登录票据（ADT 通道走 Cookie: MYSAPSSO2；None = 复用系统级 mysapsso2）
+    pub adt_sso2: Option<String>,
+    /// OAuth2 密码授权三件套（BTP/ABAP Cloud ADT）；给出时优先于 sso2/basic
+    pub adt_oauth_token_url: Option<String>,
+    pub adt_oauth_client_id: Option<String>,
+    pub adt_oauth_client_secret: Option<String>,
+    /// 外部鉴权插件：绝对路径命令 + 透传参数（最高优先级，sapcli auth_plugin 借鉴）。
+    /// 插件 stdout 产 cookie/headers 注入 ADT 会话；certificates 形态不支持（用 adt_cert/adt_key）。
+    pub adt_auth_plugin: Option<crate::adt::AuthPluginSpec>,
     /// 只读覆盖（None = 用全局 `SAP_READ_ONLY`）。
     pub read_only: Option<bool>,
     /// 落盘时的密码引用形态（如 `${SAP_PASSWD}`）：env 合成系统的 conn_params
@@ -79,6 +95,15 @@ pub(crate) struct RawSystem {
     pub(crate) user: Option<String>,
     pub(crate) passwd: Option<String>,
     pub(crate) lang: Option<String>,
+    /// SAP 登录票据（sapcli 借鉴 B1）：给出时**替代** user/passwd 建连
+    /// （票据自带身份）。支持 `${VAR}` 插值——票据与密码同等敏感。
+    pub(crate) mysapsso2: Option<String>,
+    /// SNC 登录四件套（Kerberos/Secure Login Client）：给出时 passwd 可省
+    /// （SSO 映射身份）；键直通 SDK（SNC_QOP/SNC_MYNAME/SNC_PARTNERNAME/SNC_LIB）。
+    pub(crate) snc_qop: Option<String>,
+    pub(crate) snc_myname: Option<String>,
+    pub(crate) snc_partnername: Option<String>,
+    pub(crate) snc_lib: Option<String>,
     #[serde(default)]
     pub(crate) default: bool,
     pub(crate) pool_size: Option<usize>,
@@ -87,6 +112,20 @@ pub(crate) struct RawSystem {
     pub(crate) adt_base_url: Option<String>,
     pub(crate) adt_user: Option<String>,
     pub(crate) adt_passwd: Option<String>,
+    pub(crate) adt_cert: Option<String>,
+    pub(crate) adt_key: Option<String>,
+    pub(crate) adt_ca: Option<String>,
+    pub(crate) adt_sso2: Option<String>,
+    pub(crate) adt_oauth_token_url: Option<String>,
+    pub(crate) adt_oauth_client_id: Option<String>,
+    pub(crate) adt_oauth_client_secret: Option<String>,
+    /// 插件命令（绝对路径）；给出即启用插件鉴权
+    pub(crate) adt_auth_plugin_command: Option<String>,
+    /// 插件透传参数（toml 内联表，原样进请求 JSON 的 parameters）
+    #[serde(default)]
+    pub(crate) adt_auth_plugin_params: BTreeMap<String, String>,
+    /// 插件响应缓存秒数（默认 300）
+    pub(crate) adt_auth_plugin_cache_secs: Option<u64>,
     pub(crate) read_only: Option<bool>,
     /// 自由键值透传（键大写化后直接进 `RfcOpenConnection`，
     /// 为 MSHOST/GROUP 负载均衡等形态留后门）。
@@ -138,13 +177,19 @@ fn validate_name(name: &str) -> Result<(), String> {
 }
 
 /// 快捷字段 → SDK 连接参数键。conn 透传表里的同名键（大小写不敏感）视为冲突。
-const SHORTCUT_KEYS: [(&str, &str); 6] = [
+const SHORTCUT_KEYS: [(&str, &str); 11] = [
     ("ashost", "ASHOST"),
     ("sysnr", "SYSNR"),
     ("client", "CLIENT"),
     ("user", "USER"),
     ("passwd", "PASSWD"),
     ("lang", "LANG"),
+    // 鉴权透传（sapcli 借鉴 B1）：SSO2 票据 + SNC 四件套，键直通 SDK
+    ("mysapsso2", "MYSAPSSO2"),
+    ("snc_qop", "SNC_QOP"),
+    ("snc_myname", "SNC_MYNAME"),
+    ("snc_partnername", "SNC_PARTNERNAME"),
+    ("snc_lib", "SNC_LIB"),
 ];
 
 /// 把原始系统定义组装成 [`SystemSpec`]：合并快捷字段与 conn 透传、插值、校验。
@@ -169,6 +214,11 @@ pub(crate) fn build_spec(name: &str, raw: &RawSystem) -> Result<SystemSpec, Stri
     push("USER", raw.user.as_ref())?;
     push("PASSWD", raw.passwd.as_ref())?;
     push("LANG", raw.lang.as_ref())?;
+    push("MYSAPSSO2", raw.mysapsso2.as_ref())?;
+    push("SNC_QOP", raw.snc_qop.as_ref())?;
+    push("SNC_MYNAME", raw.snc_myname.as_ref())?;
+    push("SNC_PARTNERNAME", raw.snc_partnername.as_ref())?;
+    push("SNC_LIB", raw.snc_lib.as_ref())?;
 
     // conn 透传：键大写化，与快捷字段冲突即报错（哪个生效不能有歧义）
     for (k, v) in &raw.conn {
@@ -192,10 +242,17 @@ pub(crate) fn build_spec(name: &str, raw: &RawSystem) -> Result<SystemSpec, Stri
         params.push((key, v));
     }
 
-    // 连接形态校验：直连（ASHOST+SYSNR）或负载均衡（MSHOST）；USER/PASSWD 必填
+    // 连接形态校验：直连（ASHOST+SYSNR）或负载均衡（MSHOST）。
+    // user/passwd 仅在 classic 模式必填——SSO2 票据（MYSAPSSO2）自带身份、
+    // SNC 登录靠映射身份，两者给出时 password 可省（sapcli 借鉴 B1）。
     let has = |k: &str| params.iter().any(|(k2, _)| *k2 == k);
-    if !has("USER") || !has("PASSWD") {
-        return Err(format!("{} 缺少 user/passwd（必填）", ctx));
+    let sso2 = has("MYSAPSSO2");
+    let snc = has("SNC_QOP") || has("SNC_MYNAME") || has("SNC_PARTNERNAME") || has("SNC_LIB");
+    if !sso2 && !snc && (!has("USER") || !has("PASSWD")) {
+        return Err(format!(
+            "{} 缺少 user/passwd（classic 登录必填；MYSAPSSO2 票据或 SNC 四件套登录可省）",
+            ctx
+        ));
     }
     if has("MSHOST") {
         Ok(())
@@ -216,6 +273,31 @@ pub(crate) fn build_spec(name: &str, raw: &RawSystem) -> Result<SystemSpec, Stri
         name: name.to_string(),
         is_default: raw.default,
         conn_params: params,
+        adt_cert: raw.adt_cert.clone(),
+        adt_key: raw.adt_key.clone(),
+        adt_ca: raw.adt_ca.clone(),
+        adt_sso2: raw
+            .adt_sso2
+            .as_ref()
+            .map(|v| interpolate(v, &ctx))
+            .transpose()?,
+        adt_oauth_token_url: raw.adt_oauth_token_url.clone(),
+        adt_oauth_client_id: raw.adt_oauth_client_id.clone(),
+        adt_oauth_client_secret: raw
+            .adt_oauth_client_secret
+            .as_ref()
+            .map(|v| interpolate(v, &ctx))
+            .transpose()?,
+        adt_auth_plugin: raw.adt_auth_plugin_command.as_ref().map(|cmd| {
+            crate::adt::AuthPluginSpec {
+                command: cmd.clone(),
+                parameters: raw.adt_auth_plugin_params.clone(),
+                cache_ttl: raw
+                    .adt_auth_plugin_cache_secs
+                    .map(Duration::from_secs)
+                    .unwrap_or(crate::adt::PLUGIN_DEFAULT_TTL),
+            }
+        }),
         pool_size: raw.pool_size.filter(|&n| n >= 1),
         idle_validate: raw.idle_validate_secs.map(|n| {
             if n == 0 {
@@ -251,6 +333,15 @@ fn synth_from_env(cfg: &AppConfig) -> SystemSpec {
         adt_base_url: cfg.adt_base_url.clone().or_else(|| Some(String::new())),
         adt_user: Some(cfg.adt_user.clone()),
         adt_passwd: Some(cfg.adt_passwd.clone()),
+        // env 合成路径无 TLS/OAuth/票据/插件配置（那些只在 toml 系统上有）
+        adt_cert: None,
+        adt_key: None,
+        adt_ca: None,
+        adt_sso2: None,
+        adt_oauth_token_url: None,
+        adt_oauth_client_id: None,
+        adt_oauth_client_secret: None,
+        adt_auth_plugin: None,
         read_only: None,
         // 落盘引用形态：env 密码来自 SAP_PASSWD，落 toml 时保留 ${VAR} 引用
         passwd_ref: Some("${SAP_PASSWD}".into()),
@@ -388,6 +479,9 @@ pub struct SystemHandle {
     pub meta: crate::metadata::MetadataCache,
     /// 该系统只读（写端点 403）
     pub read_only: bool,
+    /// 连接鉴权形态（sapcli 借鉴 B1）：basic | sso2 | snc | sso2+snc。
+    /// /api/systems 自描述用——agent 据此知道该系统是密码、票据还是 SNC 登录。
+    pub auth: &'static str,
     /// 该系统单请求超时**覆盖**（toml 的 request_timeout_secs；None = 跟随
     /// 全局热设置——v0.20 起 PUT /api/settings 即改即生效，见 effective_timeout）
     pub request_timeout: Option<Duration>,
@@ -779,9 +873,88 @@ fn build_adt(spec: &SystemSpec, timeout: Duration) -> Option<crate::adt::AdtEndp
         .clone()
         .or_else(|| conn_param(&spec.conn_params, "PASSWD"))
         .unwrap_or_default();
-    let ep = crate::adt::AdtEndpoint::new(&base, &user, &passwd, timeout);
+
+    // TLS 素材（mTLS identity / CA bundle，与鉴权形态正交）
+    let mut tls: Vec<&str> = Vec::new();
+    if let Some(cert) = spec.adt_cert.as_deref() {
+        tls.push(cert);
+        if let Some(key) = spec.adt_key.as_deref() {
+            tls.push(key);
+        }
+    }
+    let ca = spec.adt_ca.as_deref();
+
+    // 鉴权形态阶梯（sapcli 借鉴 B2）：OAuth（BTP ADT 只认它）> SSO2 票据 > Basic。
+    // SSO2 缺省复用系统级 mysapsso2 票据（RFC/ADT 同票）。
+    let oauth = match (
+        spec.adt_oauth_token_url.as_deref(),
+        spec.adt_oauth_client_id.as_deref(),
+        spec.adt_oauth_client_secret.as_deref(),
+    ) {
+        (Some(u), Some(id), Some(sec)) => Some((u, id, sec)),
+        (None, None, None) => None,
+        _ => {
+            tracing::error!(
+                system = %spec.name,
+                "adt_oauth_* 三件套不完整（token_url/client_id/client_secret 须同时给出）——回落 Basic/SSO2"
+            );
+            None
+        }
+    };
+    let auth = if let Some(plugin) = spec.adt_auth_plugin.clone() {
+        crate::adt::AdtAuthSpec::Plugin(plugin)
+    } else if let Some((url, id, sec)) = oauth {
+        crate::adt::AdtAuthSpec::OAuth {
+            token_url: url.to_string(),
+            client_id: id.to_string(),
+            client_secret: sec.to_string(),
+            user: spec
+                .adt_user
+                .clone()
+                .or_else(|| conn_param(&spec.conn_params, "USER")),
+            passwd: (!passwd.is_empty()).then(|| passwd.clone()),
+        }
+    } else if let Some(ticket) = spec
+        .adt_sso2
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or_else(|| conn_param(&spec.conn_params, "MYSAPSSO2"))
+    {
+        crate::adt::AdtAuthSpec::Sso2 {
+            ticket,
+            user: user.clone(),
+        }
+    } else {
+        crate::adt::AdtAuthSpec::Basic {
+            user: user.clone(),
+            passwd: passwd.clone(),
+        }
+    };
+
+    let ep = match crate::adt::AdtEndpoint::new_with_auth(&base, auth, &tls, ca, timeout) {
+        Ok(ep) => ep,
+        Err(e) => {
+            tracing::error!(system = %spec.name, error = %e, "ADT 端点构建失败——该系统 ADT 通道停用");
+            return None;
+        }
+    };
     tracing::info!(system = %spec.name, base = %ep.base_url(), "ADT 代理已启用（/api/adt/**）");
     Some(ep)
+}
+
+/// 从连接参数推导鉴权形态（纯函数，/api/systems 与测试共用）。
+fn auth_mode(params: &[(&'static str, String)]) -> &'static str {
+    let has = |k: &str| params.iter().any(|(pk, _)| *pk == k);
+    let sso2 = has("MYSAPSSO2");
+    let snc = has("SNC_QOP") || has("SNC_MYNAME") || has("SNC_PARTNERNAME") || has("SNC_LIB");
+    match (sso2, snc) {
+        (true, true) => "sso2+snc",
+        (true, false) => "sso2",
+        (false, true) => "snc",
+        (false, false) => "basic",
+    }
 }
 
 /// 组装单个系统运行句柄（启动装配与 setup 热加载共用）。
@@ -806,6 +979,7 @@ pub(crate) fn make_handle(spec: &SystemSpec, cfg: &AppConfig) -> Arc<SystemHandl
         adt,
         meta: crate::metadata::MetadataCache::new(),
         read_only,
+        auth: auth_mode(&spec.conn_params),
         request_timeout: spec.request_timeout,
         backend: backend_key(&spec.conn_params),
         sysid: OnceLock::new(),
@@ -1264,6 +1438,7 @@ ashost = "h"
             adt: None,
             meta: crate::metadata::MetadataCache::new(),
             read_only: false,
+            auth: auth_mode(&params),
             request_timeout: Some(Duration::from_secs(5)),
             backend: backend_key(&params),
             sysid: OnceLock::new(),
@@ -1362,6 +1537,14 @@ ashost = "h"
             adt_base_url: None,
             adt_user: None,
             adt_passwd: None,
+            adt_cert: None,
+            adt_key: None,
+            adt_ca: None,
+            adt_sso2: None,
+            adt_oauth_token_url: None,
+            adt_oauth_client_id: None,
+            adt_oauth_client_secret: None,
+            adt_auth_plugin: None,
             read_only: None,
             passwd_ref: None,
         };
@@ -1385,6 +1568,14 @@ ashost = "h"
             adt_base_url: None,
             adt_user: None,
             adt_passwd: None,
+            adt_cert: None,
+            adt_key: None,
+            adt_ca: None,
+            adt_sso2: None,
+            adt_oauth_token_url: None,
+            adt_oauth_client_id: None,
+            adt_oauth_client_secret: None,
+            adt_auth_plugin: None,
             read_only: None,
             passwd_ref: None,
         };
@@ -1434,5 +1625,131 @@ ashost = "h"
         assert!(was_default);
         assert!(reg.default().is_none());
         assert!(reg.names().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod auth_tests {
+    use super::*;
+
+    #[test]
+    fn auth_mode_classifies_by_params() {
+        fn mk(params: Vec<(&'static str, String)>) -> &'static str {
+            auth_mode(&params)
+        }
+        assert_eq!(
+            mk(vec![("USER", "u".into()), ("PASSWD", "p".into())]),
+            "basic"
+        );
+        assert_eq!(mk(vec![("MYSAPSSO2", "t".into())]), "sso2");
+        assert_eq!(
+            mk(vec![("SNC_QOP", "8".into()), ("SNC_LIB", "gsskrb5".into())]),
+            "snc"
+        );
+        assert_eq!(
+            mk(vec![
+                ("MYSAPSSO2", "t".into()),
+                ("SNC_PARTNERNAME", "p:CN=x".into())
+            ]),
+            "sso2+snc"
+        );
+    }
+
+    #[test]
+    fn build_spec_sso2_replaces_user_passwd() {
+        // 只有票据：classic 校验放行（票据自带身份）
+        let raw = RawSystem {
+            ashost: Some("h".into()),
+            sysnr: Some("00".into()),
+            client: Some("001".into()),
+            user: None,
+            passwd: None,
+            lang: None,
+            mysapsso2: Some("${SAP_T}".into()),
+            snc_qop: None,
+            snc_myname: None,
+            snc_partnername: None,
+            snc_lib: None,
+            default: false,
+            pool_size: None,
+            idle_validate_secs: None,
+            request_timeout_secs: None,
+            adt_base_url: None,
+            adt_user: None,
+            adt_passwd: None,
+            adt_cert: None,
+            adt_key: None,
+            adt_ca: None,
+            adt_sso2: None,
+            adt_oauth_token_url: None,
+            adt_oauth_client_id: None,
+            adt_oauth_client_secret: None,
+            adt_auth_plugin_command: None,
+            adt_auth_plugin_params: Default::default(),
+            adt_auth_plugin_cache_secs: None,
+            read_only: None,
+            conn: Default::default(),
+        };
+        unsafe { std::env::set_var("SAP_T", "ticket-value") };
+        let spec = build_spec("sso", &raw).expect("sso2 spec");
+        assert!(spec
+            .conn_params
+            .iter()
+            .any(|(k, v)| *k == "MYSAPSSO2" && v == "ticket-value"));
+        assert!(!spec.conn_params.iter().any(|(k, _)| *k == "USER"));
+
+        // 都不给：仍报错
+        let raw2 = RawSystem {
+            mysapsso2: None,
+            ..raw
+        };
+        let err = build_spec("noauth", &raw2).unwrap_err();
+        assert!(err.contains("user/passwd"), "got: {err}");
+        unsafe { std::env::remove_var("SAP_T") };
+    }
+
+    #[test]
+    fn build_spec_snc_pass_replaces_passwd() {
+        let raw = RawSystem {
+            ashost: Some("h".into()),
+            sysnr: Some("00".into()),
+            client: Some("001".into()),
+            user: None,
+            passwd: None,
+            lang: None,
+            mysapsso2: None,
+            snc_qop: Some("8".into()),
+            snc_myname: None,
+            snc_partnername: Some("p:CN=A4H".into()),
+            snc_lib: Some("/usr/sap/lib/gsskrb5.so".into()),
+            default: false,
+            pool_size: None,
+            idle_validate_secs: None,
+            request_timeout_secs: None,
+            adt_base_url: None,
+            adt_user: None,
+            adt_passwd: None,
+            adt_cert: None,
+            adt_key: None,
+            adt_ca: None,
+            adt_sso2: None,
+            adt_oauth_token_url: None,
+            adt_oauth_client_id: None,
+            adt_oauth_client_secret: None,
+            adt_auth_plugin_command: None,
+            adt_auth_plugin_params: Default::default(),
+            adt_auth_plugin_cache_secs: None,
+            read_only: None,
+            conn: Default::default(),
+        };
+        let spec = build_spec("snc", &raw).expect("snc spec");
+        assert_eq!(auth_mode(&spec.conn_params), "snc");
+        // 快捷字段与 conn 透传冲突检测依旧生效
+        let mut raw2 = raw.clone();
+        raw2.snc_qop = None;
+        raw2.conn.insert("SNC_QOP".into(), "9".into());
+        // 注意：conn 透传键也命中新的 SHORTCUT_KEYS —— 同名冲突应报错
+        let err = build_spec("snc2", &raw2).unwrap_err();
+        assert!(err.contains("快捷字段"), "got: {err}");
     }
 }

@@ -1017,14 +1017,37 @@
                       "items": {
                         "type": "object",
                         "properties": {
-                          "at": { "type": "string", "description": "RFC3339 UTC" },
-                          "via": { "type": "string", "enum": ["rfc", "functions-invoke", "invokes-alias"] },
-                          "alias": { "type": "string", "nullable": true },
-                          "func": { "type": "string" },
-                          "ok": { "type": "boolean" },
-                          "status": { "type": "integer" },
-                          "ms": { "type": "integer" },
-                          "ip": { "type": "string" }
+                          "at": {
+                            "type": "string",
+                            "description": "RFC3339 UTC"
+                          },
+                          "via": {
+                            "type": "string",
+                            "enum": [
+                              "rfc",
+                              "functions-invoke",
+                              "invokes-alias"
+                            ]
+                          },
+                          "alias": {
+                            "type": "string",
+                            "nullable": true
+                          },
+                          "func": {
+                            "type": "string"
+                          },
+                          "ok": {
+                            "type": "boolean"
+                          },
+                          "status": {
+                            "type": "integer"
+                          },
+                          "ms": {
+                            "type": "integer"
+                          },
+                          "ip": {
+                            "type": "string"
+                          }
                         }
                       }
                     }
@@ -1369,20 +1392,44 @@
                 "schema": {
                   "type": "object",
                   "properties": {
-                    "type": { "type": "string" },
-                    "name": { "type": "string" },
-                    "lines": { "type": "array", "items": { "type": "string" } },
-                    "source": { "type": "string" },
-                    "source_via": { "type": "string", "enum": ["adt"] }
+                    "type": {
+                      "type": "string"
+                    },
+                    "name": {
+                      "type": "string"
+                    },
+                    "lines": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "source": {
+                      "type": "string"
+                    },
+                    "source_via": {
+                      "type": "string",
+                      "enum": [
+                        "adt"
+                      ]
+                    }
                   }
                 }
               }
             }
           },
-          "400": { "$ref": "#/components/responses/Error" },
-          "401": { "$ref": "#/components/responses/Error" },
-          "404": { "$ref": "#/components/responses/Error" },
-          "502": { "$ref": "#/components/responses/Error" }
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "502": {
+            "$ref": "#/components/responses/Error"
+          }
         }
       },
       "put": {
@@ -1718,19 +1765,35 @@
                 "schema": {
                   "type": "object",
                   "properties": {
-                    "created": { "type": "boolean" },
-                    "type": { "type": "string" },
-                    "name": { "type": "string" },
-                    "write": { "$ref": "#/components/schemas/WriteOutcome" }
+                    "created": {
+                      "type": "boolean"
+                    },
+                    "type": {
+                      "type": "string"
+                    },
+                    "name": {
+                      "type": "string"
+                    },
+                    "write": {
+                      "$ref": "#/components/schemas/WriteOutcome"
+                    }
                   }
                 }
               }
             }
           },
-          "400": { "$ref": "#/components/responses/Error" },
-          "401": { "$ref": "#/components/responses/Error" },
-          "409": { "$ref": "#/components/responses/Error" },
-          "502": { "$ref": "#/components/responses/Error" }
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          },
+          "502": {
+            "$ref": "#/components/responses/Error"
+          }
         }
       }
     },
@@ -1796,18 +1859,888 @@
                 "schema": {
                   "type": "object",
                   "properties": {
-                    "type": { "type": "string" },
-                    "name": { "type": "string" },
-                    "deleted": { "type": "boolean" }
+                    "type": {
+                      "type": "string"
+                    },
+                    "name": {
+                      "type": "string"
+                    },
+                    "deleted": {
+                      "type": "boolean"
+                    }
                   }
                 }
               }
             }
           },
-          "400": { "$ref": "#/components/responses/Error" },
-          "401": { "$ref": "#/components/responses/Error" },
-          "409": { "$ref": "#/components/responses/Error" },
-          "502": { "$ref": "#/components/responses/Error" }
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          },
+          "502": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/objects/{type}/{name}/meta": {
+      "get": {
+        "tags": [
+          "objects"
+        ],
+        "summary": "Object metadata verbs: exists / locked / active / author in one round trip",
+        "description": "Probe before you write. exists=false short-circuits (other fields null, no error). locked is a non-destructive ADT LOCK/UNLOCK probe (null for tabl/stru etag-objects and package). active: primary source is the ADT object node itself (adtcore:version; active_check=adt); falls back to REPOSRC for prog/incl/fugr when absent (active_check=reposrc); others null + active_check=unsupported_type. changed_by/changed_on from the ADT node (adtcore:changedBy/changedAt) with REPOSRC fallback for prog/incl/fugr; author/created_on from TADIR. For func the group is auto-resolved (?group= to skip); failed resolution answers exists:false.",
+        "parameters": [
+          {
+            "name": "type",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "prog",
+                "incl",
+                "class",
+                "intf",
+                "func",
+                "fugr",
+                "cds",
+                "tabl",
+                "stru",
+                "package"
+              ]
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "group",
+            "in": "query",
+            "required": false,
+            "description": "Function group hint (func only; default auto-resolved via RFC search)",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Metadata snapshot",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "string"
+                    },
+                    "name": {
+                      "type": "string"
+                    },
+                    "group": {
+                      "type": "string",
+                      "nullable": true
+                    },
+                    "exists": {
+                      "type": "boolean"
+                    },
+                    "locked": {
+                      "type": "boolean",
+                      "nullable": true
+                    },
+                    "lock_mode": {
+                      "type": "string",
+                      "enum": [
+                        "adt_lock",
+                        "etag",
+                        "none"
+                      ]
+                    },
+                    "lock_message": {
+                      "type": "string",
+                      "nullable": true
+                    },
+                    "active": {
+                      "type": "boolean",
+                      "nullable": true
+                    },
+                    "active_check": {
+                      "type": "string",
+                      "enum": [
+                        "adt",
+                        "reposrc",
+                        "unsupported_type",
+                        "not_checked"
+                      ]
+                    },
+                    "changed_by": {
+                      "type": "string",
+                      "nullable": true
+                    },
+                    "changed_on": {
+                      "type": "string",
+                      "nullable": true
+                    },
+                    "changed_by_via": {
+                      "type": "string",
+                      "enum": [
+                        "reposrc",
+                        "none"
+                      ]
+                    },
+                    "author": {
+                      "type": "string",
+                      "nullable": true
+                    },
+                    "created_on": {
+                      "type": "string",
+                      "nullable": true
+                    },
+                    "author_via": {
+                      "type": "string",
+                      "enum": [
+                        "tadir",
+                        "none"
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "502": {
+            "$ref": "#/components/responses/Error"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/export/package/{devclass}": {
+      "get": {
+        "tags": [
+          "objects"
+        ],
+        "summary": "Export a package as an abapGit-style file tree (zip; source-compatible, not importable yet)",
+        "description": "Serializes a package and (by default) its child packages into an abapGit-convention file tree (.abapgit.xml + export_manifest.json + src/<pkg>/{name}.{prog|incl|clas|intf}.abap / {name}.{tabl|stru|cds}.ddl / package.devc.xml; FUGR members exported as group includes named by include). Metadata XML is not generated yet, so the tree is NOT abapGit-importable (import is phase 2). Coverage: R3TR PROG (includes split via REPOSRC.SUBC), CLAS, INTF, FUGR (group includes via the repository environment service - ENLFDIR/TFDIR are pooled tables RFC_READ_TABLE refuses), DDLS, TABL (structures via DD02L.TABCLASS), DEVC. Other types are listed as status=skipped. Per-object read failures do not fail the export (manifest carries the error). GET is a read: usable on read_only deployments. Scoped form: /api/s/{system}/export/package/{devclass}.",
+        "parameters": [
+          {
+            "name": "devclass",
+            "in": "path",
+            "required": true,
+            "description": "Package name (uppercase; namespaces as /NS/NAME; local $ packages allowed)",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "recurse",
+            "in": "query",
+            "required": false,
+            "description": "Include child packages via TDEVC.PARENTCL BFS (depth 10). Default true.",
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "name": "max_objects",
+            "in": "query",
+            "required": false,
+            "description": "Object count cap (including FUGR includes). Default 500; past it 400 EXPORT_TOO_LARGE (hard limit 2000).",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "manifest",
+            "in": "query",
+            "required": false,
+            "description": "true = return the JSON manifest only (no source reads, no zip) — fast preview.",
+            "schema": {
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Zip archive (or JSON manifest when manifest=true)",
+            "content": {
+              "application/zip": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              },
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "format": {
+                      "type": "string"
+                    },
+                    "folder_logic": {
+                      "type": "string"
+                    },
+                    "sysid": {
+                      "type": "string",
+                      "nullable": true
+                    },
+                    "package": {
+                      "type": "string"
+                    },
+                    "object_count": {
+                      "type": "integer"
+                    },
+                    "packages": {
+                      "type": "array",
+                      "items": {
+                        "type": "object"
+                      }
+                    },
+                    "objects": {
+                      "type": "array",
+                      "items": {
+                        "type": "object"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "502": {
+            "$ref": "#/components/responses/Error"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/import/package/{devclass}": {
+      "post": {
+        "tags": [
+          "objects"
+        ],
+        "summary": "Install an exported package zip back (round-trip; dependency-ordered, two-phase activation)",
+        "description": "Reverse of /api/export/package: installs the gateway's own export zip (sap-for-agents-export/1) into the target package. Ports abapGit's deserialization model: dependency-ordered creation (packages → FUGR shells → tabl/stru → cds → intf → class → prog → incl → group-includes), two-phase activation (all writes inactive, then activate in order with a retry pass), PREFIX-style package remap (manifest root → {devclass}; subpackages → {devclass}_{leaf}), per-object error tolerance. Object names are global in SAP: same-named objects elsewhere get updated in place (real_package reports where they landed). dry_run=true is a zero-write preflight. Arbitrary abapGit-repo XML import is phase 3. Request body: raw zip bytes, capped at 32 MB. Scoped form: /api/s/{system}/import/package/{devclass}. Read-only deployments block it (except dry_run).",
+        "parameters": [
+          {
+            "name": "devclass",
+            "in": "path",
+            "required": true,
+            "description": "Target package (uppercase; subpackages remap as {devclass}_{leaf})",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "overwrite",
+            "in": "query",
+            "required": false,
+            "description": "Update existing objects in place. Default true; false → action=skipped_exists.",
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "name": "dry_run",
+            "in": "query",
+            "required": false,
+            "description": "Zero-write preflight: parse + probe existence + plan. Default false. Exempt from the read-only guard.",
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "name": "activate",
+            "in": "query",
+            "required": false,
+            "description": "Two-phase activation after all writes (ordered, with retry pass). Default true; false → everything stays inactive.",
+            "schema": {
+              "type": "boolean"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/zip": {
+              "schema": {
+                "type": "string",
+                "format": "binary"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Import result (or plan when dry_run=true)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "format": {
+                      "type": "string"
+                    },
+                    "dry_run": {
+                      "type": "boolean"
+                    },
+                    "package": {
+                      "type": "string"
+                    },
+                    "target": {
+                      "type": "string"
+                    },
+                    "overwrite": {
+                      "type": "boolean"
+                    },
+                    "packages": {
+                      "type": "array",
+                      "items": {
+                        "type": "object"
+                      }
+                    },
+                    "objects": {
+                      "type": "array",
+                      "items": {
+                        "type": "object"
+                      }
+                    },
+                    "skipped_unsupported": {
+                      "type": "array",
+                      "items": {
+                        "type": "object"
+                      }
+                    },
+                    "summary": {
+                      "type": "object",
+                      "properties": {
+                        "created": {
+                          "type": "integer"
+                        },
+                        "updated": {
+                          "type": "integer"
+                        },
+                        "skipped": {
+                          "type": "integer"
+                        },
+                        "failed": {
+                          "type": "integer"
+                        }
+                      }
+                    },
+                    "activation": {
+                      "type": "array",
+                      "items": {
+                        "type": "object"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "502": {
+            "$ref": "#/components/responses/Error"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/objects/search": {
+      "get": {
+        "tags": [
+          "agentops"
+        ],
+        "summary": "ADT quick search across all object types",
+        "description": "Prefix search over every repository object (classes, programs, DDIC, CDS, ...). Term auto-gets a trailing `*`. Results are `[SearchHit]` (name/typ/description/package/uri) — the `uri` feeds `ANY /api/adt/{path}` directly. Complements `POST /api/functions/search` (RFC-side, functions only). Requires ADT.",
+        "parameters": [
+          {
+            "name": "q",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "max_results",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "default": 51,
+              "minimum": 1,
+              "maximum": 100
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Search hits",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/table/osql": {
+      "post": {
+        "tags": [
+          "agentops"
+        ],
+        "summary": "OpenSQL SELECT via ADT data preview (freestyle)",
+        "description": "Runs an OpenSQL SELECT (`WITH` CTE allowed) through the ADT SQL console — reads pooled tables and joins that `RFC_READ_TABLE` refuses. Values are strings; `rows` caps rows (default 100, max 5000); read-only by design.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "sql"
+                ],
+                "properties": {
+                  "sql": {
+                    "type": "string",
+                    "example": "select mandt, cccategory from t000"
+                  },
+                  "rows": {
+                    "type": "integer",
+                    "default": 100,
+                    "maximum": 5000
+                  },
+                  "aging": {
+                    "type": "boolean",
+                    "default": true
+                  },
+                  "timeout_secs": {
+                    "type": "integer"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "{columns, rows, row_count, total_rows}",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/abap/run": {
+      "post": {
+        "tags": [
+          "agentops"
+        ],
+        "summary": "Run an ABAP snippet (temporary if_oo_adt_classrun class)",
+        "description": "Wraps the snippet in a temporary classrun class (name `<prefix>_<user>_<random>` ≤30 chars, default package $TMP), creates it, syntax-checks, writes+activates, executes via ADT `oo/classrun`, then unconditionally deletes it. Execution runs in a fresh ADT session (avoids the stale class-metadata pitfall). Business failures are HTTP 200 with `ok:false` + `step` (syntax_check|activate|execute) + findings; only transport-level problems are 4xx/5xx. Blocked on read-only deployments (creates an object). Requires ADT.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "source"
+                ],
+                "properties": {
+                  "source": {
+                    "type": "string",
+                    "example": "out->write( |Hello, { sy-uname }!| )."
+                  },
+                  "package": {
+                    "type": "string",
+                    "default": "$TMP"
+                  },
+                  "prefix": {
+                    "type": "string",
+                    "default": "zcl_sfa_run"
+                  },
+                  "timeout_secs": {
+                    "type": "integer"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "{ok, output, class, package, duration_ms, deleted, [step|issues|problems]}",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/tests/aunit": {
+      "post": {
+        "tags": [
+          "agentops"
+        ],
+        "summary": "Run ABAP Unit tests (async 3-step API)",
+        "description": "Starts an ABAP Unit run for the given objects (class/program/interface/fugr/func as a flat object set; package as a package set — do not mix), polls until FINISHED (1s short polls), fetches results. `format=json` parses the ABAPUnit results XML into a summary + nested programs/test classes/methods + flat alert list; `junit4`/`raw` pass the result XML through verbatim (CI-ready). Not blocked on read-only (execution, like /api/rfc). Requires ADT.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "objects"
+                ],
+                "properties": {
+                  "objects": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "required": [
+                        "type",
+                        "name"
+                      ],
+                      "properties": {
+                        "type": {
+                          "type": "string",
+                          "enum": [
+                            "class",
+                            "program",
+                            "interface",
+                            "fugr",
+                            "func",
+                            "package"
+                          ]
+                        },
+                        "name": {
+                          "type": "string"
+                        }
+                      }
+                    }
+                  },
+                  "format": {
+                    "type": "string",
+                    "enum": [
+                      "json",
+                      "junit4",
+                      "raw"
+                    ],
+                    "default": "json"
+                  },
+                  "timeout_secs": {
+                    "type": "integer",
+                    "default": 120
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "json: {run_id, summary, programs, alerts} — junit4/raw: result XML",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/atc/run": {
+      "post": {
+        "tags": [
+          "agentops"
+        ],
+        "summary": "Run ATC checks (worklist + findings JSON)",
+        "description": "Creates an ATC worklist (`variant` optional — falls back to the system check variant from atc/customizing), runs checks for the given objects (class/interface/program/fugr/package), returns parsed findings (priority/checkId/checkTitle/messageTitle/location) with per-priority counts. Quality gate for agent-written code. Requires ADT.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "objects"
+                ],
+                "properties": {
+                  "objects": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "required": [
+                        "type",
+                        "name"
+                      ],
+                      "properties": {
+                        "type": {
+                          "type": "string",
+                          "enum": [
+                            "class",
+                            "interface",
+                            "program",
+                            "fugr",
+                            "package"
+                          ]
+                        },
+                        "name": {
+                          "type": "string"
+                        }
+                      }
+                    }
+                  },
+                  "variant": {
+                    "type": "string"
+                  },
+                  "max_verdicts": {
+                    "type": "integer",
+                    "default": 100
+                  },
+                  "include_exempted": {
+                    "type": "boolean",
+                    "default": false
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "{variant, worklist_id, objects[], total_findings, by_priority, infos}",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/cts/requests": {
+      "post": {
+        "tags": [
+          "agentops"
+        ],
+        "summary": "Create a CTS transport request",
+        "description": "Creates a workbench (default) / customizing / transport-of-copies / development-correction / repair request with one task owned by `owner` (default: the ADT login user). Returns the generated request number. Blocked on read-only. Requires ADT.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "description"
+                ],
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "enum": [
+                      "workbench",
+                      "customizing",
+                      "transport-of-copies",
+                      "development-correction",
+                      "repair"
+                    ],
+                    "default": "workbench"
+                  },
+                  "description": {
+                    "type": "string"
+                  },
+                  "target": {
+                    "type": "string"
+                  },
+                  "owner": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "{number, type, description, target, owner, status}",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/cts/requests/{number}": {
+      "get": {
+        "tags": [
+          "agentops"
+        ],
+        "summary": "Read a CTS transport request",
+        "description": "Fetches number/owner/description/status (R=released, D=in dev, ?=unknown)/target plus its tasks and locked objects. Requires ADT.",
+        "parameters": [
+          {
+            "name": "number",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "{number, type, owner, description, status, released, target, tasks[]}",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "agentops"
+        ],
+        "summary": "Delete a CTS transport request",
+        "description": "Deletes the request; `?recursive=true` first deletes its unreleased tasks. Blocked on read-only. Requires ADT.",
+        "parameters": [
+          {
+            "name": "number",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "recursive",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": false
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "{number, deleted, tasks[]}",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/cts/requests/{number}/release": {
+      "post": {
+        "tags": [
+          "agentops"
+        ],
+        "summary": "Release a CTS transport request",
+        "description": "Posts a release job; success = checkReport status `released` (returned as `released:true`, business failures stay HTTP 200). `?recursive=true` releases unreleased tasks first. Blocked on read-only. Requires ADT.",
+        "parameters": [
+          {
+            "name": "number",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "recursive",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": false
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "{number, released, status, status_text, tasks[]}",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          }
         }
       }
     },
@@ -2441,7 +3374,10 @@
           },
           "interface_via": {
             "type": "string",
-            "enum": ["fii", "sdk"],
+            "enum": [
+              "fii",
+              "sdk"
+            ],
             "description": "Which channel served the interface: fii = live server-side read (always fresh, default), sdk = SDK descriptor cache (fallback when FII is unavailable)"
           }
         }

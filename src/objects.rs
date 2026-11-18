@@ -270,30 +270,30 @@ impl ObjectType {
 
 /// 一个元素：本地名、祖先链、属性、直接文本。
 #[derive(Debug, Default)]
-struct XmlElem {
-    name: String,
+pub(crate) struct XmlElem {
+    pub(crate) name: String,
     /// 祖先本地名（从外到内），含自身以外的全部层级
-    parents: Vec<String>,
-    attrs: Vec<(String, String)>,
-    text: String,
+    pub(crate) parents: Vec<String>,
+    pub(crate) attrs: Vec<(String, String)>,
+    pub(crate) text: String,
 }
 
 impl XmlElem {
-    fn attr(&self, key: &str) -> Option<&str> {
+    pub(crate) fn attr(&self, key: &str) -> Option<&str> {
         self.attrs
             .iter()
             .find(|(k, _)| k == key)
             .map(|(_, v)| v.as_str())
     }
     /// 父链以 …/parent 结尾（不看更外层）
-    fn parent_is(&self, parent: &str) -> bool {
+    pub(crate) fn parent_is(&self, parent: &str) -> bool {
         self.parents.last().map(String::as_str) == Some(parent)
     }
 }
 
 /// 遍历 XML 文档，产出每个元素（Start 与 Empty 都产出）。
 /// 文本只累积到**直接**所属元素——子元素的文本不会污染父元素。
-fn walk_xml(xml: &str) -> Vec<XmlElem> {
+pub(crate) fn walk_xml(xml: &str) -> Vec<XmlElem> {
     use quick_xml::events::Event;
     use quick_xml::Reader;
 
@@ -372,7 +372,7 @@ fn walk_xml(xml: &str) -> Vec<XmlElem> {
     elems
 }
 
-fn local_name(qname: &str) -> &str {
+pub(crate) fn local_name(qname: &str) -> &str {
     crate::dumps::xml_local_name_of(qname)
 }
 
@@ -421,7 +421,7 @@ pub struct LockInfo {
 }
 
 /// 解析 ADT 异常文档（锁冲突 EU510 / 权限等），产出 SAP 自己的说法。
-fn adt_exception_error(body: &str, action: &str) -> RfcError {
+pub(crate) fn adt_exception_error(body: &str, action: &str) -> RfcError {
     let elems = walk_xml(body);
     let id = elems
         .iter()
@@ -717,7 +717,11 @@ fn parse_activation_result(body: &str) -> ActivationOutcome {
         .messages
         .iter()
         .any(|m| m.severity.contains('E') || m.severity.contains('A') || m.severity.contains('X'));
-    out.success = out.activation_executed && !has_error;
+    // activationExecuted="false" 有两种含义（A4H 实证）：
+    // ① 空转——同源 PUT 不产生未激活版本，激活无事可做（对象本就活跃）→ 成功；
+    // ② 被取消/拒绝——此时清单里必带消息（如 "Activation was cancelled"）→ 失败。
+    // 判据：executed=false 且清单完全无消息 = 空转成功；有消息仍按原规则判。
+    out.success = !has_error && (out.activation_executed || out.messages.is_empty());
 
     if !out.success {
         // 问题行：E/A/X 优先；一个都没有时连警告一起报（SAP 会用 W 说"已取消"）
@@ -755,7 +759,7 @@ fn parse_activation_result(body: &str) -> ActivationOutcome {
 }
 
 /// XML 属性转义。
-fn xml_attr_escape(s: &str) -> String {
+pub(crate) fn xml_attr_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
@@ -763,7 +767,8 @@ fn xml_attr_escape(s: &str) -> String {
 }
 
 /// 激活对象（先解锁后激活是 SAP 要求，见模块注释）。
-async fn activate_object(
+/// pub(crate)：导入编排（import.rs 两阶段激活的第二阶段）复用同一通道。
+pub(crate) async fn activate_object(
     adt: &AdtEndpoint,
     base: &str,
     name: &str,
@@ -2751,6 +2756,191 @@ pub async fn read_current_source(
 }
 
 // ========================================================================
+// 对象元数据动词（GET /api/objects/{type}/{name}/meta 的探测件）
+// ========================================================================
+// 写前探测三件套：存在性（base GET 状态码）、锁状态（LOCK→UNLOCK 探测环）、
+// 目录/REPOSRC 元数据（RFC 读，编排见 export.rs 的 read_meta_rfc）。
+// 探测环复用写编排的会话机制：锁随 stateful 会话丢弃而释放，不留残留。
+
+/// ADT base 资源自带的元数据属性（一次 GET 全拿到——存在性 + 作者 + 版本态）。
+pub struct AdtObjectState {
+    pub exists: bool,
+    /// 最后修改者（adtcore:changedBy）
+    pub changed_by: String,
+    /// 最后修改时间（adtcore:changedAt，ISO 8601）
+    pub changed_at: String,
+    /// 版本状态（adtcore:version："active"=无未激活版本 / "inactive"=有待激活
+    /// ——A4H 真机实证：写后不激活 → "inactive"）
+    pub version: String,
+}
+
+/// 对象的 ADT 元数据探测（base 资源 GET；2xx=存在并解析属性，404=不存在，
+/// 其余上抛）。存在性与属性同一次往返——meta 动词与写前探测共用。
+pub async fn read_adt_object_state(
+    adt: &AdtEndpoint,
+    obj_type: ObjectType,
+    name: &str,
+    group: &str,
+) -> Result<AdtObjectState, RfcError> {
+    let rel = obj_type.base_rel(name, group);
+    let (status, _, body) = adt.get_raw(&rel, "*/*").await?;
+    match status {
+        200..=299 => {
+            let xml = String::from_utf8_lossy(&body);
+            // 根元素携带 adtcore:* 属性（walk_xml 保文档序，首个即根）
+            let (changed_by, changed_at, version) = walk_xml(&xml)
+                .first()
+                .map(|root| {
+                    (
+                        root.attr("changedBy").unwrap_or_default().to_string(),
+                        root.attr("changedAt").unwrap_or_default().to_string(),
+                        root.attr("version").unwrap_or_default().to_string(),
+                    )
+                })
+                .unwrap_or_default();
+            Ok(AdtObjectState {
+                exists: true,
+                changed_by,
+                changed_at,
+                version,
+            })
+        }
+        404 => Ok(AdtObjectState {
+            exists: false,
+            changed_by: String::new(),
+            changed_at: String::new(),
+            version: String::new(),
+        }),
+        _ => Err(RfcError {
+            code: -1,
+            status: 502,
+            message: format!(
+                "ADT 存在性探测返回 {}：{}",
+                status,
+                truncate(&String::from_utf8_lossy(&body), 200)
+            ),
+            key: "ADT_META_UNAVAILABLE".into(),
+        }),
+    }
+}
+
+/// 锁探测结果。
+#[derive(Debug, serde::Serialize)]
+pub struct LockProbe {
+    /// Some(false)=当前无锁（可写）；Some(true)=被他人锁定；None=该类型无编辑锁
+    pub locked: Option<bool>,
+    /// 锁模式：`etag`=blue DDIC 乐观并发；`none`=package；`adt_lock`=ADT 编辑锁
+    pub mode: &'static str,
+    /// SAP 的一手信息（锁冲突原因 / 不可修改原因）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+/// 锁状态探测（非破坏性：LOCK 成功立刻 UNLOCK，会话随后丢弃）。
+/// - blue DDIC（tabl/stru）无编辑锁 → locked:None + mode:"etag"；
+/// - package 无锁概念 → locked:None + mode:"none"；
+/// - 其余走完整探测环：锁成功=未锁；EU510（他人锁定）=已锁（带 SAP 原因）；
+///   无锁柄（只读对象）=未锁但带不可修改原因。
+pub async fn probe_lock_state(
+    adt: &AdtEndpoint,
+    obj_type: ObjectType,
+    name: &str,
+    group: &str,
+) -> Result<LockProbe, RfcError> {
+    if obj_type.is_blue_ddic() {
+        return Ok(LockProbe {
+            locked: None,
+            mode: "etag",
+            message: None,
+        });
+    }
+    if matches!(obj_type, ObjectType::Package) {
+        return Ok(LockProbe {
+            locked: None,
+            mode: "none",
+            message: None,
+        });
+    }
+    let base = obj_type.base_rel(name, group);
+    let mut sess = WriteSession::establish(adt, &base).await?;
+    let probe = match lock_object(adt, &base, &mut sess).await {
+        Ok(lock) => {
+            let _ = unlock_object(adt, &base, &lock.lock_handle, &mut sess).await;
+            Ok(LockProbe {
+                locked: Some(false),
+                mode: "adt_lock",
+                message: None,
+            })
+        }
+        Err(e) if e.key == "OBJECT_LOCKED" => Ok(LockProbe {
+            locked: Some(true),
+            mode: "adt_lock",
+            message: Some(e.message),
+        }),
+        Err(e) if e.key == "OBJECT_NOT_MODIFIABLE" => Ok(LockProbe {
+            locked: Some(false),
+            mode: "adt_lock",
+            message: Some(e.message),
+        }),
+        // 该资源类型不支持编辑锁（fugr 基础资源等，ADT 400/405/其他 409 异常）：
+        // meta 不因此整体失败——降级为「锁态未知」
+        Err(e)
+            if e.status == 400
+                || e.status == 405
+                || (e.status == 409 && e.key.starts_with("ADT_")) =>
+        {
+            Ok(LockProbe {
+                locked: None,
+                mode: "adt_lock",
+                message: Some(format!("该资源不支持编辑锁探测: {}", e.message)),
+            })
+        }
+        Err(e) => Err(e),
+    };
+    drop_session(adt, &base, &sess).await;
+    probe
+}
+
+/// 对象的 TADIR 目录键（PGMID='R3TR'）。func 无自己的 R3TR 行（成员挂在
+/// FUGR 下），目录层面用组代表——author 兜底取组的。
+pub fn tadir_key_of(obj_type: ObjectType, name: &str, group: &str) -> (&'static str, String) {
+    match obj_type {
+        ObjectType::Program | ObjectType::Include => ("PROG", name.trim().to_uppercase()),
+        ObjectType::Class => ("CLAS", name.trim().to_uppercase()),
+        ObjectType::Interface => ("INTF", name.trim().to_uppercase()),
+        ObjectType::Function => ("FUGR", group.trim().to_uppercase()),
+        ObjectType::FunctionGroup => ("FUGR", name.trim().to_uppercase()),
+        ObjectType::CdsView => ("DDLS", name.trim().to_uppercase()),
+        ObjectType::Table | ObjectType::Structure => ("TABL", name.trim().to_uppercase()),
+        ObjectType::Package => ("DEVC", name.trim().to_uppercase()),
+    }
+}
+
+/// 对象的 REPOSRC 程序名（meta 判据的 REPOSRC 兜底通道）。
+/// func 返回 None——FM 的 REPOSRC 行在其 include 报表上，而 include 名映射在
+/// ENLFDIR 里（表池表，RFC_READ_TABLE 拒读）；meta 的主通道是 ADT 对象节点
+/// 属性（objects::read_adt_object_state），REPOSRC 仅在其属性缺失时兜底。
+pub fn reposrc_name_of(obj_type: ObjectType, name: &str, group: &str) -> Option<String> {
+    match obj_type {
+        ObjectType::Program | ObjectType::Include => Some(name.trim().to_uppercase()),
+        // 函数组主程序 SAPL{组}（SUBC='F'，生成物常驻 REPOSRC）
+        ObjectType::FunctionGroup => Some(format!("SAPL{}", group.trim().to_uppercase())),
+        _ => None,
+    }
+}
+
+/// `active` 判据是否可用（REPOSRC 未激活版本存在性检查）。
+pub fn active_check_supported(obj_type: ObjectType) -> bool {
+    matches!(
+        obj_type,
+        ObjectType::Program
+            | ObjectType::Include
+            | ObjectType::Function
+            | ObjectType::FunctionGroup
+    )
+}
+
+// ========================================================================
 // 测试
 // ========================================================================
 
@@ -2998,6 +3188,21 @@ mod tests {
         assert_eq!(out.problems.len(), 1);
         assert!(out.problems[0].starts_with("Line 18: "));
         assert!(out.problems[0].contains("headers"));
+    }
+
+    #[test]
+    fn parse_activation_noop_is_success() {
+        // activationExecuted="false" 且清单无消息 = 空转成功（同源 PUT 不产生
+        // 未激活版本，激活无事可做——对象本就活跃；A4H 实证）
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<chkl:checklist xmlns:chkl="http://www.sap.com/adt/checklist">
+  <chkl:properties checkExecuted="false" activationExecuted="false"/>
+</chkl:checklist>"#;
+        let out = parse_activation_result(xml);
+        assert!(out.success, "空转应判成功而非失败");
+        assert!(!out.activation_executed);
+        assert!(out.messages.is_empty());
+        assert!(out.problems.is_empty());
     }
 
     #[test]

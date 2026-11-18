@@ -60,6 +60,9 @@ curl -H "Authorization: Bearer <SAP_API_KEY>" http://127.0.0.1:3000/api/function
 | 语法检查（**不写库**，源码内嵌提交） | `POST /api/objects/{type}/{name}/syntax` |
 | 想**读**对象源码（保留原文大小写；含 incl / intf / cds / fugr） | `GET /api/objects/{type}/{name}/source` |
 | 想**删除**对象（删 fugr 会连带其中函数模块） | `DELETE /api/objects/{type}/{name}?group=&transport=` |
+| 想**快照一个包**为 abapGit 风格文件树（git 友好 zip；备份 / SAP↔本地 diff） | `GET /api/export/package/{devclass}` |
+| 想在**写之前**拿到对象的 exists / locked / active / 作者（一次往返） | `GET /api/objects/{type}/{name}/meta` |
+| 想把**导出的 zip 装回系统**（round-trip；依赖序 + 两阶段激活） | `POST /api/import/package/{devclass}` |
 | 想读/写 ABAP 类源码等 ADT（Eclipse 工具链）资源 | `ANY /api/adt/{path}` |
 | **实际调用一个 SAP 函数** | `POST /api/rfc` |
 | 想调用函数但**免填** `func_name`（类型化端点） | `POST /api/functions/{name}/invoke` |
@@ -450,6 +453,72 @@ curl -X POST http://127.0.0.1:3000/api/objects/prog/ZMY_REPORT/syntax \
 - **读回保留原文大小写**：`/api/programs/{name}/source` 现以 `WITH_LOWERCASE` 请求——读到即存到，从读回内容取的锚点必然匹配。`GET /api/objects/{type}/{name}/source`（ADT 通道）是新类型与函数模块的规范读入口（SEDI 形态，与写入口径一致）。
 - **只读部署**：部署者可能以 `SAP_READ_ONLY=1` 运行网关——写端点（`PUT .../source`、`POST .../replace`、`POST .../create`、`DELETE`、`/api/adt` 非读方法）此时返回 403 `READ_ONLY`。这是刻意为之：不要重试写操作，改为只读操作与 `POST .../syntax`（仍可用，不落库）。`POST /api/rfc` 不受该开关影响。
 
+### 10. 包导出与对象元数据动词（abapGit 吸收，v0.21）
+
+**包级快照**——把一个包（含子包）序列化为 abapGit 风格文件树，zip 交付：agent 可直接提交 git、做 SAP↔本地 diff、做备份：
+
+```bash
+# 先看清单（JSON manifest，不读源码，快）
+curl 'http://127.0.0.1:3000/api/export/package/ZAGT_TEST?manifest=true'
+# → {"format":"sap-for-agents-export/1","folder_logic":"full","objects":[{type,name,package,path,status,author,...}],"packages":[...]}
+
+# 完整导出（zip：.abapgit.xml + export_manifest.json + src/<包>/ 文件树）
+curl 'http://127.0.0.1:3000/api/export/package/ZAGT_TEST' -o zagt_test.zip
+# → application/zip；树内：src/<包>/{名}.{prog|incl|clas|intf|func}.abap、{名}.{tabl|stru|cds}.ddl、package.devc.xml
+
+# 递归默认开（TDEVC 子包 BFS，深度 10）；控制范围：
+curl 'http://127.0.0.1:3000/api/export/package/ZFOO?recurse=false&max_objects=200'
+```
+
+- **文件命名沿用 abapGit 约定**（filename logic + FULL 目录逻辑、小写、命名空间 `/NS/` → `#ns#`）：源码文件对 abapGit **源码兼容**。元数据 XML（TPOOL/SOTR/VSEOCLASS）本版**不生成**——树**尚不可被 abapGit 导入**（导入是二期计划；zip 同时带网关自有的 `export_manifest.json`，逐对象列出作者/状态/跳过原因——缺口可见，绝不静默丢弃）。
+- **覆盖范围**：R3TR PROG（include 经 `REPOSRC.SUBC='I'` 与程序分流）、CLAS、INTF、FUGR（经仓库环境服务枚举**全量组 include**——TOP/UXX/U01-99/自定义；文件按 include 名命名：FM↔include 映射在 `ENLFDIR` 里，而它是表池表、`RFC_READ_TABLE` 拒读）、DDLS、TABL（结构经 `DD02L.TABCLASS='INTAB'` 分流）、DEVC（每包一个 `package.devc.xml`）。其余 R3TR 类型在清单里记 `status:"skipped"`。
+- 单对象源码读取失败**不会**让导出整体失败——清单条目带 `error`，其余照常交付。
+- GET 是读操作：`read_only` 部署可用，继承鉴权/限流/作用域（`/api/s/{system}/export/package/...`）。包不存在 → `404 PACKAGE_NOT_FOUND`；超过 `max_objects`（默认 500，上限 2000）→ `400 EXPORT_TOO_LARGE`。
+- zip 根带最小可识别的 `.abapgit.xml`（`FOLDER_LOGIC=FULL`）——仅为前向兼容，不是可导入。
+
+**对象元数据动词**——写前探测，一次往返拿全：
+
+```bash
+curl 'http://127.0.0.1:3000/api/objects/prog/ZFOO/meta'
+# → {"type":"prog","name":"ZFOO","exists":true,"locked":false,"lock_mode":"adt_lock",
+#     "active":true,"active_check":"adt","changed_by":"DEVELOPER","changed_by_via":"adt",
+#     "author":"DEVELOPER","author_via":"tadir",...}
+```
+
+- `exists`——ADT base GET 探测；`false` 时短路（其余字段为空语义，不报错）。
+- `locked`——非破坏性探测（LOCK 成功立刻 UNLOCK，会话随即丢弃）：`false` = 当前可写；`true` = 他人持锁（`lock_message` 带 SAP 一手原因，EU510）。无编辑锁概念的对象返回 `null`：tabl/stru（`lock_mode:"etag"`——走 etag 乐观并发）与 package（`lock_mode:"none"`）。
+- `active`——`true` 表示无待激活的未激活版本。主判据是 ADT 对象节点自身（`adtcore:version`，`active_check:"adt"`——与存在性同一次 GET，A4H 实证语义：写后不激活 → `"inactive"`）；属性缺失时按类型回退 REPOSRC（`active_check:"reposrc"`，仅 prog/incl/fugr）；其余返回 `null` + `active_check:"unsupported_type"`。这是"我上次激活是否失败了"的读侧答案（写响应本就带 `activated.success`）。
+- `changed_by`/`changed_on`——最后修改者来自 ADT 对象节点（`adtcore:changedBy/changedAt`，全类型可用——包括 REPOSRC 映射在表池表里读不到的 func）；属性缺失时按类型回退 REPOSRC（prog/incl/fugr）。`author`/`created_on`——TADIR 创建信息（全类型可用）。`*_via` 字段标注来源通道（`adt` / `reposrc` / `tadir` / `none`）。
+- func：传 `?group=` 可跳过组反解；反解失败按 `exists:false` 应答（FM 找不到），不报错。
+
+### 11. 包导入（abapGit 反序列化模型移植，v0.21）
+
+把导出的 zip 装回系统——第 10 节的逆向。网关把 abapGit 反序列化的四个核心机制移植到自己的写管线上：
+
+```bash
+# 先预检（零写入）：解析 + 探测存在性 + 输出计划
+curl -X POST 'http://127.0.0.1:3000/api/import/package/ZRESTORE?dry_run=true' \
+  -H "Content-Type: application/zip" --data-binary @zagt_test.zip
+# → {"format":"sap-for-agents-import/1","dry_run":true,"objects":[{type,name,package,exists,action}],"packages":[...],"skipped_unsupported":[...]}
+
+# 真导入（缺包先建、全部以未激活态写入、再按序激活）
+curl -X POST 'http://127.0.0.1:3000/api/import/package/ZRESTORE' \
+  -H "Content-Type: application/zip" --data-binary @zagt_test.zip
+# → objects:[{action:"created|updated|skipped_exists|skipped_unchanged|failed",
+#     activated:"activated|activation_failed|retried|inactive", problems:[...], real_package?}], summary:{...}
+
+# 全部保持未激活，留人工审查 / 分阶段激活
+curl -X POST '.../api/import/package/ZRESTORE?activate=false' --data-binary @zagt_test.zip
+```
+
+- **输入格式**：网关自有导出 zip（`sap-for-agents-export/1`，第 10 节）——round-trip 保证。任意 abapGit 仓库 XML/AFF 导入（VSEOCLASS/TPOOL/SOTR 元数据通道）是**三期**，不在本端点。
+- **包重映射（PREFIX 式）**：manifest 根包 → 路径里的 `{devclass}`；子包 → `{devclass}_{叶名}`（对象名不变）。缺失的包先建（父先于子）。manifest 的 `folder_logic` 必须为 FULL（网关导出恒为 FULL）。
+- **依赖序创建**（abapGit korrnum/依赖图模型的类型级简化）：packages → FUGR 壳 → tabl/stru → cds → intf → class → prog → incl → 组内 include。单对象失败不中止整批——结果清单逐对象带错误。
+- **两阶段激活**（abapGit"全部建完再批量激活"语义，适配逐对象 ADT 激活）：全部写入 `activate:false`；写完后按 ddic → cds → intf → class → prog → incl → 组内 include 的顺序激活，**失败者还有一轮重试**——同批内的前向引用自愈。`?activate=false` 保持全部未激活，便于分阶段审查。
+- **覆盖语义**：`?overwrite=true`（默认）对已存在对象原地覆盖写；`false` 跳过（`action:"skipped_exists"`）。⚠️ **SAP 对象名全局唯一**：同名对象还在包 A 里时往包 B 导入，实际是原地更新 A 的对象（不做包搬移）——结果里的 `real_package` 字段如实回显每个被更新对象的实际所在包。快照→恢复流程请先删原对象（此时 dry_run 会显示全部 `action:"created"`）。
+- **dry_run**（`?dry_run=true`）是真预检：零写入（read_only 守卫也豁免它），逐对象报告 exists/action 和将创建的包。
+- read_only 部署拦导入（`403 READ_ONLY`，dry_run 除外）；runtime 模式全拦；请求体上限 32 MB。
+
 ### 函数组与函数模块（7.52 实测要点）
 
 在 SAP_BASIS 7.52 / EHP8 上验证——当上面那套「纯 ADT」的路子走不通时，实际可行的路径：
@@ -542,6 +611,100 @@ curl -X DELETE http://127.0.0.1:3000/api/adt/ddic/domains/zmy_dom
 - 修改已有对象：`GET` 文档 → 改 XML → `PUT` 回去（etag 约定与 tabl/stru 相同）。
 - 想学任何对象的完整形态：`GET /api/adt/ddic/<集合>/<已有名>`，照抄活对象（如 `domains/char10`、`dataelements/mtext_d`、`tabletypes/string_table`）。
 - **经典 SE11 视图在此无路可走**：`RPY_VIEW_INSERT` 弹窗（`DYNPRO_SEND_IN_BACKGROUND`，后台不可用），ADT 的 `ddic/views` 只管**外部 HANA 视图**。用 CDS 视图实体（`POST /api/objects/cds/{name}/create`）替代——那是现代正解且已完整支持。
+
+### 12. Agent 运行面（sapcli 借鉴，v0.21）
+
+六个端点移植自 [jfilak/sapcli](https://github.com/jfilak/sapcli)（pyrfc 作者的 CLI——README 原话："coding agents love `sapcli abap run`"）。全部走 ADT 通道：自动继承 `adt` 能力开关、多系统作用域形式（`/api/s/{system}/...`）与鉴权。`POST /api/table/osql` 与 `POST /api/table/read` 同为只读姿态；执行端点（`aunit`/`atc`）与 `/api/rfc` 同哲学——SAP 端授权才是边界；`abap/run` 与 CTS 写操作被 `read_only` 拦截。
+
+```bash
+# ① 执行 ABAP 片段：临时 if_oo_adt_classrun 类 → 激活 → 执行 → 删除
+curl -X POST http://127.0.0.1:3000/api/abap/run -H "Content-Type: application/json" \
+  -d '{"source": "out->write( |Hello, { sy-uname }!| )."}'
+# → {"ok":true,"output":"Hello, DEVELOPER!","class":"ZCL_SFA_RUN_DEVELOPER_XY","duration_ms":1820,"deleted":true}
+#   业务失败 = HTTP 200 + ok:false + step（"syntax_check"|"activate"|"execute"）+ issues/problems。
+#   包默认 $TMP；类名 <prefix>_<user>_<random> 预算 30 字符。
+
+# ② 跑 ABAP Unit 测试（异步三步：建单 → 轮询 → 取结果）
+curl -X POST http://127.0.0.1:3000/api/tests/aunit -H "Content-Type: application/json" \
+  -d '{"objects":[{"type":"class","name":"ZCL_MINE"}],"format":"json"}'
+# → {"run_id":"…","summary":{"tests":5,"alerts":1,…},"programs":[…],"alerts":[…]}
+#   format: "json"（解析）| "junit4" | "raw"（结果 XML 原样透传——CI 直连）。
+#   objects[].type: class|program|interface|fugr|func|package（package 不与普通类型混用）。
+
+# ③ 跑 ATC 检查（写码后的质量门禁）
+curl -X POST http://127.0.0.1:3000/api/atc/run -H "Content-Type: application/json" \
+  -d '{"objects":[{"type":"class","name":"ZCL_MINE"}]}'
+# → {"variant":"ZABAP_CLOUD_DEVELOPMENT","worklist_id":"…","objects":[{name,findings:[…]}],
+#    "total_findings":3,"by_priority":{"1":3}}
+#   variant 缺省 → 读 atc/customizing（systemCheckVariant）。小对象实测约 60s。
+
+# ④ CTS 传输请求：创建 / 读取 / 释放 / 删除
+curl -X POST http://127.0.0.1:3000/api/cts/requests -H "Content-Type: application/json" \
+  -d '{"type":"workbench","description":"my change"}'
+# → {"number":"A4HK900158","status":"D",…}
+curl http://127.0.0.1:3000/api/cts/requests/A4HK900158          # 含 tasks 与已锁对象
+curl -X POST http://127.0.0.1:3000/api/cts/requests/A4HK900158/release?recursive=true
+# → {"released":true}   业务失败仍是 200 + released:false（如检查报告错误）
+curl -X DELETE http://127.0.0.1:3000/api/cts/requests/A4HK900158?recursive=true
+#   ⚠️ 已释放的请求 SAP 拒绝删除；type ∈ workbench|customizing|transport-of-copies|
+#   development-correction|repair。read_only 拦 create/release/delete。
+
+# ⑤ 全对象类型快搜（类/表/CDS/…）——补 POST /api/functions/search（只搜函数模块）
+curl 'http://127.0.0.1:3000/api/objects/search?q=BAPIRET'
+# → {"objects":[{"name":"BAPIRET2","typ":"TABL/DS","package":"SBF_BAPI","uri":"/sap/bc/adt/ddic/structures/bapiret2"}]}
+#    uri 可直接喂 ANY /api/adt/{path}。词尾自动补 *。
+
+# ⑥ OpenSQL SELECT 走 ADT 数据预览——读 RFC_READ_TABLE 拒读的池表与 JOIN
+#   （ENLFDIR 等），无 512 字节行宽限制
+curl -X POST http://127.0.0.1:3000/api/table/osql -H "Content-Type: application/json" \
+  -d '{"sql":"select mandt, cccategory from t000","rows":10}'
+# → {"columns":[…],"rows":[{…}],"row_count":3,"total_rows":3}   （值都是字符串）
+#    只接受 SELECT/WITH；写操作请走 BAPI/RFC/对象端点。
+```
+
+实现要点：
+- **abap run 在全新 ADT 会话里执行**（classrun 前**强制刷新** CSRF token + cookie）——classrun 服务按 ABAP 会话缓存类元数据，同会话跑刚激活的类会得到难懂的 *"Class does not implement if_oo_adt_classrun~main method!"*（sapcli 用 `connection.new_session()` 规避的是同一个坑）。临时类在 `finally` 里无条件删除——执行失败/超时也不留尸体。
+- **aunit 用 1s 短轮询**，不用 `withLongPolling=true`（长轮询可能撞网关的客户端 HTTP 超时）。整体期限：`timeout_secs`（默认 120）。
+- 典型闭环：写码（`POST /api/objects/...`）→ `POST /api/tests/aunit` → `POST /api/atc/run` → 迭代；要挂传输就 `POST /api/cts/requests` + objects 写入的 `transport` 字段。
+
+### 13. SAP 侧登录方式（v0.21）
+
+经典 user+password 仍是默认。另有三条通道，全部按系统在 `sap_systems.toml` 配置（或经 `POST /api/setup/system`）——混合形态在装载期校验：SSO2 票据或 SNC 四件套任一给出时 `user`/`passwd` 可省。
+
+```toml
+# RFC 侧：SSO 登录票据（票据自带身份；支持 ${VAR}）
+[systems.sso]
+ashost="…"; sysnr="00"; client="001"
+mysapsso2 = "${SAP_SSO2_TICKET}"
+
+# RFC 侧：SNC / Kerberos（Secure Login Client）——passwd 可省
+[systems.snc]
+ashost="…"; sysnr="00"; client="001"
+snc_qop = "8"
+snc_partnername = "p:CN=A4H"
+snc_lib = "/usr/sap/lib/gsskrb5.so"   # snc_myname 可选
+
+# ADT 侧：现代鉴权（阶梯：plugin > OAuth > SSO2 > Basic；TLS 素材与鉴权正交）
+adt_cert = "/etc/sap/client.pem"      # mTLS 身份（adt_key 缺省 = cert 单文件含私钥；
+                                      # 加密私钥拒收并给出解密提示）
+adt_ca   = "/etc/sap/ca.pem"          # https 端点的自定义 CA bundle
+adt_sso2 = "${SAP_SSO2_TICKET}"       # ADT 通道走 Cookie MYSAPSSO2（缺省复用 mysapsso2）
+adt_oauth_token_url   = "https://…/oauth/token"   # BTP/ABAP Cloud 的 ADT 只认 OAuth2；
+adt_oauth_client_id   = "sb-…"                    # 密码授权 + 进程内 token 缓存 +
+adt_oauth_client_secret = "${SAP_BTP_SECRET}"     # refresh_token 复用；401 自动重新 grant 一次
+adt_auth_plugin_command = "/usr/local/bin/sap-auth-helper"  # 逃生舱：子进程 stdin 收 JSON，
+adt_auth_plugin_params  = { tenant = "a4h" }               # stdout 回 cookies 或 headers
+adt_auth_plugin_cache_secs = 300                           # （content.type: cookie |
+                                                           # http_authorization_header；不支持
+                                                           # certificates 形态——请用 adt_cert/
+                                                           # adt_key 静态配置）。命令必须是绝对
+                                                           # 路径；401 时失效缓存重跑一次插件。
+```
+
+- `GET /api/systems` 现在回显每个系统的 `auth`：`basic` | `sso2` | `snc` | `sso2+snc`。
+- SSO2/SNC 是 RFC 侧透传（已验证参数到达 `RfcOpenConnection`、Basic 路径回归正常；端到端 SSO 需要真实票据/SNC 基础设施，trial 系统签发不了）。
+- OAuth 打开 BTP/ABAP Cloud 目标（Basic 在那边直接被拒）。失败时网关回 `401 ADT_OAUTH_FAILED` 并带 IdP 的原话。
+- 启动期卫生：`sap_systems.toml` 若 world-readable 且含**明文凭据**（非 `${VAR}` 形态），打 WARN 建议 `chmod 600` / 改 `${VAR}` 形态。网关自己写的文件恒 0600。
 
 ## 关键约束（避坑）
 

@@ -713,6 +713,284 @@ pub fn read_table(
 }
 
 // ========================================================================
+// 包导出/对象元数据的底层读取（TADIR/TDEVC/ENLFDIR/REPOSRC/DD02L）
+// ========================================================================
+// 全部为 [`read_table`] 的薄封装：单行 WHERE（RFC_READ_TABLE 的 OPTIONS.TEXT
+// 每行上限 72 字符——下方拼接的条件都保持在一行内）、固定字段清单、结构化
+// 返回。供 export.rs（包导出）与 server.rs（对象 meta 动词）共用。
+
+/// SQL 字面量转义：单引号翻倍（ABAP 字面量）。调用方值只允许出现在引号内。
+fn quote_sql(v: &str) -> String {
+    v.replace('\'', "''")
+}
+
+/// R3TR 对象目录行（TADIR）。
+#[derive(Debug, Clone, Default)]
+pub struct TadirEntry {
+    /// R3TR 对象类型（PROG/CLAS/FUGR/TABL/...）
+    pub object: String,
+    pub obj_name: String,
+    /// 实际所在包（导入"原地更新"的 real_package 透明化用）
+    pub devclass: String,
+    /// 创建者（TADIR 无"最后修改者"——那在 REPOSRC 等 per-type 表里）
+    pub author: String,
+    /// 创建日期（yyyyMMdd 原样）
+    pub created_on: String,
+}
+
+/// 读一个包的 R3TR 对象清单（LIMU 子对象不在此列——func 成员走 ENLFDIR）。
+pub fn read_tadir_rows(
+    meta: &crate::metadata::MetadataCache,
+    conn: &RfcConnection,
+    devclass: &str,
+) -> Result<Vec<TadirEntry>, RfcError> {
+    let fields: Vec<String> = ["OBJECT", "OBJ_NAME", "DEVCLASS", "AUTHOR", "CREATED_ON"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let where_clauses = vec![format!(
+        "PGMID = 'R3TR' AND DEVCLASS = '{}'",
+        quote_sql(devclass)
+    )];
+    Ok(map_tadir_rows(read_table(
+        meta,
+        conn,
+        "TADIR",
+        &fields,
+        &where_clauses,
+        10000,
+        '\u{1}',
+    )?))
+}
+
+/// 按目录键读单条 TADIR（对象元数据动词的 author 兜底）。
+pub fn read_tadir_one(
+    meta: &crate::metadata::MetadataCache,
+    conn: &RfcConnection,
+    object: &str,
+    obj_name: &str,
+) -> Result<Option<TadirEntry>, RfcError> {
+    let fields: Vec<String> = ["OBJECT", "OBJ_NAME", "DEVCLASS", "AUTHOR", "CREATED_ON"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let where_clauses = vec![format!(
+        "PGMID = 'R3TR' AND OBJECT = '{}' AND OBJ_NAME = '{}'",
+        quote_sql(object),
+        quote_sql(obj_name)
+    )];
+    let rows = read_table(meta, conn, "TADIR", &fields, &where_clauses, 1, '\u{1}')?;
+    Ok(map_tadir_rows(rows).into_iter().next())
+}
+
+/// TADIR 行 map → [`TadirEntry`]。
+fn map_tadir_rows(rows: Vec<HashMap<String, String>>) -> Vec<TadirEntry> {
+    rows.into_iter()
+        .map(|r| TadirEntry {
+            object: r.get("OBJECT").cloned().unwrap_or_default(),
+            obj_name: r.get("OBJ_NAME").cloned().unwrap_or_default(),
+            devclass: r.get("DEVCLASS").cloned().unwrap_or_default(),
+            author: r.get("AUTHOR").cloned().unwrap_or_default(),
+            created_on: r.get("CREATED_ON").cloned().unwrap_or_default(),
+        })
+        .collect()
+}
+
+/// 子包行（TDEVC.PARENTCL 一跳；BFS 递归由调用方做）。
+#[derive(Debug, Clone, Default)]
+pub struct DevcChild {
+    pub devclass: String,
+    /// 包描述（package.devc.xml 的 CTEXT）
+    pub ctext: String,
+}
+
+/// 读一跳子包清单（TDEVC WHERE PARENTCL = 'X'）。
+pub fn read_tdevc_children(
+    meta: &crate::metadata::MetadataCache,
+    conn: &RfcConnection,
+    parent: &str,
+) -> Result<Vec<DevcChild>, RfcError> {
+    let fields: Vec<String> = ["DEVCLASS", "CTEXT"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let where_clauses = vec![format!("PARENTCL = '{}'", quote_sql(parent))];
+    Ok(map_devc_rows(read_table(
+        meta,
+        conn,
+        "TDEVC",
+        &fields,
+        &where_clauses,
+        10000,
+        '\u{1}',
+    )?))
+}
+
+/// 读包自身行（TDEVC WHERE DEVCLASS = 'X'；None = TDEVC 无此包记录）。
+pub fn read_tdevc_row(
+    meta: &crate::metadata::MetadataCache,
+    conn: &RfcConnection,
+    devclass: &str,
+) -> Result<Option<DevcChild>, RfcError> {
+    let fields: Vec<String> = ["DEVCLASS", "CTEXT"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let where_clauses = vec![format!("DEVCLASS = '{}'", quote_sql(devclass))];
+    Ok(map_devc_rows(read_table(
+        meta,
+        conn,
+        "TDEVC",
+        &fields,
+        &where_clauses,
+        1,
+        '\u{1}',
+    )?)
+    .into_iter()
+    .next())
+}
+
+/// TDEVC 行 map → [`DevcChild`]。
+fn map_devc_rows(rows: Vec<HashMap<String, String>>) -> Vec<DevcChild> {
+    rows.into_iter()
+        .map(|r| DevcChild {
+            devclass: r.get("DEVCLASS").cloned().unwrap_or_default(),
+            ctext: r.get("CTEXT").cloned().unwrap_or_default(),
+        })
+        .collect()
+}
+
+/// 函数组的 include 清单（含 TOP/UXX/U00-99/自定义组 include）。
+///
+/// ⚠️ 本来这里该查 ENLFDIR（abapGit 直 SELECT 的同款路径），但 **ENLFDIR/
+/// TFDIR 是表池表，RFC_READ_TABLE 拒读**（AD 718 TABLE_WITHOUT_DATA，A4H 816
+/// 真机实证）——RFC 侧改走环境服务 `REPOSITORY_ENVIRONMENT_SET_RFC`：以
+/// OBJ_TYPE=FUGR 查组，其 ENVIRONMENT 的 INCL 行就是组内全部 include
+/// （真机验证：STFC → LSTFCTOP/LSTFCU01-09/LSTFCF02/LSTFCT99...）。
+/// 代价：环境服务给的是 include 名而非 FM 名（FM↔include 映射同样在
+/// ENLFDIR 里）——导出文件按 include 命名，见 export.rs。
+pub fn read_group_includes(
+    meta: &crate::metadata::MetadataCache,
+    conn: &RfcConnection,
+    group: &str,
+) -> Result<Vec<String>, RfcError> {
+    let g = group.trim().to_uppercase();
+    let req = InvokeRequest {
+        func_name: "REPOSITORY_ENVIRONMENT_SET_RFC".to_string(),
+        inputs: HashMap::from([
+            ("OBJECT_NAME".to_string(), ScalarValue::Chars(g.to_string())),
+            (
+                "OBJ_TYPE".to_string(),
+                ScalarValue::Chars("FUGR".to_string()),
+            ),
+        ]),
+        // 不过滤 ENVIRONMENT_TYPES（过滤键无 INCL）：全量取回客户端筛
+        table_outputs: HashMap::from([(
+            "ENVIRONMENT".to_string(),
+            vec![
+                crate::api::FieldSpec {
+                    name: "TYPE".to_string(),
+                    max_len: Some(15),
+                    auto: false,
+                },
+                crate::api::FieldSpec {
+                    name: "OBJECT".to_string(),
+                    max_len: Some(180),
+                    auto: false,
+                },
+            ],
+        )]),
+        ..Default::default()
+    };
+    let resp = execute_collect_with(meta, conn, &req)?;
+    let prefix = format!("L{}", g);
+    // 行值是 ScalarValue：取 Chars 文本（与 read_where_used 同款小工具）
+    fn sv(v: Option<&crate::api::ScalarValue>) -> String {
+        match v {
+            Some(crate::api::ScalarValue::Chars(s)) => s.clone(),
+            _ => String::new(),
+        }
+    }
+    Ok(resp
+        .tables
+        .get("ENVIRONMENT")
+        .map(|rows| {
+            rows.iter()
+                .filter(|r| sv(r.get("TYPE")) == "INCL" && sv(r.get("OBJECT")).starts_with(&prefix))
+                .map(|r| sv(r.get("OBJECT")))
+                .filter(|o| !o.trim().is_empty())
+                .collect()
+        })
+        .unwrap_or_default())
+}
+// 注：func 的活跃判据不走 RS_FUNCTION_ACTIVE_CHECK——它虽存在但**非
+// remote-enabled**（A4H 真机 CALL_FUNCTION_NOT_REMOTE 实证）；最终统一走
+// ADT base 资源的 adtcore:version 属性（objects::read_adt_object_state）。
+
+/// REPOSRC 活跃版本行（SUBC 分类 + 最后修改者 UNAM/UDAT）。
+#[derive(Debug, Clone, Default)]
+pub struct ReposrcInfo {
+    /// 程序类型（1=可执行，I=INCLUDE，F=函数组，K=类池，...）
+    pub subc: String,
+    pub unam: String,
+    /// yyyyMMdd 原样
+    pub udat: String,
+}
+
+/// 读单个程序的活跃版本（R3STATE='A'）；无活跃版本 → None。
+pub fn read_reposrc_active(
+    meta: &crate::metadata::MetadataCache,
+    conn: &RfcConnection,
+    progname: &str,
+) -> Result<Option<ReposrcInfo>, RfcError> {
+    let fields: Vec<String> = ["SUBC", "UNAM", "UDAT"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let where_clauses = vec![format!(
+        "PROGNAME = '{}' AND R3STATE = 'A'",
+        quote_sql(progname)
+    )];
+    let rows = read_table(meta, conn, "REPOSRC", &fields, &where_clauses, 1, '\u{1}')?;
+    Ok(rows.into_iter().next().map(|r| ReposrcInfo {
+        subc: r.get("SUBC").cloned().unwrap_or_default(),
+        unam: r.get("UNAM").cloned().unwrap_or_default(),
+        udat: r.get("UDAT").cloned().unwrap_or_default(),
+    }))
+}
+
+/// 未激活版本是否存在（R3STATE='I' 有行）——对象 meta 的 `active` 判据。
+pub fn read_reposrc_inactive_exists(
+    meta: &crate::metadata::MetadataCache,
+    conn: &RfcConnection,
+    progname: &str,
+) -> Result<bool, RfcError> {
+    let fields: Vec<String> = ["PROGNAME"].iter().map(|s| s.to_string()).collect();
+    let where_clauses = vec![format!(
+        "PROGNAME = '{}' AND R3STATE = 'I'",
+        quote_sql(progname)
+    )];
+    let rows = read_table(meta, conn, "REPOSRC", &fields, &where_clauses, 1, '\u{1}')?;
+    Ok(!rows.is_empty())
+}
+
+/// DD02L 表类别（TRANSP=透明表 / INTAB=结构 / VIEW=投影）；缺失 → None。
+pub fn read_dd02l_tabclass(
+    meta: &crate::metadata::MetadataCache,
+    conn: &RfcConnection,
+    tabname: &str,
+) -> Result<Option<String>, RfcError> {
+    let fields: Vec<String> = ["TABCLASS"].iter().map(|s| s.to_string()).collect();
+    let where_clauses = vec![format!("TABNAME = '{}'", quote_sql(tabname))];
+    let rows = read_table(meta, conn, "DD02L", &fields, &where_clauses, 1, '\u{1}')?;
+    Ok(rows
+        .into_iter()
+        .next()
+        .map(|r| r.get("TABCLASS").cloned().unwrap_or_default())
+        .filter(|v| !v.is_empty()))
+}
+
+// ========================================================================
 // 依赖签名前言（prologue）：扫 CALL FUNCTION → 内联被调函数的紧凑接口
 // ========================================================================
 

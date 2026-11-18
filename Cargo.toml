@@ -13,7 +13,7 @@ path = "src/main.rs"
 [dependencies]
 # Web 服务（client 模式）
 axum = "0.8"
-tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "signal", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "signal", "macros", "process"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 dotenvy = "0.15"
@@ -34,6 +34,8 @@ toml = "1.1"
 quick-xml = "0.42"
 # 多系统作用域路由：/api/s/{system}/** 的 URI 改写服务（tower Service 手写实现）
 tower = { version = "0.5", features = ["util"] }
+# 包导出 zip 打包（GET /api/export/package/**；abapGit 兼容文件树）
+zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [profile.release]
 lto = true

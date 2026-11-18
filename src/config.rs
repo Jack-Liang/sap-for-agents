@@ -293,7 +293,54 @@ pub fn load() -> Result<AppConfig, String> {
     };
     // sap_gateway.toml 的 [gateway] 表覆盖 env（文件 > env > 默认；settings.rs）。
     // 在此之后 cfg 即"生效配置"——热态、静态快照全部从这里初始化。
-    crate::settings::overlay_from_file(cfg)
+    let cfg = crate::settings::overlay_from_file(cfg)?;
+    warn_world_readable_secrets(&cfg);
+    Ok(cfg)
+}
+
+/// 启动期配置卫生（sapcli `_check_file_permissions` 同款借鉴）：
+/// 系统配置文件若 world-readable 且含**明文**密码/票据（非 `${VAR}` 引用形态），
+/// 打 WARN 提示收紧权限。只警告不拒绝——部署形态千差万别，网关无权改盘上权限。
+fn warn_world_readable_secrets(cfg: &AppConfig) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let check = |path: &std::path::Path, label: &str, needle: &[&str]| {
+            let Ok(meta) = std::fs::metadata(path) else {
+                return;
+            };
+            if meta.permissions().mode() & 0o004 == 0 {
+                return; // 其他人不可读，干净
+            }
+            let Ok(content) = std::fs::read_to_string(path) else {
+                return;
+            };
+            let plain = needle.iter().any(|kw| {
+                // 找 `passwd = "…"` 且值不以 ${ 开头（引用形态安全）
+                content.lines().any(|l| {
+                    let l = l.trim();
+                    l.starts_with(kw) && l.contains('"') && !l.contains("${")
+                })
+            });
+            if plain {
+                tracing::warn!(
+                    file = %path.display(),
+                    "{label} 为 world-readable 且含明文凭据——建议 chmod 600 {0} 或改用 ${{VAR}} 引用形态",
+                    path.display()
+                );
+            }
+        };
+        check(
+            &cfg.systems_file,
+            "sap_systems.toml",
+            &["passwd", "mysapsso2", "snc_lib"],
+        );
+        check(&cfg.gateway_file, "sap_gateway.toml", &["api_key"]);
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = cfg;
+    }
 }
 
 #[cfg(test)]

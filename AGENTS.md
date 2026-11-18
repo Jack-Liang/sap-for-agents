@@ -60,6 +60,9 @@ curl -H "Authorization: Bearer <SAP_API_KEY>" http://127.0.0.1:3000/api/function
 | Want to syntax-check source **without** writing it | `POST /api/objects/{type}/{name}/syntax` |
 | Want to **read** an object's source with original casing (incl / intf / cds / fugr included) | `GET /api/objects/{type}/{name}/source` |
 | Want to **delete** an object (a fugr takes its function modules with it) | `DELETE /api/objects/{type}/{name}?group=&transport=` |
+| Want to **snapshot a package** as an abapGit-style file tree (git-friendly zip; backup / SAP↔local diff) | `GET /api/export/package/{devclass}` |
+| Want exists / locked / active / author of an object **before writing** (one round trip) | `GET /api/objects/{type}/{name}/meta` |
+| Want to **install an exported zip back** into a package (round-trip; dependency-ordered, two-phase activation) | `POST /api/import/package/{devclass}` |
 | Want to read/write ABAP class sources and other ADT (Eclipse tooling) resources | `ANY /api/adt/{path}` |
 | **Actually invoke an SAP function** | `POST /api/rfc` |
 | Want to invoke a function **without** filling `func_name` (typed endpoint) | `POST /api/functions/{name}/invoke` |
@@ -67,6 +70,13 @@ curl -H "Authorization: Bearer <SAP_API_KEY>" http://127.0.0.1:3000/api/function
 | Want a spec with **typed operations per BAPI** (params/types/fields expanded) | `GET /api/openapi?functions=BAPI_X,BAPI_Y` |
 | Want to know **who calls a function** before editing it (where-used) | `GET /api/functions/{name}/where-used` |
 | You are an MCP client (Claude etc.) — mount the gateway as an MCP tool server | `POST /mcp` (Streamable HTTP, stateless) |
+| Run an ABAP snippet (temp classrun class, auto-delete) | `POST /api/abap/run` |
+| Run ABAP Unit tests (json / junit4 / raw output) | `POST /api/tests/aunit` |
+| Run ATC code checks (findings as JSON) | `POST /api/atc/run` |
+| Create / read / release / delete CTS transport requests | `POST`·`GET` `/api/cts/requests…` |
+| Search ALL object types by name (ADT quick search) | `GET /api/objects/search?q=` |
+| OpenSQL SELECT via ADT data preview (pooled tables, joins) | `POST /api/table/osql` |
+| Per-system login: SSO2 ticket / SNC / ADT mTLS+OAuth2 / auth plugin | see §13 in `sap_systems.toml` (`mysapsso2`, `snc_*`, `adt_*`) |
 | Human-friendly interactive API docs | `GET /docs` (Redoc rendering of the spec) |
 
 ## First-run setup (agent-guided configuration)
@@ -451,6 +461,72 @@ curl -X POST http://127.0.0.1:3000/api/objects/prog/ZMY_REPORT/syntax \
 - **Reads return the original case**: `/api/programs/{name}/source` now requests `WITH_LOWERCASE` — what you read is what is stored, so anchors taken from a previous read always match. `GET /api/objects/{type}/{name}/source` (ADT channel) is the canonical read for the new types and for function modules (SEDI form, matching what writes expect).
 - **Read-only deployments**: the deployer may run the gateway with `SAP_READ_ONLY=1` — write endpoints (`PUT .../source`, `POST .../replace`, `POST .../create`, `DELETE`, non-read `/api/adt` methods) then return 403 `READ_ONLY`. This is intentional: don't retry writes, stick to reads and `POST .../syntax` (still allowed, nothing is stored). `POST /api/rfc` is unaffected by the switch.
 
+### 10. Package export & object metadata verbs (abapGit absorption, v0.21)
+
+**Package snapshot** — serialize a package (and its subpackages) into an abapGit-style file tree, delivered as a zip the agent can commit straight to git, diff against local files, or keep as a backup:
+
+```bash
+# Preview the inventory first (JSON manifest, no source reads, fast)
+curl 'http://127.0.0.1:3000/api/export/package/ZAGT_TEST?manifest=true'
+# → {"format":"sap-for-agents-export/1","folder_logic":"full","objects":[{type,name,package,path,status,author,...}],"packages":[...]}
+
+# Full export (zip: .abapgit.xml + export_manifest.json + src/<pkg>/ tree)
+curl 'http://127.0.0.1:3000/api/export/package/ZAGT_TEST' -o zagt_test.zip
+# → application/zip; tree: src/<pkg>/{name}.{prog|incl|clas|intf|func}.abap, {name}.{tabl|stru|cds}.ddl, package.devc.xml
+
+# Recursion defaults on (TDEVC child packages, BFS depth 10); cap the blast radius:
+curl 'http://127.0.0.1:3000/api/export/package/ZFOO?recurse=false&max_objects=200'
+```
+
+- **File naming follows abapGit conventions** (filename logic + FULL folder logic, lowercase, namespace `/NS/` → `#ns#`): the source files are abapGit-*source*-compatible. Metadata XML (TPOOL/SOTR/VSEOCLASS) is **not** generated yet — the tree is **not abapGit-importable** yet (import is the planned phase 2; the zip also carries the gateway's own `export_manifest.json` listing every object with author/status/skip-reason — gaps stay visible, never silently dropped).
+- **Coverage**: R3TR PROG (incl split from programs via `REPOSRC.SUBC='I'`), CLAS, INTF, FUGR (the whole group-include set — TOP/UXX/U01-99/custom — enumerated via the repository environment service; files are named by include since the FM↔include mapping lives in `ENLFDIR`, a pooled table that `RFC_READ_TABLE` refuses to read), DDLS, TABL (structures split via `DD02L.TABCLASS='INTAB'`), DEVC (`package.devc.xml` per package). Other R3TR types are listed as `status:"skipped"` in the manifest.
+- Per-object source read failures do **not** fail the export — the manifest entry carries the `error` and the rest ships.
+- A GET is a read: allowed on `read_only` deployments, inherits auth/rate-limit/scoping (`/api/s/{system}/export/package/...`). Unknown package → `404 PACKAGE_NOT_FOUND`; more than `max_objects` (default 500, ≤2000) → `400 EXPORT_TOO_LARGE`.
+- Zip root carries a minimal abapGit-recognizable `.abapgit.xml` (`FOLDER_LOGIC=FULL`) — for forward compatibility, not for import.
+
+**Object metadata verbs** — probe before you write; one round trip returns everything:
+
+```bash
+curl 'http://127.0.0.1:3000/api/objects/prog/ZFOO/meta'
+# → {"type":"prog","name":"ZFOO","exists":true,"locked":false,"lock_mode":"adt_lock",
+#     "active":true,"active_check":"adt","changed_by":"DEVELOPER","changed_by_via":"adt",
+#     "author":"DEVELOPER","author_via":"tadir",...}
+```
+
+- `exists` — ADT base-GET probe; `false` short-circuits the rest of the fields (no error raised).
+- `locked` — non-destructive probe (LOCK succeeds → immediately UNLOCK, session discarded): `false` = writable now; `true` = someone else holds it (`lock_message` carries SAP's own reason, EU510). `null` for objects without editor locks: tabl/stru (`lock_mode:"etag"` — they use etag optimistic concurrency) and package (`lock_mode:"none"`).
+- `active` — `true` when no pending inactive version exists. Primary source is the ADT object node itself (`adtcore:version`, `active_check:"adt"` — one GET with the existence probe, A4H-verified semantics: write-without-activate → `"inactive"`); when the attribute is absent, falls back to `REPOSRC` (`active_check:"reposrc"`, prog/incl/fugr); anything else returns `null` + `active_check:"unsupported_type"`. This is the read-side answer to "did my last activation fail?" (writes already carry `activated.success`).
+- `changed_by`/`changed_on` — last modifier from the ADT object node (`adtcore:changedBy/changedAt`, all types — including func, whose REPOSRC mapping is pooled-table-unreachable); falls back to `REPOSRC` for prog/incl/fugr when the attribute is absent. `author`/`created_on` — TADIR creation info, available for every type. `*_via` fields say which channel answered (`adt` / `reposrc` / `tadir` / `none`).
+- func: pass `?group=` to skip group resolution; a failed resolution answers `exists:false` (the FM can't be found) instead of an error.
+
+### 11. Package import (abapGit deserialization model, v0.21)
+
+Install an exported zip back into the system — the reverse of section 10. The gateway ports abapGit's four deserialization mechanisms onto its own write pipeline:
+
+```bash
+# Preflight first (zero writes): parse + probe existence + plan
+curl -X POST 'http://127.0.0.1:3000/api/import/package/ZRESTORE?dry_run=true' \
+  -H "Content-Type: application/zip" --data-binary @zagt_test.zip
+# → {"format":"sap-for-agents-import/1","dry_run":true,"objects":[{type,name,package,exists,action}],"packages":[...],"skipped_unsupported":[...]}
+
+# Real import (creates missing packages, writes all inactive, then activates in order)
+curl -X POST 'http://127.0.0.1:3000/api/import/package/ZRESTORE' \
+  -H "Content-Type: application/zip" --data-binary @zagt_test.zip
+# → objects:[{action:"created|updated|skipped_exists|skipped_unchanged|failed",
+#     activated:"activated|activation_failed|retried|inactive", problems:[...], real_package?}], summary:{...}
+
+# Leave everything inactive for manual review / staged activation
+curl -X POST '.../api/import/package/ZRESTORE?activate=false' --data-binary @zagt_test.zip
+```
+
+- **Input format**: the gateway's own export zip (`sap-for-agents-export/1`, section 10) — round-trip guaranteed. Arbitrary abapGit-repo XML/AFF import (VSEOCLASS/TPOOL/SOTR metadata channels) is **phase 3**, not here.
+- **Package remap (PREFIX-style)**: manifest root package → `{devclass}` in the path; subpackages → `{devclass}_{leaf}` (object names unchanged). Missing packages are created first (parent before child). The manifest's `folder_logic` must be FULL (gateway exports always are).
+- **Dependency-ordered creation** (abapGit's korrnum/graph model, reduced to our types): packages → FUGR shells → tabl/stru → cds → intf → class → prog → incl → group-includes. Per-object failures don't abort the batch — the result manifest carries each error.
+- **Two-phase activation** (abapGit's "create everything, then mass-activate" semantics, adapted to per-object ADT activation): every write runs `activate:false`; after all writes, activation runs in phase order (ddic → cds → intf → class → prog → incl → group-includes) **with a retry pass** for failures — forward references inside one import self-heal. `?activate=false` keeps everything inactive for staged review.
+- **Overwrite semantics**: `?overwrite=true` (default) updates existing objects in place; `false` skips them (`action:"skipped_exists"`). ⚠️ **SAP object names are global**: importing into package B while the same-named object still lives in package A updates A's object in place (there is no package move) — the result's `real_package` field reports where each updated object actually landed. Snapshot→restore flows should delete the originals first (then dry_run shows `action:"created"` for everything).
+- **dry_run** (`?dry_run=true`) is a true preflight: zero writes (the read-only guard even exempts it), reports exists/action per object and packages to be created.
+- read_only deployments block import (`403 READ_ONLY`) except dry_run; runtime mode blocks it entirely; request body capped at 32 MB.
+
 ### Function groups & function modules (7.52 notes)
 
 Verified on SAP_BASIS 7.52 / EHP8 — the paths that actually work when the ADT-only story above does not:
@@ -543,6 +619,102 @@ Tips:
 - To modify an existing object: `GET` the document, edit the XML, `PUT` it back (same etag conventions as tabl/stru).
 - To learn the full shape of anything: `GET /api/adt/ddic/<collection>/<existing-name>` and copy from a live object (e.g. `domains/char10`, `dataelements/mtext_d`, `tabletypes/string_table`).
 - **Classic SE11 views have no usable path here**: `RPY_VIEW_INSERT` pops a dialog (`DYNPRO_SEND_IN_BACKGROUND`, background-unsafe) and ADT `ddic/views` is for **external HANA views** only. Use a CDS view entity (`POST /api/objects/cds/{name}/create`) instead — that is the modern replacement and fully supported.
+
+### 12. Agent runtime surface (sapcli absorption, v0.21)
+
+Six endpoints adapted from [jfilak/sapcli](https://github.com/jfilak/sapcli) (the pyrfc author's CLI — "coding agents love `sapcli abap run`"). All ride the ADT channel: they inherit the `adt` capability switch, multi-system scoped forms (`/api/s/{system}/...`) and auth automatically. `POST /api/table/osql` and `POST /api/table/read` share the read-only posture; execution endpoints (`aunit`/`atc`) are like `/api/rfc` — SAP-side authorization is the boundary; `abap/run` and CTS writes are blocked by `read_only`.
+
+```bash
+# ① Run an ABAP snippet: temp if_oo_adt_classrun class → activate → execute → delete
+curl -X POST http://127.0.0.1:3000/api/abap/run -H "Content-Type: application/json" \
+  -d '{"source": "out->write( |Hello, { sy-uname }!| )."}'
+# → {"ok":true,"output":"Hello, DEVELOPER!","class":"ZCL_SFA_RUN_DEVELOPER_XY","duration_ms":1820,"deleted":true}
+#   Business failure = HTTP 200 + ok:false + step ("syntax_check"|"activate"|"execute") + issues/problems.
+#   Package defaults to $TMP; class name is <prefix>_<user>_<random> within 30 chars.
+
+# ② Run ABAP Unit tests (async 3-step: start → poll → fetch)
+curl -X POST http://127.0.0.1:3000/api/tests/aunit -H "Content-Type: application/json" \
+  -d '{"objects":[{"type":"class","name":"ZCL_MINE"}],"format":"json"}'
+# → {"run_id":"…","summary":{"tests":5,"alerts":1,…},"programs":[…],"alerts":[…]}
+#   format: "json" (parsed) | "junit4" | "raw" (result XML verbatim — CI-ready).
+#   objects[].type: class|program|interface|fugr|func|package (package can't mix with others).
+
+# ③ Run ATC checks (quality gate after writing code)
+curl -X POST http://127.0.0.1:3000/api/atc/run -H "Content-Type: application/json" \
+  -d '{"objects":[{"type":"class","name":"ZCL_MINE"}]}'
+# → {"variant":"ZABAP_CLOUD_DEVELOPMENT","worklist_id":"…","objects":[{name,findings:[…]}],
+#    "total_findings":3,"by_priority":{"1":3}}
+#   variant omitted → read from atc/customizing (systemCheckVariant). Can take ~60s on small classes.
+
+# ④ CTS transport requests: create / read / release / delete
+curl -X POST http://127.0.0.1:3000/api/cts/requests -H "Content-Type: application/json" \
+  -d '{"type":"workbench","description":"my change"}'
+# → {"number":"A4HK900158","status":"D",…}
+curl http://127.0.0.1:3000/api/cts/requests/A4HK900158          # + tasks & locked objects
+curl -X POST http://127.0.0.1:3000/api/cts/requests/A4HK900158/release?recursive=true
+# → {"released":true}   business failure stays 200 + released:false (e.g. check report errors)
+curl -X DELETE http://127.0.0.1:3000/api/cts/requests/A4HK900158?recursive=true
+#   ⚠️ released requests cannot be deleted (SAP refuses); type ∈ workbench|customizing|
+#   transport-of-copies|development-correction|repair. Blocked on read_only.
+
+# ⑤ Quick search across ALL object types (classes/tables/CDS/…) — complements
+#    POST /api/functions/search which only finds function modules
+curl 'http://127.0.0.1:3000/api/objects/search?q=BAPIRET'
+# → {"objects":[{"name":"BAPIRET2","typ":"TABL/DS","package":"SBF_BAPI","uri":"/sap/bc/adt/ddic/structures/bapiret2"}]}
+#    The uri feeds ANY /api/adt/{path} directly. Term auto-gets a trailing *.
+
+# ⑥ OpenSQL SELECT via the ADT data preview — reads pooled tables & joins that
+#    RFC_READ_TABLE refuses (ENLFDIR etc.), no 512-byte row cap
+curl -X POST http://127.0.0.1:3000/api/table/osql -H "Content-Type: application/json" \
+  -d '{"sql":"select mandt, cccategory from t000","rows":10}'
+# → {"columns":[…],"rows":[{…}],"row_count":3,"total_rows":3}   (values are strings)
+#    SELECT/WITH only; write operations go through BAPI/RFC/object endpoints.
+```
+
+Implementation notes worth knowing:
+- **abap run executes in a fresh ADT session** (the CSRF token + cookies are forcibly refreshed before `POST oo/classrun/{name}`) — the classrun service caches class metadata per ABAP session, so running a just-activated class in the same session yields the cryptic *"Class does not implement if_oo_adt_classrun~main method!"* (sapcli dodges this with `connection.new_session()`). The temp class is deleted in a `finally` step even when execution fails or times out.
+- **aunit polls with 1s short polls**, not `withLongPolling=true` (long polls can collide with the gateway's client-side HTTP timeout). Overall deadline: `timeout_secs` (default 120).
+- Typical loop: write code (`POST /api/objects/...`) → `POST /api/tests/aunit` → `POST /api/atc/run` → iterate; put objects on a transport via `POST /api/cts/requests` + `objects` writes' `transport` field.
+
+### 13. SAP-side login methods (v0.21)
+
+Classic user+password stays the default. Three more doors, all configured per system in `sap_systems.toml` (or via `POST /api/setup/system`) — mixed forms validate at load: an SSO2 ticket or SNC set makes `user`/`passwd` optional.
+
+```toml
+# RFC side: SSO logon ticket (ticket carries the identity; supports ${VAR})
+[systems.sso]
+ashost="…"; sysnr="00"; client="001"
+mysapsso2 = "${SAP_SSO2_TICKET}"
+
+# RFC side: SNC / Kerberos (Secure Login Client) — passwd optional
+[systems.snc]
+ashost="…"; sysnr="00"; client="001"
+snc_qop = "8"
+snc_partnername = "p:CN=A4H"
+snc_lib = "/usr/sap/lib/gsskrb5.so"   # snc_myname optional
+
+# ADT side: modern auth (ladder: plugin > OAuth > SSO2 > Basic; TLS material is orthogonal)
+adt_cert = "/etc/sap/client.pem"      # mTLS identity (adt_key optional = combined PEM;
+                                      # encrypted private keys are rejected with a fix hint)
+adt_ca   = "/etc/sap/ca.pem"          # custom CA bundle for https endpoints
+adt_sso2 = "${SAP_SSO2_TICKET}"       # ADT channel via Cookie MYSAPSSO2 (defaults to mysapsso2)
+adt_oauth_token_url   = "https://…/oauth/token"   # BTP/ABAP Cloud ADT only accepts OAuth2;
+adt_oauth_client_id   = "sb-…"                    # password grant + in-memory token cache +
+adt_oauth_client_secret = "${SAP_BTP_SECRET}"     # refresh-token reuse; 401 → re-grant once
+adt_auth_plugin_command = "/usr/local/bin/sap-auth-helper"  # escape hatch: subprocess gets
+adt_auth_plugin_params  = { tenant = "a4h" }               # JSON on stdin, returns cookies or
+adt_auth_plugin_cache_secs = 300                           # headers on stdout (types: cookie |
+                                                           # http_authorization_header; the
+                                                           # certificates form is not supported —
+                                                           # use adt_cert/adt_key). Plugin command
+                                                           # must be an absolute path; 401 invalidates
+                                                           # the cache and re-runs the plugin once.
+```
+
+- `GET /api/systems` now reports each system's `auth`: `basic` | `sso2` | `snc` | `sso2+snc`.
+- SSO2/SNC are RFC-side passthroughs (verified the parameters reach `RfcOpenConnection` + the Basic path still works; end-to-end SSO needs a real ticket/SNC infrastructure the trial system doesn't issue).
+- OAuth opens BTP/ABAP Cloud as a target (Basic is rejected there). On failure the gateway answers `401 ADT_OAUTH_FAILED` with the IdP's message.
+- Startup hygiene: `sap_systems.toml` world-readable **with plaintext credentials** (non-`${VAR}` values) logs a WARN suggesting `chmod 600` / `${VAR}` form. Files written by the gateway are always 0600.
 
 ## Key constraints (pitfalls to avoid)
 

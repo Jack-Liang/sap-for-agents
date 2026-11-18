@@ -225,6 +225,8 @@ pub async fn status_handler(
         "connection_forms": {
             "direct": "ashost + sysnr（+ client）——直连单个应用服务器",
             "load_balanced": "conn.MSHOST（+ conn.R3NAME / conn.GROUP）——消息服务器负载均衡，此形态不需要 ashost/sysnr",
+            "sso2_ticket": "mysapsso2（+ ashost/sysnr/client）——SAP 登录票据建连，不需要 user/passwd",
+            "snc": "snc_qop + snc_partnername（+ snc_lib/snc_myname）——Kerberos/Secure Login Client SSO，不需要 user/passwd",
         },
         "example": {
             "name": "a4h",
@@ -256,11 +258,23 @@ fn field_schema() -> serde_json::Value {
          "description": "系统号（两位数字，SAP 管理员提供，常为 00）", "example": "00"},
         {"name": "client", "required": false,
          "description": "登录客户端号（三位数字，如开发 001 / 生产 100）", "example": "001"},
-        {"name": "user", "required": true,
+        {"name": "user", "required": "classic 模式必填（MYSAPSSO2 或 SNC 登录可省）",
          "description": "SAP 登录账号（建议专用通信账号，非个人账号）", "example": "DEVELOPER"},
-        {"name": "passwd", "required": true,
+        {"name": "passwd", "required": "classic 模式必填（MYSAPSSO2 或 SNC 登录可省）",
          "description": "SAP 登录密码；支持 ${VAR} 环境变量引用（推荐，避免明文落盘/入对话）",
          "example": "${SAP_A4H_PASSWD}"},
+        {"name": "mysapsso2", "required": false,
+         "description": "SAP 登录票据（SAP Logon Ticket）：给出时替代 user/passwd 建连；支持 ${VAR} 引用",
+         "example": "${SAP_A4H_SSO2}"},
+        {"name": "snc_qop", "required": false,
+         "description": "SNC 登录四件套之一（质量等级，如 8/9）——四件套任一给出时 passwd 可省（Kerberos/Secure Login Client）",
+         "example": "8"},
+        {"name": "snc_partnername", "required": false,
+         "description": "SNC 登录四件套之一：后端 SNC 名称（p:CN=A4H，…）", "example": "p:CN=A4H"},
+        {"name": "snc_myname", "required": false,
+         "description": "SNC 登录四件套之一：网关侧 SNC 名称（缺省用默认凭据）", "example": "p:CN=gateway"},
+        {"name": "snc_lib", "required": false,
+         "description": "SNC 登录四件套之一：gsskrb5/gysskrb5 库路径", "example": "/usr/sap/lib/gsskrb5.so"},
         {"name": "lang", "required": false,
          "description": "登录语言（默认 EN）", "example": "EN"},
         {"name": "default", "required": false,
@@ -269,6 +283,31 @@ fn field_schema() -> serde_json::Value {
         {"name": "conn", "required": false,
          "description": "自由连接参数表（键大写化直通 SDK）：负载均衡形态在此给 MSHOST/R3NAME/GROUP",
          "example": {"MSHOST": "msg.example.com", "GROUP": "SPACE"}},
+        {"name": "adt_cert", "required": false,
+         "description": "ADT 通道 TLS 客户端证书 PEM 路径（mTLS，https）；单独文件或与 adt_key 合并单文件",
+         "example": "/etc/sap/client.pem"},
+        {"name": "adt_key", "required": false,
+         "description": "ADT 通道 TLS 私钥 PEM 路径（缺省 = cert 单文件内含私钥）；加密私钥会被拒收",
+         "example": "/etc/sap/client.key"},
+        {"name": "adt_ca", "required": false,
+         "description": "ADT 通道自定义 CA bundle 路径（私有 CA 的 https 端点）", "example": "/etc/sap/ca.pem"},
+        {"name": "adt_sso2", "required": false,
+         "description": "ADT 通道 SAP 登录票据（Cookie MYSAPSSO2）；缺省复用系统级 mysapsso2",
+         "example": "${SAP_A4H_SSO2}"},
+        {"name": "adt_oauth_token_url", "required": false,
+         "description": "ADT OAuth2 token 端点（BTP/ABAP Cloud ADT 只认 OAuth；三件套须同时给出）",
+         "example": "https://abc.authentication.eu10.hana.ondemand.com/oauth/token"},
+        {"name": "adt_oauth_client_id", "required": false,
+         "description": "ADT OAuth2 client id", "example": "sb-..."},
+        {"name": "adt_oauth_client_secret", "required": false,
+         "description": "ADT OAuth2 client secret；支持 ${VAR} 引用", "example": "${SAP_BTP_SECRET}"},
+        {"name": "adt_auth_plugin_command", "required": false,
+         "description": "外部鉴权插件：绝对路径可执行文件。stdin 收 JSON(connection+parameters)，stdout 回 {message,content:{type:cookie|http_authorization_header,...}}；401 时失效重跑",
+         "example": "/usr/local/bin/sap-auth-helper"},
+        {"name": "adt_auth_plugin_params", "required": false,
+         "description": "插件透传参数（原样进 stdin JSON 的 parameters）", "example": {"tenant": "a4h"}},
+        {"name": "adt_auth_plugin_cache_secs", "required": false,
+         "description": "插件响应缓存秒数（默认 300；响应里的 cache_secs 可覆盖）", "example": 300},
         {"name": "read_only", "required": false,
          "description": "该系统只读（写端点 403），默认跟随全局 SAP_READ_ONLY", "example": false},
         {"name": "test", "required": false,
@@ -293,6 +332,13 @@ pub struct SetupSystemRequest {
     user: Option<String>,
     passwd: Option<String>,
     lang: Option<String>,
+    /// SAP 登录票据（给出时替代 user/passwd 建连；支持 ${VAR}）
+    mysapsso2: Option<String>,
+    /// SNC 四件套（Kerberos/Secure Login Client；给出时 passwd 可省）
+    snc_qop: Option<String>,
+    snc_myname: Option<String>,
+    snc_partnername: Option<String>,
+    snc_lib: Option<String>,
     /// 是否设为默认系统（首个系统无视此值、必然默认）
     default: Option<bool>,
     /// 写入前是否真实试连（默认 true）
@@ -303,6 +349,24 @@ pub struct SetupSystemRequest {
     adt_base_url: Option<String>,
     adt_user: Option<String>,
     adt_passwd: Option<String>,
+    /// TLS 客户端证书 PEM 路径（mTLS）；adt_key 缺省 = cert 单文件含私钥
+    adt_cert: Option<String>,
+    adt_key: Option<String>,
+    /// 自定义 CA bundle 路径（私有 CA 的 https 端点）
+    adt_ca: Option<String>,
+    /// SAP 登录票据（ADT 通道；缺省复用系统级 mysapsso2）
+    adt_sso2: Option<String>,
+    /// OAuth2 密码授权三件套（BTP ADT）；三件须同时给出
+    adt_oauth_token_url: Option<String>,
+    adt_oauth_client_id: Option<String>,
+    adt_oauth_client_secret: Option<String>,
+    /// 外部鉴权插件命令（绝对路径）；给出即启用插件鉴权
+    adt_auth_plugin_command: Option<String>,
+    /// 插件透传参数（原样进插件 stdin JSON 的 parameters）
+    #[serde(default)]
+    adt_auth_plugin_params: BTreeMap<String, String>,
+    /// 插件响应缓存秒数（默认 300）
+    adt_auth_plugin_cache_secs: Option<u64>,
     read_only: Option<bool>,
     conn: Option<BTreeMap<String, String>>,
 }
@@ -317,6 +381,11 @@ impl SetupSystemRequest {
             user: self.user.clone(),
             passwd: self.passwd.clone(),
             lang: self.lang.clone(),
+            mysapsso2: self.mysapsso2.clone(),
+            snc_qop: self.snc_qop.clone(),
+            snc_myname: self.snc_myname.clone(),
+            snc_partnername: self.snc_partnername.clone(),
+            snc_lib: self.snc_lib.clone(),
             default: self.default.unwrap_or(false),
             pool_size: self.pool_size,
             idle_validate_secs: self.idle_validate_secs,
@@ -324,6 +393,16 @@ impl SetupSystemRequest {
             adt_base_url: self.adt_base_url.clone(),
             adt_user: self.adt_user.clone(),
             adt_passwd: self.adt_passwd.clone(),
+            adt_cert: self.adt_cert.clone(),
+            adt_key: self.adt_key.clone(),
+            adt_ca: self.adt_ca.clone(),
+            adt_sso2: self.adt_sso2.clone(),
+            adt_oauth_token_url: self.adt_oauth_token_url.clone(),
+            adt_oauth_client_id: self.adt_oauth_client_id.clone(),
+            adt_oauth_client_secret: self.adt_oauth_client_secret.clone(),
+            adt_auth_plugin_command: self.adt_auth_plugin_command.clone(),
+            adt_auth_plugin_params: self.adt_auth_plugin_params.clone(),
+            adt_auth_plugin_cache_secs: self.adt_auth_plugin_cache_secs,
             read_only: self.read_only,
             conn: self.conn.clone().unwrap_or_default(),
         }
@@ -537,6 +616,13 @@ pub struct UpdateSystemRequest {
     user: Option<String>,
     passwd: Option<String>,
     lang: Option<String>,
+    /// SAP 登录票据（给出时替代 user/passwd 建连；支持 ${VAR}）
+    mysapsso2: Option<String>,
+    /// SNC 四件套（给出时 passwd 可省）
+    snc_qop: Option<String>,
+    snc_myname: Option<String>,
+    snc_partnername: Option<String>,
+    snc_lib: Option<String>,
     default: Option<bool>,
     /// 改后是否真实试连（默认 true）
     test: Option<bool>,
@@ -546,6 +632,24 @@ pub struct UpdateSystemRequest {
     adt_base_url: Option<String>,
     adt_user: Option<String>,
     adt_passwd: Option<String>,
+    /// TLS 客户端证书 PEM 路径（mTLS）
+    adt_cert: Option<String>,
+    adt_key: Option<String>,
+    /// 自定义 CA bundle 路径
+    adt_ca: Option<String>,
+    /// SAP 登录票据（ADT 通道）
+    adt_sso2: Option<String>,
+    /// OAuth2 密码授权三件套
+    adt_oauth_token_url: Option<String>,
+    adt_oauth_client_id: Option<String>,
+    adt_oauth_client_secret: Option<String>,
+    /// 外部鉴权插件命令
+    adt_auth_plugin_command: Option<String>,
+    /// 插件透传参数（提供即整体替换）
+    #[serde(default)]
+    adt_auth_plugin_params: BTreeMap<String, String>,
+    /// 插件响应缓存秒数
+    adt_auth_plugin_cache_secs: Option<u64>,
     read_only: Option<bool>,
     /// 连接参数透传表（提供即整体替换原 conn）
     conn: Option<BTreeMap<String, String>>,
@@ -567,6 +671,21 @@ fn merge_update_raw(mut base: RawSystem, body: &UpdateSystemRequest) -> RawSyste
     }
     if body.passwd.is_some() {
         base.passwd = body.passwd.clone();
+    }
+    if body.mysapsso2.is_some() {
+        base.mysapsso2 = body.mysapsso2.clone();
+    }
+    if body.snc_qop.is_some() {
+        base.snc_qop = body.snc_qop.clone();
+    }
+    if body.snc_myname.is_some() {
+        base.snc_myname = body.snc_myname.clone();
+    }
+    if body.snc_partnername.is_some() {
+        base.snc_partnername = body.snc_partnername.clone();
+    }
+    if body.snc_lib.is_some() {
+        base.snc_lib = body.snc_lib.clone();
     }
     if body.lang.is_some() {
         base.lang = body.lang.clone();
@@ -591,6 +710,37 @@ fn merge_update_raw(mut base: RawSystem, body: &UpdateSystemRequest) -> RawSyste
     }
     if body.adt_passwd.is_some() {
         base.adt_passwd = body.adt_passwd.clone();
+    }
+    if body.adt_cert.is_some() {
+        base.adt_cert = body.adt_cert.clone();
+    }
+    if body.adt_key.is_some() {
+        base.adt_key = body.adt_key.clone();
+    }
+    if body.adt_ca.is_some() {
+        base.adt_ca = body.adt_ca.clone();
+    }
+    if body.adt_sso2.is_some() {
+        base.adt_sso2 = body.adt_sso2.clone();
+    }
+    if body.adt_oauth_token_url.is_some() {
+        base.adt_oauth_token_url = body.adt_oauth_token_url.clone();
+    }
+    if body.adt_oauth_client_id.is_some() {
+        base.adt_oauth_client_id = body.adt_oauth_client_id.clone();
+    }
+    if body.adt_oauth_client_secret.is_some() {
+        base.adt_oauth_client_secret = body.adt_oauth_client_secret.clone();
+    }
+    if body.adt_auth_plugin_command.is_some() {
+        base.adt_auth_plugin_command = body.adt_auth_plugin_command.clone();
+    }
+    if !body.adt_auth_plugin_params.is_empty() {
+        // 提供即整体替换（同 conn 的语义）
+        base.adt_auth_plugin_params = body.adt_auth_plugin_params.clone();
+    }
+    if body.adt_auth_plugin_cache_secs.is_some() {
+        base.adt_auth_plugin_cache_secs = body.adt_auth_plugin_cache_secs;
     }
     if body.read_only.is_some() {
         base.read_only = body.read_only;
@@ -1024,6 +1174,11 @@ fn spec_to_raw(spec: &SystemSpec) -> RawSystem {
         // 引用形态优先：`${VAR}` 不落明文的约定在反解路径同样成立
         passwd: spec.passwd_ref.clone().or_else(|| get("PASSWD")),
         lang: get("LANG"),
+        mysapsso2: get("MYSAPSSO2"),
+        snc_qop: get("SNC_QOP"),
+        snc_myname: get("SNC_MYNAME"),
+        snc_partnername: get("SNC_PARTNERNAME"),
+        snc_lib: get("SNC_LIB"),
         default: spec.is_default,
         pool_size: spec.pool_size,
         idle_validate_secs: spec.idle_validate.map(|d| d.as_secs()),
@@ -1031,6 +1186,20 @@ fn spec_to_raw(spec: &SystemSpec) -> RawSystem {
         adt_base_url: spec.adt_base_url.clone(),
         adt_user: spec.adt_user.clone(),
         adt_passwd: spec.adt_passwd.clone(),
+        adt_cert: spec.adt_cert.clone(),
+        adt_key: spec.adt_key.clone(),
+        adt_ca: spec.adt_ca.clone(),
+        adt_sso2: spec.adt_sso2.clone(),
+        adt_oauth_token_url: spec.adt_oauth_token_url.clone(),
+        adt_oauth_client_id: spec.adt_oauth_client_id.clone(),
+        adt_oauth_client_secret: spec.adt_oauth_client_secret.clone(),
+        adt_auth_plugin_command: spec.adt_auth_plugin.as_ref().map(|p| p.command.clone()),
+        adt_auth_plugin_params: spec
+            .adt_auth_plugin
+            .as_ref()
+            .map(|p| p.parameters.clone())
+            .unwrap_or_default(),
+        adt_auth_plugin_cache_secs: spec.adt_auth_plugin.as_ref().map(|p| p.cache_ttl.as_secs()),
         read_only: spec.read_only,
         conn,
     }
@@ -1132,6 +1301,17 @@ fn raw_to_table(raw: &RawSystem, is_default: bool) -> toml::Value {
     put_str(&mut t, "adt_base_url", &raw.adt_base_url);
     put_str(&mut t, "adt_user", &raw.adt_user);
     put_str(&mut t, "adt_passwd", &raw.adt_passwd);
+    put_str(&mut t, "adt_cert", &raw.adt_cert);
+    put_str(&mut t, "adt_key", &raw.adt_key);
+    put_str(&mut t, "adt_ca", &raw.adt_ca);
+    put_str(&mut t, "adt_sso2", &raw.adt_sso2);
+    put_str(&mut t, "adt_oauth_token_url", &raw.adt_oauth_token_url);
+    put_str(&mut t, "adt_oauth_client_id", &raw.adt_oauth_client_id);
+    put_str(
+        &mut t,
+        "adt_oauth_client_secret",
+        &raw.adt_oauth_client_secret,
+    );
     if let Some(b) = raw.read_only {
         t.insert("read_only".into(), toml::Value::Boolean(b));
     }
@@ -1250,6 +1430,11 @@ mod tests {
             user: Some("dev".into()),
             passwd: Some(format!("${{{}}}", TEST_PW_VAR)),
             lang: None,
+            mysapsso2: None,
+            snc_qop: None,
+            snc_myname: None,
+            snc_partnername: None,
+            snc_lib: None,
             default: false,
             pool_size: None,
             idle_validate_secs: None,
@@ -1257,6 +1442,16 @@ mod tests {
             adt_base_url: None,
             adt_user: None,
             adt_passwd: None,
+            adt_cert: None,
+            adt_key: None,
+            adt_ca: None,
+            adt_sso2: None,
+            adt_oauth_token_url: None,
+            adt_oauth_client_id: None,
+            adt_oauth_client_secret: None,
+            adt_auth_plugin_command: None,
+            adt_auth_plugin_params: BTreeMap::new(),
+            adt_auth_plugin_cache_secs: None,
             read_only: None,
             conn: BTreeMap::new(),
         }

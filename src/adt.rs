@@ -30,17 +30,126 @@ use axum::response::Response;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+/// ADT 端点鉴权配置（构造期解析，运行期只读）。
+///
+/// - `Basic`：现状默认（user/passwd）；
+/// - `Sso2`：SAP 登录票据走 `Cookie: MYSAPSSO2=…`（sapcli 借鉴 B2；票据自带
+///   身份，不送 Basic 头）；
+/// - `OAuth`：OAuth 2.0 密码授权（BTP/ABAP Cloud ADT 只认这个）——Bearer
+///   token 懒取 + 进程内缓存 + 401 强制刷新重试一次；password 可省
+///   （缓存里有 refresh token 时），刷新失败回落 password grant。
+///   mTLS 客户端证书与鉴权**正交**（identity 见 `AdtEndpointOpts`）。
+pub(crate) enum AdtAuthSpec {
+    Basic {
+        user: String,
+        passwd: String,
+    },
+    Sso2 {
+        ticket: String,
+        user: String,
+    },
+    /// 外部鉴权插件（懒执行 + TTL 缓存；最高优先级，sapcli 同序）
+    Plugin(AuthPluginSpec),
+    OAuth {
+        /// token 端点基址（实际请求 `{base}/oauth/token`）
+        token_url: String,
+        client_id: String,
+        client_secret: String,
+        user: Option<String>,
+        passwd: Option<String>,
+    },
+}
+
+/// OAuth 缓存状态（token + 拿到时刻；提前 60s 视为过期，sapcli 同款余量）
+struct OAuthState {
+    token_url: String,
+    client_id: String,
+    client_secret: String,
+    user: Option<String>,
+    passwd: Option<String>,
+    token: Mutex<Option<(String, Instant)>>,
+    /// refresh token（grant 响应带就存；内存态，重启后重新 password grant）
+    refresh: Mutex<Option<String>>,
+}
+
+const OAUTH_REFRESH_MARGIN: Duration = Duration::from_secs(60);
+
+/// 外部鉴权插件配置（sapcli auth_plugin 借鉴 B3，网关版收缩到 ADT 通道）。
+///
+/// 协议：子进程 stdin 收 `{"connection":{...},"parameters":{...}}`，
+/// stdout 回 `{"message":str,"content":{...},"cache_secs":num?}`。
+/// `content.type ∈ cookie | http_authorization_header`（certificates 形态
+/// 网关不支持——用 adt_cert/adt_key 静态配置替代）。
+#[derive(Debug, Clone)]
+pub(crate) struct AuthPluginSpec {
+    /// 插件可执行文件**绝对路径**（常驻服务防 PATH 劫持）
+    pub command: String,
+    /// 透传参数（原样进请求 JSON 的 parameters）
+    pub parameters: std::collections::BTreeMap<String, String>,
+    /// 响应缓存秒数（默认 300；响应里的 cache_secs 可覆盖）
+    pub cache_ttl: Duration,
+}
+
+impl Default for AuthPluginSpec {
+    fn default() -> Self {
+        Self {
+            command: String::new(),
+            parameters: Default::default(),
+            cache_ttl: Duration::from_secs(300),
+        }
+    }
+}
+
+/// 插件凭证缓存：应用为请求的额外头 + Cookie 串
+#[derive(Debug, Clone)]
+struct PluginCred {
+    /// headers 映射（可含 Authorization）——原样作为请求头注入
+    headers: Vec<(String, String)>,
+    /// cookies 合成的 Cookie 头值（"k=v; k2=v2"）
+    cookies: Option<String>,
+    /// 插件自述 message（401 诊断日志透出）
+    message: String,
+    expires_at: Instant,
+}
+
+const PLUGIN_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const PLUGIN_DEFAULT_TTL: Duration = Duration::from_secs(300);
+const PLUGIN_MAX_OUTPUT: usize = 1 << 20;
+
+/// 私钥文件的 PEM 加密标记（PKCS#8 与 legacy PKCS#1）
+const PEM_ENCRYPTION_MARKERS: [&str; 2] = ["BEGIN ENCRYPTED PRIVATE KEY", "Proc-Type: 4,ENCRYPTED"];
+
+/// 拒收加密私钥（reqwest 的 OpenSSL 报错不可读；给出可执行的修复路径）。
+fn check_key_not_encrypted(bytes: &[u8], path: &str) -> Result<(), String> {
+    let text = String::from_utf8_lossy(bytes);
+    if PEM_ENCRYPTION_MARKERS.iter().any(|m| text.contains(m)) {
+        return Err(format!(
+            "ADT 客户端私钥是加密的，无法直接使用: {path}\n要么先解密（openssl pkey -in encrypted.key -out plain.key），\n要么走 auth 外置方案后提供解密后的 key 文件"
+        ));
+    }
+    Ok(())
+}
+
 /// 单系统的 ADT 端点（基地址 + 认证 + HTTP 客户端 + CSRF 会话缓存）。
 pub struct AdtEndpoint {
     /// 基地址，如 `http://localhost:50000`（不带尾斜杠）
     base_url: String,
-    /// 预组装的 `Basic xxx` Authorization 头
-    basic: String,
+    /// 鉴权状态（Basic / SSO2 / OAuth）
+    auth: AuthState,
     /// 登录用户（对象创建 XML 的 adtcore:responsible 用；大写）
     user: String,
     client: reqwest::Client,
     /// CSRF token 缓存：写操作共用一个会话 token，过期或 403 后刷新
     csrf: Mutex<Option<CsrfToken>>,
+}
+
+enum AuthState {
+    /// 预组装的 `Basic xxx` Authorization 头
+    Basic(String),
+    Sso2(String),
+    OAuth(OAuthState),
+    /// 外部插件（懒执行 + TTL 缓存；401 时失效重跑一次）
+    Plugin(std::sync::RwLock<Option<PluginCred>>, AuthPluginSpec),
 }
 
 const CSRF_TTL: Duration = Duration::from_secs(30 * 60);
@@ -81,29 +190,119 @@ pub fn capabilities_adt_enabled() -> bool {
 }
 
 impl AdtEndpoint {
-    /// 创建端点。`base_url` 不带尾斜杠；`timeout` 为单请求超时。
+    /// 创建端点（Basic 快捷形态）。`base_url` 不带尾斜杠；`timeout` 为单请求超时。
+    #[allow(dead_code)] // build_adt 走 new_with_auth；Basic 快捷形态留给测试与工具调用
     pub fn new(base_url: &str, user: &str, passwd: &str, timeout: Duration) -> Self {
+        Self::new_with_auth(
+            base_url,
+            AdtAuthSpec::Basic {
+                user: user.to_string(),
+                passwd: passwd.to_string(),
+            },
+            &[],
+            None,
+            timeout,
+        )
+        .expect("Basic 形态构造不会失败（无 TLS 素材读取）")
+    }
+
+    /// 完整构造：鉴权形态 + TLS 素材（mTLS identity / CA bundle）。
+    /// `tls_files`：cert PEM 路径 + 可选 key PEM 路径（key 缺省 = cert 单文件含私钥）。
+    pub(crate) fn new_with_auth(
+        base_url: &str,
+        auth: AdtAuthSpec,
+        tls_files: &[&str],
+        ca_bundle: Option<&str>,
+        timeout: Duration,
+    ) -> Result<Self, String> {
         use base64::Engine;
-        let basic = format!(
-            "Basic {}",
-            base64::engine::general_purpose::STANDARD.encode(format!("{}:{}", user, passwd))
-        );
-        let client = reqwest::Client::builder()
-            // ADT 永远直连 SAP，无视 HTTP_PROXY/HTTPS_PROXY/ALL_PROXY 环境变量。
-            // 本机代理是白名单型的，对内网 IP 一律返 403 空 body（<30ms），
-            // 一旦网关进程在带代理的 shell 里启动，ADT 全线挂掉而不自知
-            // （RFC 走 CPIC socket 不走 HTTP，所以表现为"RFC 全通、ADT 全 403"）。
-            .no_proxy()
-            .timeout(timeout)
-            .build()
-            .unwrap_or_default();
-        Self {
+        let (auth_state, user) = match auth {
+            AdtAuthSpec::Basic { user, passwd } => {
+                let basic = format!(
+                    "Basic {}",
+                    base64::engine::general_purpose::STANDARD
+                        .encode(format!("{}:{}", user, passwd))
+                );
+                (AuthState::Basic(basic), user)
+            }
+            AdtAuthSpec::Sso2 { ticket, user } => (AuthState::Sso2(ticket), user),
+            AdtAuthSpec::OAuth {
+                token_url,
+                client_id,
+                client_secret,
+                user,
+                passwd,
+            } => (
+                AuthState::OAuth(OAuthState {
+                    token_url,
+                    client_id,
+                    client_secret,
+                    user: user.clone(),
+                    passwd,
+                    token: Mutex::new(None),
+                    refresh: Mutex::new(None),
+                }),
+                user.unwrap_or_else(|| "AGENT".to_string()),
+            ),
+            AdtAuthSpec::Plugin(spec) => (
+                AuthState::Plugin(std::sync::RwLock::new(None), spec),
+                "AGENT".to_string(),
+            ),
+        };
+        // TLS identity：PEM（证书 + 私钥可合并单文件）。加密私钥提前拒收——
+        // reqwest/OSSL 报错难读，sapcli 的处置照抄（提示 openssl pkey 解密）
+        let mut pem_parts: Vec<Vec<u8>> = Vec::new();
+        for (i, path) in tls_files.iter().enumerate() {
+            let bytes = std::fs::read(path).map_err(|e| {
+                format!(
+                    "ADT TLS 素材读取失败（第 {} 个文件 {}）: {}",
+                    i + 1,
+                    path,
+                    e
+                )
+            })?;
+            // key 文件（第二个，或单文件形态里的合并 PEM）含加密私钥 → 拒收
+            if i > 0 || tls_files.len() == 1 {
+                check_key_not_encrypted(&bytes, path)?;
+            }
+            pem_parts.push(bytes);
+        }
+        let client = {
+            let mut b = reqwest::Client::builder()
+                // ADT 永远直连 SAP，无视 HTTP_PROXY/HTTPS_PROXY/ALL_PROXY 环境变量。
+                // 本机代理是白名单型的，对内网 IP 一律返 403 空 body（<30ms），
+                // 一旦网关进程在带代理的 shell 里启动，ADT 全线挂掉而不自知
+                // （RFC 走 CPIC socket 不走 HTTP，所以表现为"RFC 全通、ADT 全 403"）。
+                .no_proxy()
+                .timeout(timeout);
+            if !pem_parts.is_empty() {
+                let mut all = Vec::new();
+                for p in &pem_parts {
+                    all.extend_from_slice(p);
+                    if !p.ends_with(b"\n") {
+                        all.push(b'\n');
+                    }
+                }
+                let identity = reqwest::Identity::from_pem(&all)
+                    .map_err(|e| format!("ADT TLS identity 构建失败（cert/key 无效？）: {e}"))?;
+                b = b.identity(identity);
+            }
+            if let Some(ca) = ca_bundle {
+                let pem = std::fs::read(ca)
+                    .map_err(|e| format!("ADT CA bundle 读取失败 ({}): {}", ca, e))?;
+                let cert = reqwest::Certificate::from_pem(&pem)
+                    .map_err(|e| format!("ADT CA bundle 解析失败 ({}): {}", ca, e))?;
+                b = b.add_root_certificate(cert);
+            }
+            b.build().unwrap_or_default()
+        };
+        Ok(Self {
             base_url: base_url.trim_end_matches('/').to_string(),
-            basic,
+            auth: auth_state,
             user: user.trim().to_uppercase(),
             client,
             csrf: Mutex::new(None),
-        }
+        })
     }
 
     /// ADT 登录用户名（对象创建 XML 的 responsible 字段）。
@@ -175,15 +374,19 @@ impl AdtEndpoint {
         &self,
         url: &str,
     ) -> Result<Option<(String, Option<String>)>, RfcError> {
-        let resp = self
+        let auth = self.auth_header().await?;
+        let mut req = self
             .client
             .get(url)
-            .header("Authorization", &self.basic)
             .header("X-CSRF-Token", "Fetch")
-            .header("Accept", "*/*")
-            .send()
-            .await
-            .map_err(adt_unreachable)?;
+            .header("Accept", "*/*");
+        if let Some(a) = &auth {
+            req = req.header("Authorization", a);
+        }
+        if let Some(c) = self.sso2_cookie() {
+            req = req.header("Cookie", c);
+        }
+        let resp = req.send().await.map_err(adt_unreachable)?;
 
         let token = resp
             .headers()
@@ -204,6 +407,217 @@ impl AdtEndpoint {
         }
     }
 
+    /// **强制刷新**共享缓存的 CSRF token 并返回 (token, cookie 头串)。
+    ///
+    /// 用途：临时对象执行编排（`/api/abap/run`）。classrun 服务按 ABAP 会话
+    /// 缓存类元数据——同一会话里「刚激活的类」常被判成不存在/不完整
+    /// （sapcli 同款报错 "Class does not implement if_oo_adt_classrun~main
+    /// method!"，它靠 `connection.new_session()` 规避）。强制刷新会从服务器
+    /// 拿一套**全新**的 sap-contextid cookie，把执行请求放进新会话。
+    /// token 与资源无关、按 client+user 会话签发，用 discovery URL 签发即可。
+    pub(crate) async fn fresh_session_token(&self) -> Result<(String, Option<String>), RfcError> {
+        let disco = format!("{}/sap/bc/adt/discovery", self.base_url);
+        let got = self.csrf_token(&disco, true).await?;
+        got.ok_or_else(|| RfcError {
+            code: -1,
+            status: 502,
+            message: "ADT CSRF token 获取失败（响应缺少 X-CSRF-Token 头）".into(),
+            key: "ADT_CSRF_FAILED".into(),
+        })
+    }
+
+    /// 当前鉴权对应的 `Authorization` 头值（Sso2 返回 None——身份在 Cookie 里；
+    /// OAuth 取缓存 token，必要时先发 grant）。
+    async fn auth_header(&self) -> Result<Option<String>, RfcError> {
+        match &self.auth {
+            AuthState::Basic(h) => Ok(Some(h.clone())),
+            AuthState::Sso2(_) | AuthState::Plugin(..) => Ok(None),
+            AuthState::OAuth(_) => Ok(Some(format!("Bearer {}", self.oauth_token(false).await?))),
+        }
+    }
+
+    /// SSO2 票据 Cookie 串（非 Sso2 形态恒 None）。
+    fn sso2_cookie(&self) -> Option<String> {
+        match &self.auth {
+            AuthState::Sso2(ticket) => Some(format!("MYSAPSSO2={ticket}")),
+            _ => None,
+        }
+    }
+
+    /// 插件凭证（缓存未过期直接用；过期重跑插件）。`force` = 失效重跑（401 后）。
+    async fn plugin_cred(&self, force: bool) -> Result<PluginCred, RfcError> {
+        let (cache, spec) = match &self.auth {
+            AuthState::Plugin(cache, spec) => (cache, spec),
+            _ => {
+                return Err(RfcError {
+                    code: -1,
+                    status: 500,
+                    message: "plugin_cred 仅 Plugin 形态可调".into(),
+                    key: "ADT_INTERNAL".into(),
+                })
+            }
+        };
+        if !force {
+            if let Ok(guard) = cache.read() {
+                if let Some(c) = guard.as_ref() {
+                    if Instant::now() < c.expires_at {
+                        return Ok(c.clone());
+                    }
+                }
+            }
+        }
+        // 连接上下文从基地址解析（插件可据此选后端/租户）
+        let (proto, hostport) = match self.base_url.split_once("://") {
+            Some((p, rest)) => (p.to_string(), rest.to_string()),
+            None => ("http".to_string(), self.base_url.clone()),
+        };
+        let (host, port) = match hostport.rsplit_once(':') {
+            Some((h, p)) => (h.to_string(), p.to_string()),
+            None => (
+                hostport.clone(),
+                if proto == "https" { "443" } else { "80" }.to_string(),
+            ),
+        };
+        let cred = run_auth_plugin(spec, &proto, &host, &port).await?;
+        if let Ok(mut g) = cache.write() {
+            *g = Some(cred.clone());
+        }
+        Ok(cred)
+    }
+
+    /// 插件产物 → (额外请求头, 额外 Cookie 串)。非 Plugin 形态返回空。
+    async fn plugin_extras(&self) -> Result<(Vec<(String, String)>, Option<String>), RfcError> {
+        if !matches!(self.auth, AuthState::Plugin(..)) {
+            return Ok((Vec::new(), None));
+        }
+        let cred = self.plugin_cred(false).await?;
+        let cookie = cred.cookies.clone();
+        // 插件可自带 Authorization——它优先于计算出的 auth_header
+        let _ = &cred;
+        Ok((cred.headers.to_vec(), cookie))
+    }
+
+    /// 插件产物里是否带 Authorization 头（决定 auth_header 是否让位）。
+    fn plugin_has_authorization(extras: &[(String, String)]) -> bool {
+        extras
+            .iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case("authorization"))
+    }
+
+    /// OAuth token：缓存未过期直接用 → refresh_token 换新 → password grant。
+    /// `force=true` 丢弃缓存强制重取（401 后用）。
+    async fn oauth_token(&self, force: bool) -> Result<String, RfcError> {
+        let state = match &self.auth {
+            AuthState::OAuth(st) => st,
+            _ => {
+                return Err(RfcError {
+                    code: -1,
+                    status: 500,
+                    message: "oauth_token 仅 OAuth 形态可调".into(),
+                    key: "ADT_INTERNAL".into(),
+                })
+            }
+        };
+        if !force {
+            if let Ok(guard) = state.token.lock() {
+                if let Some((t, expires_at)) = guard.as_ref() {
+                    // 提前 OAUTH_REFRESH_MARGIN 轮换（并发窗口）
+                    if Instant::now() + OAUTH_REFRESH_MARGIN < *expires_at {
+                        return Ok(t.clone());
+                    }
+                }
+            }
+        }
+        // refresh 优先（有就先试，失败回落 password grant——sapcli get_token 同序）
+        let refresh = state.refresh.lock().ok().and_then(|g| g.clone());
+        let token_url = format!("{}/oauth/token", state.token_url.trim_end_matches('/'));
+        let send_grant = |form: Vec<(&str, String)>| {
+            self.client
+                .post(&token_url)
+                .basic_auth(&state.client_id, Some(&state.client_secret))
+                .header("Accept", "application/json")
+                .form(&form)
+        };
+        // 刷新失败不致命：走完整 grant（refresh token 可能已过期/吊销）
+        let response = if let Some(rt) = refresh {
+            match send_grant(vec![
+                ("grant_type", "refresh_token".into()),
+                ("refresh_token", rt),
+            ])
+            .send()
+            .await
+            {
+                Ok(r) if r.status().is_success() => Some(r),
+                _ => None,
+            }
+        } else {
+            None
+        };
+
+        let response = match response {
+            Some(r) => r,
+            None => {
+                let mut form = vec![("grant_type", "password".to_string())];
+                if let Some(u) = &state.user {
+                    form.push(("username", u.clone()));
+                }
+                if let Some(p) = &state.passwd {
+                    form.push(("password", p.clone()));
+                }
+                send_grant(form).send().await.map_err(adt_unreachable)?
+            }
+        };
+
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let body = response.text().await.unwrap_or_default();
+            return Err(RfcError {
+                code: -1,
+                status: if status == 401 || status == 400 { 401 } else { 502 },
+                message: format!(
+                    "OAuth token 获取失败（HTTP {status}）——检查 token_url/client_id/client_secret{}: {}",
+                    if state.passwd.is_none() { "（password grant 需要 user/passwd，除非缓存里有有效 refresh token）" } else { "" },
+                    crate::explore::first_line(&body)
+                ),
+                key: "ADT_OAUTH_FAILED".into(),
+            });
+        }
+
+        let data: serde_json::Value = response.json().await.map_err(|e| RfcError {
+            code: -1,
+            status: 502,
+            message: format!("OAuth token 响应不是 JSON: {e}"),
+            key: "ADT_OAUTH_FAILED".into(),
+        })?;
+        let access = data
+            .get("access_token")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| RfcError {
+                code: -1,
+                status: 502,
+                message: "OAuth token 响应缺少 access_token".into(),
+                key: "ADT_OAUTH_FAILED".into(),
+            })?
+            .to_string();
+        if let Some(rt) = data.get("refresh_token").and_then(|v| v.as_str()) {
+            if let Ok(mut g) = state.refresh.lock() {
+                *g = Some(rt.to_string());
+            }
+        }
+        let expires_in = data
+            .get("expires_in")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(3600)
+            .max(0) as u64;
+        if let Ok(mut g) = state.token.lock() {
+            *g = Some((
+                access.clone(),
+                Instant::now() + Duration::from_secs(expires_in),
+            ));
+        }
+        Ok(access)
+    }
+
     /// 内部 GET 通道：供网关自身的结构化端点（`/api/dumps/**`）复用 ADT 配置、
     /// 认证与错误契约，避免各自直接拼 URL。
     ///
@@ -218,18 +632,18 @@ impl AdtEndpoint {
         let rel_raw = validate_raw_path(rel_raw)?;
         let url = format!("{}/sap/bc/adt/{}", self.base_url, rel_raw);
 
-        let resp = self
-            .client
-            .get(&url)
-            .header("Authorization", &self.basic)
-            .header("Accept", accept)
-            .send()
-            .await
-            .map_err(|e| {
-                metrics::counter!("adt_calls_total", "method" => "GET", "result" => "err")
-                    .increment(1);
-                adt_unreachable(e)
-            })?;
+        let auth = self.auth_header().await?;
+        let mut req = self.client.get(&url).header("Accept", accept);
+        if let Some(a) = &auth {
+            req = req.header("Authorization", a);
+        }
+        if let Some(c) = self.sso2_cookie() {
+            req = req.header("Cookie", c);
+        }
+        let resp = req.send().await.map_err(|e| {
+            metrics::counter!("adt_calls_total", "method" => "GET", "result" => "err").increment(1);
+            adt_unreachable(e)
+        })?;
 
         let status = resp.status().as_u16();
         let content_type = resp
@@ -310,20 +724,23 @@ impl AdtEndpoint {
     ) -> Result<(String, Vec<(String, String)>), RfcError> {
         let rel_path = validate_raw_path(rel_path)?;
         let url = format!("{}/sap/bc/adt/{}", self.base_url, rel_path);
-        let resp = self
+        let auth = self.auth_header().await?;
+        let mut req = self
             .client
             .get(&url)
-            .header("Authorization", &self.basic)
             .header("Accept", "*/*")
             .header("X-CSRF-Token", "Fetch")
-            .header("X-sap-adt-sessiontype", "stateful")
-            .send()
-            .await
-            .map_err(|e| {
-                metrics::counter!("adt_calls_total", "method" => "GET", "result" => "err")
-                    .increment(1);
-                adt_unreachable(e)
-            })?;
+            .header("X-sap-adt-sessiontype", "stateful");
+        if let Some(a) = &auth {
+            req = req.header("Authorization", a);
+        }
+        if let Some(c) = self.sso2_cookie() {
+            req = req.header("Cookie", c);
+        }
+        let resp = req.send().await.map_err(|e| {
+            metrics::counter!("adt_calls_total", "method" => "GET", "result" => "err").increment(1);
+            adt_unreachable(e)
+        })?;
         let token = resp
             .headers()
             .get("x-csrf-token")
@@ -386,12 +803,27 @@ impl AdtEndpoint {
             sep = '&';
         }
 
-        let send = |csrf: Option<(String, Option<String>)>| {
+        // 鉴权头一次计算（OAuth 会先取缓存 token）；插件产物（任意头 + Cookie）
+        // 与 Sso2 票据 Cookie、会话 Cookie 合并成单个 Cookie 头（重复 Cookie 头
+        // 服务器行为不可靠）。插件自带 Authorization 时让位。
+        let auth0 = self.auth_header().await?;
+        let (plugin_hdrs, plugin_cookie) = self.plugin_extras().await?;
+        let auth0 = if Self::plugin_has_authorization(&plugin_hdrs) {
+            None
+        } else {
+            auth0
+        };
+        let send = |csrf: Option<(String, Option<String>)>,
+                    auth: &Option<String>,
+                    extra_hdrs: &[(String, String)],
+                    extra_cookie: &Option<String>| {
             let mut req = self
                 .client
                 .request(method.clone(), &url)
-                .header("Authorization", &self.basic)
                 .header("Accept", accept);
+            if let Some(a) = auth {
+                req = req.header("Authorization", a);
+            }
             if let Some(ct) = content_type {
                 req = req.header("Content-Type", ct);
             }
@@ -401,6 +833,16 @@ impl AdtEndpoint {
             for (k, v) in extra_headers {
                 req = req.header(*k, *v);
             }
+            for (k, v) in extra_hdrs {
+                req = req.header(k.as_str(), v.as_str());
+            }
+            let mut cookie_parts: Vec<String> = Vec::new();
+            if let Some(sc) = self.sso2_cookie() {
+                cookie_parts.push(sc);
+            }
+            if let Some(pc) = extra_cookie {
+                cookie_parts.push(pc.clone());
+            }
             if let Some((token, cookie)) = csrf {
                 req = req.header("X-CSRF-Token", token);
                 // 编排会话的 Cookie 优先（含 sap-contextid），否则用共享缓存会话
@@ -408,8 +850,11 @@ impl AdtEndpoint {
                     .map(str::to_string)
                     .or_else(|| cookie.clone());
                 if let Some(c) = cookie {
-                    req = req.header("Cookie", c);
+                    cookie_parts.push(c);
                 }
+            }
+            if !cookie_parts.is_empty() {
+                req = req.header("Cookie", cookie_parts.join("; "));
             }
             req
         };
@@ -425,11 +870,14 @@ impl AdtEndpoint {
         };
         // 传输层重试一次：ED1 的坏节点对部分请求直接断连（connection reset），
         // 重发通常落到健康节点。与下面 uriMappingError 重试互补。
-        let mut resp = match send(csrf.clone()).send().await {
+        let mut resp = match send(csrf.clone(), &auth0, &plugin_hdrs, &plugin_cookie)
+            .send()
+            .await
+        {
             Ok(r) => r,
             Err(e) => {
                 tracing::warn!(error = %e, "ADT 请求传输层失败（坏节点断连？），重发一次");
-                send(csrf.clone()).send().await.map_err(|e2| {
+                send(csrf.clone(), &auth0, &plugin_hdrs, &plugin_cookie).send().await.map_err(|e2| {
                     metrics::counter!("adt_calls_total", "method" => method.as_str().to_owned(), "result" => "err").increment(1);
                     adt_unreachable(e2)
                 })?
@@ -442,19 +890,48 @@ impl AdtEndpoint {
             tracing::debug!("ADT 内部写请求 403，刷新 CSRF token 后重试");
             if let Ok(Some(new)) = self.csrf_token(&url, true).await {
                 csrf = Some(new);
-                resp = send(csrf.clone()).send().await.map_err(|e| {
+                resp = send(csrf.clone(), &auth0, &plugin_hdrs, &plugin_cookie).send().await.map_err(|e| {
                     metrics::counter!("adt_calls_total", "method" => method.as_str().to_owned(), "result" => "err").increment(1);
                     adt_unreachable(e)
                 })?;
             }
         }
 
+        // 401 on OAuth：token 被吊销/过期——强制重新 grant 后重发一次
+        if resp.status() == StatusCode::UNAUTHORIZED && matches!(self.auth, AuthState::OAuth(_)) {
+            tracing::debug!("ADT OAuth 401，强制刷新 token 后重发一次");
+            let fresh = self.oauth_token(true).await?;
+            resp = send(csrf.clone(), &Some(format!("Bearer {fresh}")), &plugin_hdrs, &plugin_cookie).send().await.map_err(|e| {
+                metrics::counter!("adt_calls_total", "method" => method.as_str().to_owned(), "result" => "err").increment(1);
+                adt_unreachable(e)
+            })?;
+        }
+        // 401 on Plugin：凭证失效——失效缓存重跑插件后重发一次
+        if resp.status() == StatusCode::UNAUTHORIZED && matches!(self.auth, AuthState::Plugin(..)) {
+            tracing::debug!("ADT plugin 401，失效缓存重跑插件后重发一次");
+            let _ = self.plugin_cred(true).await?;
+            let (hdrs2, cookie2) = self.plugin_extras().await?;
+            // 插件路径的 Authorization 由 hdrs2 自带——auth2 恒为 None（避免与
+            // 共享认证头重复）；plugin_has_authorization 检查留给未来分流
+            let auth2: Option<String> = None;
+            let _ = Self::plugin_has_authorization(&hdrs2);
+            resp = send(csrf.clone(), &auth2, &hdrs2, &cookie2).send().await.map_err(|e| {
+                metrics::counter!("adt_calls_total", "method" => method.as_str().to_owned(), "result" => "err").increment(1);
+                adt_unreachable(e)
+            })?;
+        }
+
         // 响应读取最多两轮：ED1 这类 Web Dispatcher 负载均衡下，坏节点的 ADT
         // URI mapper 会稳定返回 500 + `uriMappingError`（实测 200/500 完美交替），
         // 原样重发一次通常就轮到健康节点。会话 cookie / CSRF 原样带上。
         let mut retries_left = 1;
-        let (status, etag, cookies, body) = loop {
+        let (status, etag, cookies, body, location) = loop {
             let status = resp.status().as_u16();
+            let location = resp
+                .headers()
+                .get("location")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned);
             let etag = resp
                 .headers()
                 .get("etag")
@@ -484,11 +961,11 @@ impl AdtEndpoint {
             if !retryable {
                 metrics::counter!("adt_calls_total", "method" => method.as_str().to_owned(), "result" => "ok")
                     .increment(1);
-                break (status, etag, cookies, body);
+                break (status, etag, cookies, body, location);
             }
             retries_left -= 1;
             tracing::warn!("ADT 响应 500 uriMappingError（负载均衡坏节点），原样重发一次");
-            resp = send(csrf.clone()).send().await.map_err(|e| {
+            resp = send(csrf.clone(), &auth0, &plugin_hdrs, &plugin_cookie).send().await.map_err(|e| {
                 metrics::counter!("adt_calls_total", "method" => method.as_str().to_owned(), "result" => "err").increment(1);
                 adt_unreachable(e)
             })?;
@@ -499,6 +976,7 @@ impl AdtEndpoint {
             etag,
             body,
             cookies,
+            location,
         })
     }
 
@@ -531,18 +1009,28 @@ impl AdtEndpoint {
             url.push_str(q);
         }
 
-        let send = |csrf: Option<(String, Option<String>)>| {
-            let mut req = self
-                .client
-                .request(method.clone(), &url)
-                .header("Authorization", &self.basic)
-                .header(
-                    "Accept",
-                    headers
-                        .get("accept")
-                        .and_then(|v| v.to_str().ok())
-                        .unwrap_or("*/*"),
-                );
+        // 鉴权头一次计算（OAuth 取缓存 token）；插件产物与 Sso2 票据 Cookie 并入
+        let auth0 = self.auth_header().await?;
+        let (plugin_hdrs, plugin_cookie) = self.plugin_extras().await?;
+        let auth0 = if Self::plugin_has_authorization(&plugin_hdrs) {
+            None
+        } else {
+            auth0
+        };
+        let send = |csrf: Option<(String, Option<String>)>,
+                    auth: &Option<String>,
+                    extra_hdrs: &[(String, String)],
+                    extra_cookie: &Option<String>| {
+            let mut req = self.client.request(method.clone(), &url).header(
+                "Accept",
+                headers
+                    .get("accept")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("*/*"),
+            );
+            if let Some(a) = auth {
+                req = req.header("Authorization", a);
+            }
             if let Some(ct) = headers.get("content-type").and_then(|v| v.to_str().ok()) {
                 req = req.header("Content-Type", ct);
             }
@@ -555,11 +1043,24 @@ impl AdtEndpoint {
             if !body.is_empty() {
                 req = req.body(body.clone());
             }
+            for (k, v) in extra_hdrs {
+                req = req.header(k.as_str(), v.as_str());
+            }
+            let mut cookie_parts: Vec<String> = Vec::new();
+            if let Some(sc) = self.sso2_cookie() {
+                cookie_parts.push(sc);
+            }
+            if let Some(pc) = extra_cookie {
+                cookie_parts.push(pc.clone());
+            }
             if let Some((token, cookie)) = csrf {
                 req = req.header("X-CSRF-Token", token);
                 if let Some(c) = cookie {
-                    req = req.header("Cookie", c);
+                    cookie_parts.push(c);
                 }
+            }
+            if !cookie_parts.is_empty() {
+                req = req.header("Cookie", cookie_parts.join("; "));
             }
             req
         };
@@ -579,21 +1080,60 @@ impl AdtEndpoint {
         } else {
             None
         };
-        let mut resp = send(csrf.clone()).send().await.map_err(|e| {
-            metrics_result(false);
-            adt_unreachable(e)
-        })?;
+        let mut resp = send(csrf.clone(), &auth0, &plugin_hdrs, &plugin_cookie)
+            .send()
+            .await
+            .map_err(|e| {
+                metrics_result(false);
+                adt_unreachable(e)
+            })?;
 
         // 403 通常是 token 过期：刷新后重试一次（仅写方法）
         if resp.status() == StatusCode::FORBIDDEN && is_write_method(&method) {
             tracing::debug!("ADT 写请求 403，刷新 CSRF token 后重试");
             if let Ok(Some(new)) = self.csrf_token(&url, true).await {
                 csrf = Some(new);
-                resp = send(csrf.clone()).send().await.map_err(|e| {
+                resp = send(csrf.clone(), &auth0, &plugin_hdrs, &plugin_cookie)
+                    .send()
+                    .await
+                    .map_err(|e| {
+                        metrics_result(false);
+                        adt_unreachable(e)
+                    })?;
+            }
+        }
+
+        // OAuth 401：token 失效——强制重新 grant 重发一次
+        if resp.status() == StatusCode::UNAUTHORIZED && matches!(self.auth, AuthState::OAuth(_)) {
+            tracing::debug!("ADT OAuth 401（代理通道），强制刷新 token 后重发一次");
+            let fresh = self.oauth_token(true).await?;
+            resp = send(
+                csrf.clone(),
+                &Some(format!("Bearer {fresh}")),
+                &plugin_hdrs,
+                &plugin_cookie,
+            )
+            .send()
+            .await
+            .map_err(|e| {
+                metrics_result(false);
+                adt_unreachable(e)
+            })?;
+        }
+
+        // Plugin 401：凭证失效——失效缓存重跑插件后重发一次
+        if resp.status() == StatusCode::UNAUTHORIZED && matches!(self.auth, AuthState::Plugin(..)) {
+            let cred = self.plugin_cred(true).await?;
+            tracing::debug!(message = %cred.message, "ADT plugin 401（代理通道），失效缓存重跑插件后重发一次");
+            let (hdrs2, cookie2) = self.plugin_extras().await?;
+            let auth2 = None;
+            resp = send(csrf.clone(), &auth2, &hdrs2, &cookie2)
+                .send()
+                .await
+                .map_err(|e| {
                     metrics_result(false);
                     adt_unreachable(e)
                 })?;
-            }
         }
 
         let status = resp.status();
@@ -630,6 +1170,184 @@ pub(crate) struct AdtRawResponse {
     /// 响应 `set-cookie` 的 (name, value) 对——有状态编排（锁→写→解锁）
     /// 靠回传 `sap-contextid` 等维持同一 ABAP 会话
     pub cookies: Vec<(String, String)>,
+    /// `Location` 响应头——aunit 异步 run 创建（201 + Location: …/runs/{id}）
+    /// 等需要靠它拿新资源 ID 的端点用；其余端点恒 None
+    pub location: Option<String>,
+}
+
+/// 执行外部鉴权插件：stdin JSON 进、stdout JSON 出，30s 硬超时。
+/// 失败（非零退出/超时/坏 JSON/未知 content.type）一律 502 ADT_PLUGIN_FAILED。
+async fn run_auth_plugin(
+    spec: &AuthPluginSpec,
+    conn_proto: &str,
+    conn_host: &str,
+    conn_port: &str,
+) -> Result<PluginCred, RfcError> {
+    use tokio::io::AsyncWriteExt;
+    if !spec.command.starts_with('/') {
+        return Err(RfcError {
+            code: -1,
+            status: 502,
+            message: format!(
+                "auth_plugin.command 必须是绝对路径（防 PATH 劫持，网关常驻服务）: {:?}",
+                spec.command
+            ),
+            key: "ADT_PLUGIN_FAILED".into(),
+        });
+    }
+    let request = serde_json::json!({
+        "connection": {
+            "proto": conn_proto,
+            "host": conn_host,
+            "port": conn_port,
+            "type": "adt",
+            "path": "/sap/bc/adt/core/discovery",
+            "verify": true,
+        },
+        "parameters": spec.parameters,
+    });
+
+    let mut child = tokio::process::Command::new(&spec.command)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| RfcError {
+            code: -1,
+            status: 502,
+            message: format!("auth_plugin 启动失败 ({}): {}", spec.command, e),
+            key: "ADT_PLUGIN_FAILED".into(),
+        })?;
+    if let Some(mut si) = child.stdin.take() {
+        let _ = si.write_all(request.to_string().as_bytes()).await;
+        let _ = si.shutdown().await;
+    }
+    let out = tokio::time::timeout(PLUGIN_TIMEOUT, child.wait_with_output()).await;
+    let out = match out {
+        Ok(Ok(o)) => o,
+        Ok(Err(e)) => {
+            return Err(RfcError {
+                code: -1,
+                status: 502,
+                message: format!("auth_plugin 执行失败: {e}"),
+                key: "ADT_PLUGIN_FAILED".into(),
+            })
+        }
+        Err(_) => {
+            return Err(RfcError {
+                code: -1,
+                status: 502,
+                message: format!("auth_plugin 超时（{}s）", PLUGIN_TIMEOUT.as_secs()),
+                key: "ADT_PLUGIN_FAILED".into(),
+            })
+        }
+    };
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        return Err(RfcError {
+            code: -1,
+            status: 502,
+            message: format!(
+                "auth_plugin 非零退出（{}）: {}",
+                out.status,
+                crate::explore::first_line(&err)
+            ),
+            key: "ADT_PLUGIN_FAILED".into(),
+        });
+    }
+    if out.stdout.len() > PLUGIN_MAX_OUTPUT {
+        return Err(RfcError {
+            code: -1,
+            status: 502,
+            message: format!("auth_plugin 输出超限（>{}KB）", PLUGIN_MAX_OUTPUT / 1024),
+            key: "ADT_PLUGIN_FAILED".into(),
+        });
+    }
+    let data: serde_json::Value = serde_json::from_slice(&out.stdout).map_err(|e| RfcError {
+        code: -1,
+        status: 502,
+        message: format!("auth_plugin 输出不是 JSON: {e}"),
+        key: "ADT_PLUGIN_FAILED".into(),
+    })?;
+    let message = data
+        .get("message")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let content = data
+        .get("content")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let typ = content.get("type").and_then(|v| v.as_str()).unwrap_or("");
+    let (headers, cookies) = match typ {
+        // {type:"cookie", cookies:[{name,value,...}]}
+        "cookie" => {
+            let mut cs = Vec::new();
+            for c in content
+                .get("cookies")
+                .and_then(|v| v.as_array())
+                .map(|a| a.as_slice())
+                .unwrap_or(&[])
+            {
+                let name = c.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                let value = c.get("value").and_then(|v| v.as_str()).unwrap_or("");
+                if !name.is_empty() {
+                    cs.push(format!("{name}={value}"));
+                }
+            }
+            (Vec::new(), if cs.is_empty() { None } else { Some(cs.join("; ")) })
+        }
+        // {type:"http_authorization_header", headers:{Name:Value,...}}
+        "http_authorization_header" => {
+            let map = content
+                .get("headers")
+                .and_then(|v| v.as_object())
+                .ok_or_else(|| RfcError {
+                    code: -1,
+                    status: 502,
+                    message: "auth_plugin headers 形态需要非空 headers 对象".into(),
+                    key: "ADT_PLUGIN_FAILED".into(),
+                })?;
+            let hs: Vec<(String, String)> = map
+                .iter()
+                .filter_map(|(k, v)| {
+                    v.as_str().map(|s| (k.trim().to_string(), s.to_string()))
+                })
+                .collect();
+            (hs, None)
+        }
+        "certificates" => {
+            return Err(RfcError {
+                code: -1,
+                status: 502,
+                message: "auth_plugin 的 certificates 形态网关不支持——mTLS 请直接配置 adt_cert/adt_key（静态路径）".into(),
+                key: "ADT_PLUGIN_FAILED".into(),
+            })
+        }
+        other => {
+            return Err(RfcError {
+                code: -1,
+                status: 502,
+                message: format!(
+                    "auth_plugin 不支持的 content.type {other:?}（可用 cookie | http_authorization_header）"
+                ),
+                key: "ADT_PLUGIN_FAILED".into(),
+            })
+        }
+    };
+    // 响应可带 cache_secs 覆盖配置 TTL；clamp 1s..24h
+    let ttl = data
+        .get("cache_secs")
+        .and_then(|v| v.as_u64())
+        .map(|s| Duration::from_secs(s.clamp(1, 86_400)))
+        .unwrap_or(spec.cache_ttl);
+    Ok(PluginCred {
+        headers,
+        cookies,
+        message,
+        expires_at: Instant::now() + ttl,
+    })
 }
 
 fn adt_unreachable(e: reqwest::Error) -> RfcError {
