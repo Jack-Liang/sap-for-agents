@@ -24,7 +24,9 @@ env:
 
 jobs:
   clippy-test:
-    runs-on: ubuntu-latest
+    # 钉住 24.04：ubuntu-latest 正迁移 Ubuntu 26（runner-images#14748），
+    # 镜像换代不应无通知地改变 CI 行为——升级 26 走单独验证
+    runs-on: ubuntu-24.04
     steps:
       # actions 按 commit SHA 固定（可变 tag 是供应链风险）；SHA 对应 v7
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -78,7 +80,7 @@ jobs:
   # 依赖漏洞门禁（2026-11-11 REVIEW R12）：对 Cargo.lock 全量比对 RustSec
   # advisory 库。无需 Rust 工具链与 SAP SDK，只读 lock 文件。
   audit:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # audit-check 用 token 写 check-run 汇报结果——workflow 级最小权限
     # （contents: read）下会 403 "Resource not accessible by integration"，
     # 故仅此 job 提升 checks: write，其余 job 不受影响。

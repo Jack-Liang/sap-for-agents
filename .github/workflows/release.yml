@@ -33,7 +33,7 @@ jobs:
   # （/api/version、MCP serverInfo 都读 Cargo.toml，版本可信度依赖此校验）。
   check-version:
     name: Verify tag matches Cargo.toml version
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: tag == Cargo.toml version
@@ -50,7 +50,7 @@ jobs:
   # stub SDK 环境跑 clippy + 全部单测；集成测试仍 #[ignore]（CI 无真 SAP）。
   test:
     name: Test (stub SDK)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Install Rust toolchain
