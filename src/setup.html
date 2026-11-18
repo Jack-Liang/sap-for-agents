@@ -384,6 +384,9 @@ FYI: your full working documentation is at {{ORIGIN}}/agents.md (read it if you 
         if (!msg) return '';
         if (msg.indexOf('连接超时') === 0) return 'Connection timed out (5s probe)';
         if (msg.indexOf('探测任务失败') === 0) return 'Probe task failed: ' + msg.slice(7);
+        var um = msg.match(/^目标系统当前不可达.*（(.*)）$/);
+        if (um) return 'Target system currently unreachable, please retry later ('
+            + um[1].replace(/^连接失败:\s*/, 'connection failed: ') + ')';
         return msg; // RFC 错误本身是英文
     }
 
