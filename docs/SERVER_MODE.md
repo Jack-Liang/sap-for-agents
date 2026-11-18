@@ -134,6 +134,8 @@ if __name__ == "__main__":
     app.run(port=9000)
 ```
 
+A dependency-free equivalent ships in the repo: [`mock_webhook.py`](../mock_webhook.py) (stdlib `http.server`, no Flask needed). `python mock_webhook.py` listens on 9000 and serves both `/ping` (`Z_REST_PING`) and `/echo` (`Z_REST_ECHO`), echoing back every SAP request body — handy for debugging the dispatch loop before wiring up the real business service.
+
 ## Limitations (Initial Release)
 
 | Item | Notes |

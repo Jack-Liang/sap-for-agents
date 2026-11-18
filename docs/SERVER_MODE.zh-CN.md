@@ -134,6 +134,11 @@ if __name__ == "__main__":
     app.run(port=9000)
 ```
 
+仓库里还自带一份零依赖版本：[`mock_webhook.py`](../mock_webhook.py)（标准库
+`http.server`，无需 Flask）。`python mock_webhook.py` 同样监听 9000，同时服务
+`/ping`（`Z_REST_PING`）与 `/echo`（`Z_REST_ECHO`），并把每个 SAP 请求体原样
+回显——接真实业务服务之前，用它调试 dispatch 循环最方便。
+
 ## 限制（首版）
 
 | 项 | 说明 |
