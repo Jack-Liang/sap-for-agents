@@ -241,19 +241,25 @@ curl -X POST http://127.0.0.1:3000/api/setup/system -H "Content-Type: applicatio
 ashost = "vhcala4h"
 sysnr  = "00"
 client = "001"
-user   = "developer"
-passwd = "${SAP_A4H_PASSWD}"     # ${VAR} 环境变量插值——密钥留在 .env，本文件可入库
 default = true                    # 无前缀路径路由到此系统（必须恰好一个）
+
+[systems.a4h.auth.basic]
+user = "developer"
+passwd = "${SAP_A4H_PASSWD}"      # ${VAR} 环境变量插值——密钥留在 .env，本文件可入库
 
 [systems.prd]
 ashost = "sap-prd.example.com"
 sysnr  = "10"
 client = "100"
-user   = "rfc_gateway"
-passwd = "${SAP_PRD_PASSWD}"
 pool_size = 4                     # 每系统可选覆盖（缺省用 .env 全局值）
 read_only = true                  # 例如：生产系统只读、开发系统可写
+
+[systems.prd.auth.basic]
+user = "rfc_gateway"
+passwd = "${SAP_PRD_PASSWD}"
 ```
+
+凭据放每系统的 `[systems.{名字}.auth.*]` 块里（`basic` / `sso2` / `plugin` / `oauth` 主通道互斥，可选 `snc` 叠加）——v0.21 起平铺 `user`/`passwd` 字段已移除。SSO/SNC/OAuth/插件形态见 `sap_systems.toml.example` 与 [AGENTS.md §13](./AGENTS.zh-CN.md)。注意 TOML 表作用域：系统标量键（`default`、`pool_size`、`read_only`…）必须写在它自己的 `auth`/`adt` 子表头**之前**。
 
 **与 `.env` 的关系**——三层优先级：内置默认 ← `.env`（网关级开关：监听地址、API key、限流、runtime 档位…；以及池大小/超时/只读/ADT 的全局默认）← toml 每系统字段。连接参数二选一：toml 存在则系统集合完全由它定义；不存在则由 `SAP_*` 合成名为 `default` 的单系统（存量部署零改动）。
 

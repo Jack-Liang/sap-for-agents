@@ -126,27 +126,37 @@
 ashost = "vhcala4h"
 sysnr  = "00"
 client = "001"
-user   = "developer"
-passwd = "${SAP_A4H_PASSWD}"     # 环境变量插值，文件本身可入库不带密钥
 lang   = "EN"
 default = true                    # 无前缀路径路由到它（必须恰好一个）
+
+[systems.a4h.auth.basic]
+user = "developer"
+passwd = "${SAP_A4H_PASSWD}"     # 环境变量插值，文件本身可入库不带密钥
 
 [systems.prd]
 ashost = "sap-prd.example.com"
 sysnr  = "10"
 client = "100"
-user   = "rfc_gateway"
-passwd = "${SAP_PRD_PASSWD}"
 pool_size = 4                     # 可选覆盖（默认 8）
-adt_base_url = "https://sap-prd.example.com:44300"   # 可选，默认按 ashost 推导
 read_only = true                  # 可选：该系统只允许读（默认 false）
+
+[systems.prd.auth.basic]
+user = "rfc_gateway"
+passwd = "${SAP_PRD_PASSWD}"
+
+[systems.prd.adt]
+base_url = "https://sap-prd.example.com:44300"   # 可选，默认按 ashost:50000 推导
 ```
 
 要点：
 
-- **每系统可覆盖项**：`pool_size`、`pool_idle_validate_secs`、`request_timeout_secs`、
-  `adt_base_url`/`adt_user`/`adt_passwd`、`read_only`；未设走全局默认（全局值仍来自
-  环境变量，语义不变）。
+- **每系统可覆盖项**：`pool_size`、`idle_validate_secs`、`request_timeout_secs`、
+  `read_only`；未设走全局默认（全局值仍来自环境变量，语义不变）。
+- **鉴权（v0.21 auth 块化）**：每系统 `[systems.x.auth]` 块——basic / sso2 / plugin /
+  oauth 主通道互斥四选一，可选 `[systems.x.auth.snc]` 叠加；平铺 `user`/`passwd`
+  及 `adt_user`/`adt_passwd` 已移除，ADT 走 `[systems.x.adt]` 块（base_url / tls /
+  auth 覆盖，缺省继承系统 auth）。注意 TOML 表作用域：系统标量键必须写在
+  该系统的子表头**之前**。
 - **连接参数透传**：除固定快捷字段（ashost/sysnr/...）外，支持
   `[systems.x.conn]` 自由键值直接进 `RfcOpenConnection`——为 MSHOST/GROUP
   负载均衡等形态留后门，不用等网关逐个建模。

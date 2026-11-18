@@ -241,19 +241,25 @@ One gateway process can connect to **N SAP systems at once**. Define them in `sa
 ashost = "vhcala4h"
 sysnr  = "00"
 client = "001"
-user   = "developer"
-passwd = "${SAP_A4H_PASSWD}"     # ${VAR} env interpolation — secrets stay in .env, this file can be committed
 default = true                    # unprefixed paths route here (exactly one)
+
+[systems.a4h.auth.basic]
+user = "developer"
+passwd = "${SAP_A4H_PASSWD}"      # ${VAR} env interpolation — secrets stay in .env, this file can be committed
 
 [systems.prd]
 ashost = "sap-prd.example.com"
 sysnr  = "10"
 client = "100"
-user   = "rfc_gateway"
-passwd = "${SAP_PRD_PASSWD}"
 pool_size = 4                     # optional per-system overrides (fall back to the .env globals)
 read_only = true                  # e.g. keep production read-only while dev stays writable
+
+[systems.prd.auth.basic]
+user = "rfc_gateway"
+passwd = "${SAP_PRD_PASSWD}"
 ```
+
+Credentials live in per-system `[systems.{name}.auth.*]` blocks (`basic` / `sso2` / `plugin` / `oauth`, mutually exclusive, optional `snc` overlay) since v0.21 — the old flat `user`/`passwd` keys were removed. See `sap_systems.toml.example` and [AGENTS.md §13](./AGENTS.md) for the SSO/SNC/OAuth/plugin forms. Note the TOML table scoping: a system's scalar keys (`default`, `pool_size`, `read_only`…) must sit **before** its `auth`/`adt` subtable headers.
 
 **Relationship to `.env`** — three layers: built-in defaults ← `.env` (gateway-global switches: listen address, API key, rate limit, runtime mode…; plus global defaults for pool size / timeouts / read-only / ADT) ← per-system fields in the toml. Connection params are either/or: with the toml present it fully defines the system set; without it the `SAP_*` vars synthesize a single system named `default` (zero change for existing deployments).
 

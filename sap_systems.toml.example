@@ -34,19 +34,22 @@
 # 会被隔离（503 SYSTEM_SYSID_CONFLICT）；conn 里夹带鉴权键（USER/PASSWD/
 # MYSAPSSO2/SNC_*）会在装载期被拒——鉴权只认 auth 块。
 
+# ⚠️ TOML 表作用域：系统标量键（default / pool_size / read_only …）必须写在
+# 该系统自己的 [systems.x.auth.*] / [systems.x.adt] 子表头**之前**——
+# 表头之后的键属于子表，写错位置会被 deny_unknown_fields 拒收。
+
 # ── 形态一：经典账密（auth.basic）────────────────────────────────────
 [systems.a4h]
 ashost = "vhcala4h"
 sysnr = "00"
 client = "001"
 lang = "EN"              # 可选，默认 EN
+# 无前缀路径路由到此系统（多系统时必须恰好一个标记 default）
+default = true
 
 [systems.a4h.auth.basic]
 user = "developer"
 passwd = "${SAP_A4H_PASSWD}"
-
-# 无前缀路径路由到此系统（多系统时必须恰好一个标记 default）
-default = true
 
 # ── 形态二：SSO 登录票据（auth.sso2；票据自带身份，不需要账密）───────
 # [systems.sso]
@@ -75,15 +78,15 @@ ashost = "sap-prd.example.com"
 sysnr = "10"
 client = "100"
 
-[systems.prd.auth.basic]
-user = "rfc_gateway"
-passwd = "${SAP_PRD_PASSWD}"
-
 # ── 每系统可选覆盖（缺省用 .env 全局值）───────────────────────────────
 pool_size = 4                        # 连接池上限（默认 SAP_POOL_SIZE/8）
 idle_validate_secs = 30              # 空闲连接借出前 ping 校验阈值
 request_timeout_secs = 60            # 该系统单请求超时
 read_only = true                     # 该系统写端点 403（如生产系统只许读）
+
+[systems.prd.auth.basic]
+user = "rfc_gateway"
+passwd = "${SAP_PRD_PASSWD}"
 
 # ADT 通道块（可选）：base_url 缺省按 ashost:50000 推导（空串 = 禁用）、
 # auth 缺省继承 [systems.prd.auth]、tls 为 mTLS 素材
