@@ -35,7 +35,7 @@ quick-xml = "0.42"
 # 多系统作用域路由：/api/s/{system}/** 的 URI 改写服务（tower Service 手写实现）
 tower = { version = "0.5", features = ["util"] }
 # 包导出 zip 打包（GET /api/export/package/**；abapGit 兼容文件树）
-zip = { version = "2", default-features = false, features = ["deflate"] }
+zip = { version = "9", default-features = false, features = ["deflate"] }
 
 [profile.release]
 lto = true

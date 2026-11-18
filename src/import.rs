@@ -265,7 +265,7 @@ async fn import_package_handler(
             .or_else(|| to.rsplit_once('_').map(|(super_, _)| super_.to_string()));
         pkg_plan.push((to.clone(), from, p.ctext.clone(), parent_to));
     }
-    pkg_plan.sort_by(|a, b| a.0.matches('_').count().cmp(&b.0.matches('_').count()));
+    pkg_plan.sort_by_key(|a| a.0.matches('_').count());
     if !pkg_plan.iter().any(|(to, _, _, _)| to == &target) {
         pkg_plan.insert(
             0,
@@ -712,7 +712,11 @@ fn read_zip(bytes: &[u8]) -> Result<BTreeMap<String, String>, RfcError> {
         if f.is_dir() {
             continue;
         }
-        let name = f.name().trim_start_matches("./").to_string();
+        // zip 9：name() 返回 Result<Cow<str>>（RUSTSEC-2026-0548 修复——
+        // 本地头文件名可能与中央目录不一致），解码失败按坏 zip 拒收
+        let name = f.name().map(|n| n.trim_start_matches("./").to_string()).map_err(|e| {
+            import_err("IMPORT_ZIP_INVALID", &format!("zip 条目名解码失败: {}", e))
+        })?;
         let mut content = String::new();
         use std::io::Read as _;
         f.read_to_string(&mut content).map_err(|e| {
