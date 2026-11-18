@@ -94,7 +94,7 @@ jobs:
         include:
           # Unix 系：在 CI 上自动 build（用空 .so/.dylib 满足 build.rs 占位）
           - target: x86_64-unknown-linux-gnu
-            runner: ubuntu-latest
+            runner: ubuntu-24.04
             archive: tar.gz
             binary: sap_for_agents
             platform_dir: linux-x86_64
@@ -102,7 +102,7 @@ jobs:
             cc: cc
             cross_compile: false
           - target: aarch64-unknown-linux-gnu
-            runner: ubuntu-latest
+            runner: ubuntu-24.04
             archive: tar.gz
             binary: sap_for_agents
             platform_dir: linux-aarch64
@@ -144,9 +144,19 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
+      # 交叉 std 必须装进 cargo 实际解析的 toolchain：仓库有 rust-toolchain.toml
+      # 时 cargo 按它解析，而 action 的 targets 输入缺 toolchain 时落到 default
+      # toolchain——v0.21.0 tag 构建实证 linux-aarch64 / darwin-x86_64 E0463
+      # （can't find crate for core），本机目标因 std 自带不受影响。
+      # 从 rust-toolchain.toml 解析 channel 显式传入，两个来源强制一致。
+      - name: Resolve pinned toolchain
+        id: pin
+        run: echo "channel=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
+          toolchain: ${{ steps.pin.outputs.channel }}
           targets: ${{ matrix.target }}
 
       # Windows：激活 MSVC 开发环境，把 lib.exe / link.exe 加入 PATH。
