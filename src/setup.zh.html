@@ -516,9 +516,9 @@ curl -X PUT    http://127.0.0.1:3000/api/setup/default         -H "Content-Type:
             var j = res.json;
             S.editing_default = !!j.default;
             setVal('edit-ashost', j.ashost); setVal('edit-sysnr', j.sysnr); setVal('edit-client', j.client);
-            setVal('edit-user', j.user); setVal('edit-lang', j.lang);
+            setVal('edit-user', j.auth && j.auth.basic && j.auth.basic.user); setVal('edit-lang', j.lang);
             setVal('edit-pool_size', j.pool_size); setVal('edit-request_timeout_secs', j.request_timeout_secs);
-            setVal('edit-adt_base_url', j.adt_base_url); setVal('edit-adt_user', j.adt_user);
+            setVal('edit-adt_base_url', j.adt && j.adt.base_url); setVal('edit-adt_user', j.adt && j.adt.auth && j.adt.auth.basic && j.adt.auth.basic.user);
             setVal('edit-adt_passwd', j.adt_passwd);
             setVal('edit-conn', j.conn && Object.keys(j.conn).length ? JSON.stringify(j.conn) : '');
             $('edit-default').checked = S.editing_default;

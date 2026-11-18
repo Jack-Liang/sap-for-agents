@@ -1,7 +1,7 @@
 # 多系统配置（可选）：一个网关同时连接 N 个 SAP 系统。
 #
 # 用法：复制为 sap_systems.toml（或用 SAP_SYSTEMS_FILE 指定路径）后启动。
-# 详见 README §配置 与 docs/MULTI_SYSTEM.zh-CN.md。
+# 详见 AGENTS.md §13（登录方式）与 docs/MULTI_SYSTEM.zh-CN.md。
 #
 # 不想手工写文件？无配置启动的网关支持引导式配置（v0.17）：
 #   GET  /api/setup          查看状态与「该问用户哪些字段」清单
@@ -12,42 +12,70 @@
 #
 # - 只在 .env：监听地址、API key、限流、runtime 档位、更新检查、registry 路径
 # - .env 给全局默认、本文件按系统覆盖：pool_size / idle_validate_secs /
-#   request_timeout_secs / read_only / ADT 地址与账号
+#   request_timeout_secs / read_only / ADT 通道（[systems.x.adt] 块）
 # - 二选一：连接参数——本文件存在则系统集合完全由本文件定义（.env 的
 #   SAP_ASHOST 一族被忽略，启动日志有提示）；不存在则从 .env 合成单系统
+#   （.env 形态没有 auth 块概念，凭据即 SAP_USER/SAP_PASSWD）
+#
+# ── 鉴权（auth 块，v0.21 起必填）──────────────────────────────────────
+# 主通道互斥四选一 + 可选 snc 叠加；密码/票据支持 ${VAR} 插值（推荐——
+# 明文凭据 + world-readable 文件会在启动日志告警）。
 #
 # ── 作用域 URL ────────────────────────────────────────────────────────
 #   无前缀路径            = default = true 的系统（存量消费方零改动）
 #   /api/s/{系统名}/...   = 指定系统（如 /api/s/prd/rfc、/api/s/prd/functions/ZFOO）
-#   /api/s/{系统名}/ready = 该系统 readiness
-#   GET /api/systems      = 系统清单（Agent 会话第一步）
+#   GET /api/systems      = 系统清单（含每系统 auth 形态自描述）
 #
 # ── client 说明 ────────────────────────────────────────────────────────
-# 同一系统不同 client = 多条目（同 ashost/sysnr、不同 client），完全支持：
-# SAP 仓库对象跨 client、签名必然一致，各条目仍有独立池/ADT/注册表命名空间。
-
+# 同一系统不同 client = 多条目（同 ashost/sysnr、不同 client），完全支持。
+#
 # ── 硬性限制 ──────────────────────────────────────────────────────────
-# 不同后端不得共用同一 SYSID（SDK 描述符缓存按 SYSID 分区，跨后端同 SYSID
-# 会静默共享错误签名）。克隆的开发容器经不同主机访问时常同 SID——冲突系统
-# 会被隔离（503 SYSTEM_SYSID_CONFLICT），改 SID 或只连其一；同后端条目豁免。
+# 不同后端不得共用同一 SYSID（SDK 描述符缓存按 SYSID 分区）。冲突系统
+# 会被隔离（503 SYSTEM_SYSID_CONFLICT）；conn 里夹带鉴权键（USER/PASSWD/
+# MYSAPSSO2/SNC_*）会在装载期被拒——鉴权只认 auth 块。
 
+# ── 形态一：经典账密（auth.basic）────────────────────────────────────
 [systems.a4h]
-# 连接参数（快捷字段；或用下方 [systems.a4h.conn] 透传任意 SDK 参数）
 ashost = "vhcala4h"
 sysnr = "00"
 client = "001"
-user = "developer"
-# 密码支持 ${VAR} 环境变量插值——密钥放 .env/环境变量，本文件可入库
-passwd = "${SAP_A4H_PASSWD}"
 lang = "EN"              # 可选，默认 EN
+
+[systems.a4h.auth.basic]
+user = "developer"
+passwd = "${SAP_A4H_PASSWD}"
 
 # 无前缀路径路由到此系统（多系统时必须恰好一个标记 default）
 default = true
 
+# ── 形态二：SSO 登录票据（auth.sso2；票据自带身份，不需要账密）───────
+# [systems.sso]
+# ashost = "sap-sso.example.com"
+# sysnr = "00"
+# client = "100"
+# [systems.sso.auth.sso2]
+# ticket = "${SAP_SSO2_TICKET}"
+
+# ── 形态三：SNC / Kerberos（auth.basic/sso2 + auth.snc 叠加层）────────
+# [systems.snc]
+# ashost = "sap-kerb.example.com"
+# sysnr = "00"
+# client = "100"
+# [systems.snc.auth.basic]
+# user = "rfc_gateway"
+# passwd = "${SAP_SNC_PASSWD}"
+# [systems.snc.auth.snc]
+# qop = "8"                            # 质量等级
+# partnername = "p:CN=A4H"             # 后端 SNC 名称
+# lib = "gsskrb5"                      # 库（snc_myname 可选）
+
+# ── 生产系统（只读 + 独立池 + ADT 覆盖）───────────────────────────────
 [systems.prd]
 ashost = "sap-prd.example.com"
 sysnr = "10"
 client = "100"
+
+[systems.prd.auth.basic]
 user = "rfc_gateway"
 passwd = "${SAP_PRD_PASSWD}"
 
@@ -56,16 +84,49 @@ pool_size = 4                        # 连接池上限（默认 SAP_POOL_SIZE/8�
 idle_validate_secs = 30              # 空闲连接借出前 ping 校验阈值
 request_timeout_secs = 60            # 该系统单请求超时
 read_only = true                     # 该系统写端点 403（如生产系统只许读）
-# adt_base_url = "https://host:44300" # 缺省按本系统 ashost:50000 推导；空串 = 禁用
-# adt_user = "otheruser"              # 缺省同本系统 user
-# adt_passwd = "${SAP_PRD_ADT_PASSWD}"
+
+# ADT 通道块（可选）：base_url 缺省按 ashost:50000 推导（空串 = 禁用）、
+# auth 缺省继承 [systems.prd.auth]、tls 为 mTLS 素材
+# [systems.prd.adt]
+# base_url = "https://host:44300"
+#
+# [systems.prd.adt.tls]
+# cert = "/etc/sap/client.pem"        # key 缺省 = cert 单文件含私钥；ca 可选
+#
+# # auth 覆盖示例（如生产 ADT 走独立账号）：
+# [systems.prd.adt.auth.basic]
+# user = "adt_account"
+# passwd = "${SAP_PRD_ADT_PASSWD}"
+
+# ── 形态四：OAuth2（BTP / ABAP Cloud 的 ADT 通道专用）─────────────────
+# RFC 在 BTP 不可用——OAuth 系统只服务 /api/adt/**（/api/rfc 会 503）。
+# [systems.btp]
+# ashost = "…acme.abap.eu10.hana.ondemand.com"   # 仅用于推导 ADT 端口
+# sysnr = "00"
+# client = "000"                                 # BTP 无 client 概念，占位
+# [systems.btp.adt]
+# base_url = "https://…acme.abap.eu10.hana.ondemand.com:443"
+# [systems.btp.adt.auth.oauth]
+# token_url = "https://acme.authentication.eu10.hana.ondemand.com/oauth/token"
+# client_id = "sb-…"
+# client_secret = "${SAP_BTP_SECRET}"
 
 # ── conn 透传表（可选）：任意 RfcOpenConnection 参数 ──────────────────
-# 负载均衡/消息服务器形态（与 ashost 二选一）：
+# 负载均衡/消息服务器形态（与 ashost 二选一）。鉴权键（USER/PASSWD/
+# MYSAPSSO2/SNC_*）不收——请放 auth 块：
 # [systems.lb]
+# [systems.lb.auth.basic]
 # user = "u"
 # passwd = "${SAP_LB_PASSWD}"
 # [systems.lb.conn]
 # MSHOST = "msg.example.com"
 # GROUP = "SPACE"
 # R3NAME = "PRD"
+
+# ── 外部鉴权插件（ADT 通道逃生舱）─────────────────────────────────────
+# [systems.plg]
+# ashost = "…"; sysnr = "00"; client = "001"
+# [systems.plg.adt.auth.plugin]
+# command = "/usr/local/bin/sap-auth-helper"   # 必须绝对路径
+# params = { tenant = "a4h" }                  # 原样进 stdin JSON
+# cache_secs = 300                             # 响应缓存（响应内 cache_secs 可覆盖）

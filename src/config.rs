@@ -299,43 +299,74 @@ pub fn load() -> Result<AppConfig, String> {
 }
 
 /// 启动期配置卫生（sapcli `_check_file_permissions` 同款借鉴）：
-/// 系统配置文件若 world-readable 且含**明文**密码/票据（非 `${VAR}` 引用形态），
-/// 打 WARN 提示收紧权限。只警告不拒绝——部署形态千差万别，网关无权改盘上权限。
+/// 配置文件若 world-readable 且含**明文凭据**（值非 `${VAR}` 引用形态），
+/// 打 WARN 提示收紧。只警告不拒绝——部署形态千差万别，网关无权改盘上权限。
+///
+/// 凭据键：系统文件 auth 块的 passwd/ticket/client_secret（含 adt.auth）；
+/// 网关文件的 api_key。toml 结构化遍历（auth 嵌套后行启发式不可靠）。
 fn warn_world_readable_secrets(cfg: &AppConfig) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let check = |path: &std::path::Path, label: &str, needle: &[&str]| {
+        const SECRET_KEYS: [&str; 4] = ["passwd", "ticket", "client_secret", "api_key"];
+
+        // 递归走 toml 表：键 ∈ SECRET_KEYS 且值为非 ${VAR} 字符串 → 明文凭据
+        fn walk(value: &toml::Value, path: String, hits: &mut Vec<String>) {
+            match value {
+                toml::Value::Table(t) => {
+                    for (k, v) in t {
+                        let p = format!("{path}.{k}");
+                        match v {
+                            toml::Value::String(sv)
+                                if SECRET_KEYS.contains(&k.as_str())
+                                    && !sv.starts_with("${") =>
+                            {
+                                hits.push(p)
+                            }
+                            _ => walk(v, p, hits),
+                        }
+                    }
+                }
+                toml::Value::Array(arr) => {
+                    for (i, v) in arr.iter().enumerate() {
+                        walk(v, format!("{path}[{i}]"), hits);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let check = |path: &std::path::Path, label: &str, gateway: bool| {
             let Ok(meta) = std::fs::metadata(path) else {
                 return;
             };
             if meta.permissions().mode() & 0o004 == 0 {
                 return; // 其他人不可读，干净
             }
-            let Ok(content) = std::fs::read_to_string(path) else {
-                return;
-            };
-            let plain = needle.iter().any(|kw| {
-                // 找 `passwd = "…"` 且值不以 ${ 开头（引用形态安全）
-                content.lines().any(|l| {
-                    let l = l.trim();
-                    l.starts_with(kw) && l.contains('"') && !l.contains("${")
-                })
-            });
-            if plain {
+            let mut hits = Vec::new();
+            if gateway {
+                // sap_gateway.toml 是平表：api_key 单键（toml 解析同样适用）
+                if let Ok(content) = std::fs::read_to_string(path) {
+                    if let Ok(v) = content.parse::<toml::Value>() {
+                        walk(&v, label.to_string(), &mut hits);
+                    }
+                }
+            } else if let Ok(content) = std::fs::read_to_string(path) {
+                if let Ok(v) = content.parse::<toml::Value>() {
+                    walk(&v, label.to_string(), &mut hits);
+                }
+            }
+            if !hits.is_empty() {
                 tracing::warn!(
                     file = %path.display(),
-                    "{label} 为 world-readable 且含明文凭据——建议 chmod 600 {0} 或改用 ${{VAR}} 引用形态",
+                    keys = ?hits,
+                    "{label} 为 world-readable 且含明文凭据——建议 chmod 600 {} 或改用 ${{VAR}} 引用形态",
                     path.display()
                 );
             }
         };
-        check(
-            &cfg.systems_file,
-            "sap_systems.toml",
-            &["passwd", "mysapsso2", "snc_lib"],
-        );
-        check(&cfg.gateway_file, "sap_gateway.toml", &["api_key"]);
+        check(&cfg.systems_file, "sap_systems.toml", false);
+        check(&cfg.gateway_file, "sap_gateway.toml", true);
     }
     #[cfg(not(unix))]
     {

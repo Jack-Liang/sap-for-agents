@@ -111,7 +111,7 @@ fn start_server_with_env(extra: &[(&str, &str)]) -> ServerHandle {
         std::fs::write(
             &systems_path,
             format!(
-                "[systems.a4h]\nashost = \"{}\"\nsysnr = \"{}\"\nclient = \"{}\"\nuser = \"{}\"\npasswd = \"${{SAP_PASSWD}}\"\ndefault = true\n",
+                "[systems.a4h]\nashost = \"{}\"\nsysnr = \"{}\"\nclient = \"{}\"\ndefault = true\n\n[systems.a4h.auth.basic]\nuser = \"{}\"\npasswd = \"${{SAP_PASSWD}}\"\n",
                 ashost, sysnr, client, user
             ),
         )

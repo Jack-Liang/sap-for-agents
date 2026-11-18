@@ -271,7 +271,7 @@ Please guide me through first-time setup:
 1. GET {{ORIGIN}}/api/setup — read the setup status and the checklist of fields you need to ask me for;
 2. Interview me for the SAP connection details: application server host (ashost), system number (sysnr), client, user, password, plus a short lowercase system name (e.g. a4h);
 3. For the password, suggest I provide a ${ENV_VAR} indirection (e.g. ${SAP_A4H_PASSWD}) so the plaintext never appears in this chat — the gateway interpolates it from its environment at connect time;
-4. POST the collected info to {{ORIGIN}}/api/setup/system (JSON fields: name/ashost/sysnr/client/user/passwd). The gateway opens a real test connection first and persists nothing on failure — if it fails, tell me why and we'll correct and retry;
+4. POST the collected info to {{ORIGIN}}/api/setup/system (JSON: name/ashost/sysnr/client + auth.basic={user,passwd}). The gateway opens a real test connection first and persists nothing on failure — if it fails, tell me why and we'll correct and retry;
 5. On success, GET {{ORIGIN}}/api/systems to confirm the system is live, then tell me the gateway is ready to use.
 
 FYI: your full working documentation is at {{ORIGIN}}/agents.md (read it if you need more endpoint capabilities).</script>
@@ -515,19 +515,30 @@ FYI: your full working documentation is at {{ORIGIN}}/agents.md (read it if you 
     $('add-cancel').addEventListener('click', function () { $('add-card').classList.add('hidden'); });
     $('add-save').addEventListener('click', function () {
         var body = {};
-        var need = { name: 'add-name', ashost: 'add-ashost', sysnr: 'add-sysnr', user: 'add-user', passwd: 'add-passwd' };
+        var need = { name: 'add-name', ashost: 'add-ashost', sysnr: 'add-sysnr' };
         for (var k in need) { var v = val(need[k]); if (v) body[k] = v; }
-        ['client', 'lang', 'pool_size', 'request_timeout_secs', 'adt_base_url', 'adt_user', 'adt_passwd'].forEach(function (k) {
+        ['client', 'lang', 'pool_size', 'request_timeout_secs'].forEach(function (k) {
             var v = val('add-' + k);
             if (v === null) return;
             body[k] = (k === 'pool_size' || k === 'request_timeout_secs') ? Number(v) : v;
         });
+        // auth.basic（账密；sso2/snc/oauth 走 API 或手工 toml）
+        var au = val('add-user'), ap = val('add-passwd');
+        if (au || ap) body.auth = { basic: { user: au, passwd: ap } };
+        // adt 块（base_url / ADT 账号覆盖）
+        var abu = val('add-adt_base_url'), adu = val('add-adt_user'), adp = val('add-adt_passwd');
+        if (abu || adu || adp) {
+            body.adt = {};
+            if (abu) body.adt.base_url = abu;
+            if (adu || adp) body.adt.auth = { basic: { user: adu, passwd: adp } };
+        }
         if (bool('add-default')) body.default = true;
         if (bool('add-read_only')) body.read_only = true;
         if (bool('add-skip-test')) body.test = false;
         var cj = val('add-conn');
         if (cj) { try { body.conn = JSON.parse(cj); } catch (e) { $('add-msg').textContent = 'conn must be a JSON object'; return; } }
         if (!body.name || (!body.ashost && !body.conn)) { $('add-msg').textContent = 'name and (ashost+sysnr or conn) are required'; return; }
+        if (!body.auth) { $('add-msg').textContent = 'auth is required (user + password)'; return; }
         $('add-msg').textContent = 'Testing connection…';
         api('POST', '/api/setup/system', body).then(function (res) {
             if (res.ok) {
@@ -556,9 +567,9 @@ FYI: your full working documentation is at {{ORIGIN}}/agents.md (read it if you 
             var j = res.json;
             S.editing_default = !!j.default;
             setVal('edit-ashost', j.ashost); setVal('edit-sysnr', j.sysnr); setVal('edit-client', j.client);
-            setVal('edit-user', j.user); setVal('edit-lang', j.lang);
+            setVal('edit-user', j.auth && j.auth.basic && j.auth.basic.user); setVal('edit-lang', j.lang);
             setVal('edit-pool_size', j.pool_size); setVal('edit-request_timeout_secs', j.request_timeout_secs);
-            setVal('edit-adt_base_url', j.adt_base_url); setVal('edit-adt_user', j.adt_user);
+            setVal('edit-adt_base_url', j.adt && j.adt.base_url); setVal('edit-adt_user', j.adt && j.adt.auth && j.adt.auth.basic && j.adt.auth.basic.user);
             setVal('edit-adt_passwd', j.adt_passwd);
             setVal('edit-conn', j.conn && Object.keys(j.conn).length ? JSON.stringify(j.conn) : '');
             $('edit-default').checked = S.editing_default;
@@ -570,8 +581,9 @@ FYI: your full working documentation is at {{ORIGIN}}/agents.md (read it if you 
             } else {
                 note.classList.add('hidden');
             }
-            if (j.passwd && j.passwd.ref) $('edit-passwd').placeholder = j.passwd.ref + ' (blank = keep)';
-            else if (j.passwd && j.passwd.set) $('edit-passwd').placeholder = 'blank = keep current password';
+            var pw = j.auth && j.auth.basic && j.auth.basic.passwd;
+            if (pw && pw.ref) $('edit-passwd').placeholder = pw.ref + ' (blank = keep)';
+            else if (pw && pw.set) $('edit-passwd').placeholder = 'blank = keep current password';
         });
     }
     function closeEdit() { $('edit-modal').classList.add('hidden'); S.editing = null; }
@@ -580,9 +592,18 @@ FYI: your full working documentation is at {{ORIGIN}}/agents.md (read it if you 
     $('edit-save').addEventListener('click', function () {
         if (!S.editing) return;
         var body = {};
-        ['ashost','sysnr','client','user','passwd','lang','adt_base_url','adt_user','adt_passwd'].forEach(function (k) {
+        ['ashost','sysnr','client','lang'].forEach(function (k) {
             var v = val('edit-' + k); if (v !== null) body[k] = v;
         });
+        // auth.basic：user/passwd 有任一填写才发（块级替换——两栏都发完整对）
+        var eu = val('edit-user'), ep = val('edit-passwd');
+        if (eu || ep) body.auth = { basic: { user: eu, passwd: ep } };
+        var abu = val('edit-adt_base_url'), adu = val('edit-adt_user'), adp = val('edit-adt_passwd');
+        if (abu || adu || adp) {
+            body.adt = {};
+            if (abu) body.adt.base_url = abu;
+            if (adu || adp) body.adt.auth = { basic: { user: adu, passwd: adp } };
+        }
         ['pool_size','request_timeout_secs'].forEach(function (k) {
             var v = numOrNull('edit-' + k); if (v !== null) body[k] = v;
         });

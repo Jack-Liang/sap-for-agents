@@ -76,7 +76,7 @@ curl -H "Authorization: Bearer <SAP_API_KEY>" http://127.0.0.1:3000/api/function
 | Create / read / release / delete CTS transport requests | `POST`·`GET` `/api/cts/requests…` |
 | Search ALL object types by name (ADT quick search) | `GET /api/objects/search?q=` |
 | OpenSQL SELECT via ADT data preview (pooled tables, joins) | `POST /api/table/osql` |
-| Per-system login: SSO2 ticket / SNC / ADT mTLS+OAuth2 / auth plugin | see §13 in `sap_systems.toml` (`mysapsso2`, `snc_*`, `adt_*`) |
+| Per-system login: SSO2 / SNC / ADT mTLS+OAuth2 / auth plugin | `auth.*` / `adt.*` blocks in `sap_systems.toml` (see §13) |
 | Human-friendly interactive API docs | `GET /docs` (Redoc rendering of the spec) |
 
 ## First-run setup (agent-guided configuration)
@@ -678,43 +678,68 @@ Implementation notes worth knowing:
 
 ### 13. SAP-side login methods (v0.21)
 
-Classic user+password stays the default. Three more doors, all configured per system in `sap_systems.toml` (or via `POST /api/setup/system`) — mixed forms validate at load: an SSO2 ticket or SNC set makes `user`/`passwd` optional.
+Auth lives in a per-system **`auth` block** — primary channel mutually exclusive (basic / sso2 / plugin / oauth, "exactly one" enforced at load), plus an optional `snc` overlay. Passwords/tickets support `${VAR}` interpolation; the same block shape drives both the RFC connection and (via inheritance) the ADT channel.
 
 ```toml
-# RFC side: SSO logon ticket (ticket carries the identity; supports ${VAR})
-[systems.sso]
-ashost="…"; sysnr="00"; client="001"
-mysapsso2 = "${SAP_SSO2_TICKET}"
+[systems.prd]
+ashost = "…"
+sysnr = "00"
+client = "001"
 
-# RFC side: SNC / Kerberos (Secure Login Client) — passwd optional
-[systems.snc]
-ashost="…"; sysnr="00"; client="001"
-snc_qop = "8"
-snc_partnername = "p:CN=A4H"
-snc_lib = "/usr/sap/lib/gsskrb5.so"   # snc_myname optional
+# Primary channel — pick exactly one:
+[systems.prd.auth.basic]
+user = "DEVELOPER"
+passwd = "${SAP_PASSWD}"
 
-# ADT side: modern auth (ladder: plugin > OAuth > SSO2 > Basic; TLS material is orthogonal)
-adt_cert = "/etc/sap/client.pem"      # mTLS identity (adt_key optional = combined PEM;
-                                      # encrypted private keys are rejected with a fix hint)
-adt_ca   = "/etc/sap/ca.pem"          # custom CA bundle for https endpoints
-adt_sso2 = "${SAP_SSO2_TICKET}"       # ADT channel via Cookie MYSAPSSO2 (defaults to mysapsso2)
-adt_oauth_token_url   = "https://…/oauth/token"   # BTP/ABAP Cloud ADT only accepts OAuth2;
-adt_oauth_client_id   = "sb-…"                    # password grant + in-memory token cache +
-adt_oauth_client_secret = "${SAP_BTP_SECRET}"     # refresh-token reuse; 401 → re-grant once
-adt_auth_plugin_command = "/usr/local/bin/sap-auth-helper"  # escape hatch: subprocess gets
-adt_auth_plugin_params  = { tenant = "a4h" }               # JSON on stdin, returns cookies or
-adt_auth_plugin_cache_secs = 300                           # headers on stdout (types: cookie |
-                                                           # http_authorization_header; the
-                                                           # certificates form is not supported —
-                                                           # use adt_cert/adt_key). Plugin command
-                                                           # must be an absolute path; 401 invalidates
-                                                           # the cache and re-runs the plugin once.
+# [systems.prd.auth.sso2]
+# ticket = "${SAP_SSO2_TICKET}"          # SAP Logon Ticket (identity in the ticket)
+
+# [systems.prd.auth.plugin]              # external plugin (ADT channel only)
+# command = "/usr/local/bin/sap-auth-helper"   # absolute path, enforced
+# params = { tenant = "a4h" }
+# cache_secs = 300
+
+# [systems.prd.auth.oauth]               # BTP/ABAP Cloud — system-level use is
+# token_url = "https://…/oauth/token"    # rejected; put it under adt.auth (below)
+# client_id = "sb-…"
+# client_secret = "${SAP_BTP_SECRET}"
+
+# Optional SNC overlay (combines with any primary):
+[systems.prd.auth.snc]
+qop = "8"
+partnername = "p:CN=A4H"
+lib = "gsskrb5"          # myname optional
 ```
 
-- `GET /api/systems` now reports each system's `auth`: `basic` | `sso2` | `snc` | `sso2+snc`.
-- SSO2/SNC are RFC-side passthroughs (verified the parameters reach `RfcOpenConnection` + the Basic path still works; end-to-end SSO needs a real ticket/SNC infrastructure the trial system doesn't issue).
-- OAuth opens BTP/ABAP Cloud as a target (Basic is rejected there). On failure the gateway answers `401 ADT_OAUTH_FAILED` with the IdP's message.
-- Startup hygiene: `sap_systems.toml` world-readable **with plaintext credentials** (non-`${VAR}` values) logs a WARN suggesting `chmod 600` / `${VAR}` form. Files written by the gateway are always 0600.
+The ADT channel has its own **`adt` block** — `base_url` (default `http://<ashost>:50000`, `""` = disabled), `tls` (mTLS: `cert`/`key`/`ca`; encrypted private keys rejected with a fix hint), and `auth` **override** (absent = inherit the system auth; present = replace whole):
+
+```toml
+[systems.prd.adt]
+base_url = "https://host:44300"
+
+[systems.prd.adt.tls]
+cert = "/etc/sap/client.pem"    # key optional (combined PEM); ca optional
+
+# Override example — production ADT on a separate account:
+[systems.prd.adt.auth.basic]
+user = "adt_account"
+passwd = "${SAP_PRD_ADT_PASSWD}"
+
+# BTP/ABAP Cloud (Basic is rejected there; RFC does not exist on BTP —
+# an oauth system serves /api/adt/** only):
+[systems.btp.adt.auth.oauth]
+token_url = "https://acme.authentication.eu10.hana.ondemand.com/oauth/token"
+client_id = "sb-…"
+client_secret = "${SAP_BTP_SECRET}"
+```
+
+Notes:
+- `GET /api/systems` reports each system's `auth`: `basic` | `sso2` | `plugin` | `oauth` (+`+snc`).
+- `conn` passthrough **rejects auth keys** (`USER`/`PASSWD`/`MYSAPSSO2`/`SNC_*`) at load — auth only comes from the auth block (no dual representation).
+- OAuth token cache + refresh-token reuse is in-memory; 401 → one forced re-grant. Plugin responses cache for `cache_secs`; 401 → invalidate and re-run once.
+- The `.env` single-system path is unchanged (`SAP_USER`/`SAP_PASSWD` map to basic; `SAP_ADT_USER`/`SAP_ADT_PASSWD` override only when different).
+- Startup hygiene: world-readable config with plaintext credentials (non-`${VAR}` values under auth) logs a WARN suggesting `chmod 600` / `${VAR}` form.
+- ⚠️ **Config breaking change (v0.21)**: flat `user`/`passwd`/`mysapsso2`/`snc_*`/`adt_user`/`adt_passwd`/`adt_cert`… fields are gone — migrate to `auth.*` / `adt.*` blocks (structure above).
 
 ## Key constraints (pitfalls to avoid)
 

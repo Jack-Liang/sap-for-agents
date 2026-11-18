@@ -225,16 +225,17 @@ pub async fn status_handler(
         "connection_forms": {
             "direct": "ashost + sysnr（+ client）——直连单个应用服务器",
             "load_balanced": "conn.MSHOST（+ conn.R3NAME / conn.GROUP）——消息服务器负载均衡，此形态不需要 ashost/sysnr",
-            "sso2_ticket": "mysapsso2（+ ashost/sysnr/client）——SAP 登录票据建连，不需要 user/passwd",
-            "snc": "snc_qop + snc_partnername（+ snc_lib/snc_myname）——Kerberos/Secure Login Client SSO，不需要 user/passwd",
+            "auth_basic": "auth.basic={user,passwd}——经典账密",
+            "auth_sso2": "auth.sso2={ticket}——SAP 登录票据，不需要账密",
+            "auth_snc": "auth.basic/sso2 + auth.snc={qop,partnername,lib?,myname?}——Kerberos/Secure Login Client",
+            "auth_oauth_adt": "adt.auth.oauth={token_url,client_id,client_secret}——BTP/ABAP Cloud 的 ADT 通道",
         },
         "example": {
             "name": "a4h",
             "ashost": "vhcala4h",
             "sysnr": "00",
             "client": "001",
-            "user": "DEVELOPER",
-            "passwd": "${SAP_A4H_PASSWD}",
+            "auth": {"basic": {"user": "DEVELOPER", "passwd": "${SAP_A4H_PASSWD}"}},
             "lang": "EN",
             "default": true,
         },
@@ -258,23 +259,12 @@ fn field_schema() -> serde_json::Value {
          "description": "系统号（两位数字，SAP 管理员提供，常为 00）", "example": "00"},
         {"name": "client", "required": false,
          "description": "登录客户端号（三位数字，如开发 001 / 生产 100）", "example": "001"},
-        {"name": "user", "required": "classic 模式必填（MYSAPSSO2 或 SNC 登录可省）",
-         "description": "SAP 登录账号（建议专用通信账号，非个人账号）", "example": "DEVELOPER"},
-        {"name": "passwd", "required": "classic 模式必填（MYSAPSSO2 或 SNC 登录可省）",
-         "description": "SAP 登录密码；支持 ${VAR} 环境变量引用（推荐，避免明文落盘/入对话）",
-         "example": "${SAP_A4H_PASSWD}"},
-        {"name": "mysapsso2", "required": false,
-         "description": "SAP 登录票据（SAP Logon Ticket）：给出时替代 user/passwd 建连；支持 ${VAR} 引用",
-         "example": "${SAP_A4H_SSO2}"},
-        {"name": "snc_qop", "required": false,
-         "description": "SNC 登录四件套之一（质量等级，如 8/9）——四件套任一给出时 passwd 可省（Kerberos/Secure Login Client）",
-         "example": "8"},
-        {"name": "snc_partnername", "required": false,
-         "description": "SNC 登录四件套之一：后端 SNC 名称（p:CN=A4H，…）", "example": "p:CN=A4H"},
-        {"name": "snc_myname", "required": false,
-         "description": "SNC 登录四件套之一：网关侧 SNC 名称（缺省用默认凭据）", "example": "p:CN=gateway"},
-        {"name": "snc_lib", "required": false,
-         "description": "SNC 登录四件套之一：gsskrb5/gysskrb5 库路径", "example": "/usr/sap/lib/gsskrb5.so"},
+        {"name": "auth", "required": true,
+         "description": "鉴权块（主通道互斥四选一 + 可选 snc 叠加）：auth.basic={user,passwd} 经典账密 | auth.sso2={ticket} 登录票据 | \
+auth.oauth={token_url,client_id,client_secret}（仅 ADT 通道） | \
+auth.plugin={command,params?,cache_secs?} 外部插件；auth.snc={qop?,myname?,partnername?,lib?} 叠加。\n密码/票据一律支持 ${VAR} 引用（推荐）",
+         "example": {"basic": {"user": "DEVELOPER", "passwd": "${SAP_A4H_PASSWD}"}},
+         "variants": ["basic", "sso2", "oauth(adt-only)", "plugin(adt-only)", "snc(overlay)"]},
         {"name": "lang", "required": false,
          "description": "登录语言（默认 EN）", "example": "EN"},
         {"name": "default", "required": false,
@@ -283,31 +273,14 @@ fn field_schema() -> serde_json::Value {
         {"name": "conn", "required": false,
          "description": "自由连接参数表（键大写化直通 SDK）：负载均衡形态在此给 MSHOST/R3NAME/GROUP",
          "example": {"MSHOST": "msg.example.com", "GROUP": "SPACE"}},
-        {"name": "adt_cert", "required": false,
-         "description": "ADT 通道 TLS 客户端证书 PEM 路径（mTLS，https）；单独文件或与 adt_key 合并单文件",
-         "example": "/etc/sap/client.pem"},
-        {"name": "adt_key", "required": false,
-         "description": "ADT 通道 TLS 私钥 PEM 路径（缺省 = cert 单文件内含私钥）；加密私钥会被拒收",
-         "example": "/etc/sap/client.key"},
-        {"name": "adt_ca", "required": false,
-         "description": "ADT 通道自定义 CA bundle 路径（私有 CA 的 https 端点）", "example": "/etc/sap/ca.pem"},
-        {"name": "adt_sso2", "required": false,
-         "description": "ADT 通道 SAP 登录票据（Cookie MYSAPSSO2）；缺省复用系统级 mysapsso2",
-         "example": "${SAP_A4H_SSO2}"},
-        {"name": "adt_oauth_token_url", "required": false,
-         "description": "ADT OAuth2 token 端点（BTP/ABAP Cloud ADT 只认 OAuth；三件套须同时给出）",
-         "example": "https://abc.authentication.eu10.hana.ondemand.com/oauth/token"},
-        {"name": "adt_oauth_client_id", "required": false,
-         "description": "ADT OAuth2 client id", "example": "sb-..."},
-        {"name": "adt_oauth_client_secret", "required": false,
-         "description": "ADT OAuth2 client secret；支持 ${VAR} 引用", "example": "${SAP_BTP_SECRET}"},
-        {"name": "adt_auth_plugin_command", "required": false,
-         "description": "外部鉴权插件：绝对路径可执行文件。stdin 收 JSON(connection+parameters)，stdout 回 {message,content:{type:cookie|http_authorization_header,...}}；401 时失效重跑",
-         "example": "/usr/local/bin/sap-auth-helper"},
-        {"name": "adt_auth_plugin_params", "required": false,
-         "description": "插件透传参数（原样进 stdin JSON 的 parameters）", "example": {"tenant": "a4h"}},
-        {"name": "adt_auth_plugin_cache_secs", "required": false,
-         "description": "插件响应缓存秒数（默认 300；响应里的 cache_secs 可覆盖）", "example": 300},
+        {"name": "adt", "required": false,
+         "description": "ADT 通道块: base_url 缺省按 ashost:50000 推导(空串=禁用), auth 缺省继承系统级 auth(可覆盖为 basic/sso2/oauth/plugin), tls={cert,key?,ca?} mTLS 素材",
+         "example": {"base_url": "https://sap.example.com:44300",
+                     "auth": {"oauth": {"token_url": "https://…/oauth/token",
+                                        "client_id": "sb-…",
+                                        "client_secret": "${SAP_BTP_SECRET}"}},
+                     "tls": {"cert": "/etc/sap/client.pem"}},
+         "notes": "adt.tls.key 缺省 = cert 单文件含私钥；加密私钥拒收；oauth 即 BTP/ABAP Cloud"},
         {"name": "read_only", "required": false,
          "description": "该系统只读（写端点 403），默认跟随全局 SAP_READ_ONLY", "example": false},
         {"name": "test", "required": false,
@@ -329,16 +302,11 @@ pub struct SetupSystemRequest {
     ashost: Option<String>,
     sysnr: Option<String>,
     client: Option<String>,
-    user: Option<String>,
-    passwd: Option<String>,
     lang: Option<String>,
-    /// SAP 登录票据（给出时替代 user/passwd 建连；支持 ${VAR}）
-    mysapsso2: Option<String>,
-    /// SNC 四件套（Kerberos/Secure Login Client；给出时 passwd 可省）
-    snc_qop: Option<String>,
-    snc_myname: Option<String>,
-    snc_partnername: Option<String>,
-    snc_lib: Option<String>,
+    /// 鉴权块（basic/sso2/plugin 主通道 + 可选 snc；结构同 toml 的 auth 表）
+    auth: Option<crate::systems::AuthRaw>,
+    /// ADT 通道块（base_url / tls / auth 覆盖）
+    adt: Option<crate::systems::AdtRaw>,
     /// 是否设为默认系统（首个系统无视此值、必然默认）
     default: Option<bool>,
     /// 写入前是否真实试连（默认 true）
@@ -346,27 +314,6 @@ pub struct SetupSystemRequest {
     pool_size: Option<usize>,
     idle_validate_secs: Option<u64>,
     request_timeout_secs: Option<u64>,
-    adt_base_url: Option<String>,
-    adt_user: Option<String>,
-    adt_passwd: Option<String>,
-    /// TLS 客户端证书 PEM 路径（mTLS）；adt_key 缺省 = cert 单文件含私钥
-    adt_cert: Option<String>,
-    adt_key: Option<String>,
-    /// 自定义 CA bundle 路径（私有 CA 的 https 端点）
-    adt_ca: Option<String>,
-    /// SAP 登录票据（ADT 通道；缺省复用系统级 mysapsso2）
-    adt_sso2: Option<String>,
-    /// OAuth2 密码授权三件套（BTP ADT）；三件须同时给出
-    adt_oauth_token_url: Option<String>,
-    adt_oauth_client_id: Option<String>,
-    adt_oauth_client_secret: Option<String>,
-    /// 外部鉴权插件命令（绝对路径）；给出即启用插件鉴权
-    adt_auth_plugin_command: Option<String>,
-    /// 插件透传参数（原样进插件 stdin JSON 的 parameters）
-    #[serde(default)]
-    adt_auth_plugin_params: BTreeMap<String, String>,
-    /// 插件响应缓存秒数（默认 300）
-    adt_auth_plugin_cache_secs: Option<u64>,
     read_only: Option<bool>,
     conn: Option<BTreeMap<String, String>>,
 }
@@ -378,31 +325,13 @@ impl SetupSystemRequest {
             ashost: self.ashost.clone(),
             sysnr: self.sysnr.clone(),
             client: self.client.clone(),
-            user: self.user.clone(),
-            passwd: self.passwd.clone(),
             lang: self.lang.clone(),
-            mysapsso2: self.mysapsso2.clone(),
-            snc_qop: self.snc_qop.clone(),
-            snc_myname: self.snc_myname.clone(),
-            snc_partnername: self.snc_partnername.clone(),
-            snc_lib: self.snc_lib.clone(),
+            auth: self.auth.clone(),
+            adt: self.adt.clone(),
             default: self.default.unwrap_or(false),
             pool_size: self.pool_size,
             idle_validate_secs: self.idle_validate_secs,
             request_timeout_secs: self.request_timeout_secs,
-            adt_base_url: self.adt_base_url.clone(),
-            adt_user: self.adt_user.clone(),
-            adt_passwd: self.adt_passwd.clone(),
-            adt_cert: self.adt_cert.clone(),
-            adt_key: self.adt_key.clone(),
-            adt_ca: self.adt_ca.clone(),
-            adt_sso2: self.adt_sso2.clone(),
-            adt_oauth_token_url: self.adt_oauth_token_url.clone(),
-            adt_oauth_client_id: self.adt_oauth_client_id.clone(),
-            adt_oauth_client_secret: self.adt_oauth_client_secret.clone(),
-            adt_auth_plugin_command: self.adt_auth_plugin_command.clone(),
-            adt_auth_plugin_params: self.adt_auth_plugin_params.clone(),
-            adt_auth_plugin_cache_secs: self.adt_auth_plugin_cache_secs,
             read_only: self.read_only,
             conn: self.conn.clone().unwrap_or_default(),
         }
@@ -609,47 +538,21 @@ pub async fn get_system_handler(
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UpdateSystemRequest {
-    /// 半更新语义：未提供的字段保持原值（密码不回显，留空 = 不改密码）。
+    /// 半更新语义：未提供的块/字段保持原值。
     ashost: Option<String>,
     sysnr: Option<String>,
     client: Option<String>,
-    user: Option<String>,
-    passwd: Option<String>,
     lang: Option<String>,
-    /// SAP 登录票据（给出时替代 user/passwd 建连；支持 ${VAR}）
-    mysapsso2: Option<String>,
-    /// SNC 四件套（给出时 passwd 可省）
-    snc_qop: Option<String>,
-    snc_myname: Option<String>,
-    snc_partnername: Option<String>,
-    snc_lib: Option<String>,
+    /// 鉴权块：**给出即整体替换**（块内结构完整，校验同创建路径）
+    auth: Option<crate::systems::AuthRaw>,
+    /// ADT 通道块：**给出即整体替换**
+    adt: Option<crate::systems::AdtRaw>,
     default: Option<bool>,
     /// 改后是否真实试连（默认 true）
     test: Option<bool>,
     pool_size: Option<usize>,
     idle_validate_secs: Option<u64>,
     request_timeout_secs: Option<u64>,
-    adt_base_url: Option<String>,
-    adt_user: Option<String>,
-    adt_passwd: Option<String>,
-    /// TLS 客户端证书 PEM 路径（mTLS）
-    adt_cert: Option<String>,
-    adt_key: Option<String>,
-    /// 自定义 CA bundle 路径
-    adt_ca: Option<String>,
-    /// SAP 登录票据（ADT 通道）
-    adt_sso2: Option<String>,
-    /// OAuth2 密码授权三件套
-    adt_oauth_token_url: Option<String>,
-    adt_oauth_client_id: Option<String>,
-    adt_oauth_client_secret: Option<String>,
-    /// 外部鉴权插件命令
-    adt_auth_plugin_command: Option<String>,
-    /// 插件透传参数（提供即整体替换）
-    #[serde(default)]
-    adt_auth_plugin_params: BTreeMap<String, String>,
-    /// 插件响应缓存秒数
-    adt_auth_plugin_cache_secs: Option<u64>,
     read_only: Option<bool>,
     /// 连接参数透传表（提供即整体替换原 conn）
     conn: Option<BTreeMap<String, String>>,
@@ -666,29 +569,16 @@ fn merge_update_raw(mut base: RawSystem, body: &UpdateSystemRequest) -> RawSyste
     if body.client.is_some() {
         base.client = body.client.clone();
     }
-    if body.user.is_some() {
-        base.user = body.user.clone();
-    }
-    if body.passwd.is_some() {
-        base.passwd = body.passwd.clone();
-    }
-    if body.mysapsso2.is_some() {
-        base.mysapsso2 = body.mysapsso2.clone();
-    }
-    if body.snc_qop.is_some() {
-        base.snc_qop = body.snc_qop.clone();
-    }
-    if body.snc_myname.is_some() {
-        base.snc_myname = body.snc_myname.clone();
-    }
-    if body.snc_partnername.is_some() {
-        base.snc_partnername = body.snc_partnername.clone();
-    }
-    if body.snc_lib.is_some() {
-        base.snc_lib = body.snc_lib.clone();
-    }
     if body.lang.is_some() {
         base.lang = body.lang.clone();
+    }
+    // auth / adt 块级替换：给出即整体生效（半更新语义保留在块外字段上；
+    // 块内的完整性由 build_spec 校验兜底——不完整的 basic 会在试连前报错）
+    if body.auth.is_some() {
+        base.auth = body.auth.clone();
+    }
+    if body.adt.is_some() {
+        base.adt = body.adt.clone();
     }
     if let Some(d) = body.default {
         base.default = d;
@@ -702,51 +592,11 @@ fn merge_update_raw(mut base: RawSystem, body: &UpdateSystemRequest) -> RawSyste
     if body.request_timeout_secs.is_some() {
         base.request_timeout_secs = body.request_timeout_secs;
     }
-    if body.adt_base_url.is_some() {
-        base.adt_base_url = body.adt_base_url.clone();
-    }
-    if body.adt_user.is_some() {
-        base.adt_user = body.adt_user.clone();
-    }
-    if body.adt_passwd.is_some() {
-        base.adt_passwd = body.adt_passwd.clone();
-    }
-    if body.adt_cert.is_some() {
-        base.adt_cert = body.adt_cert.clone();
-    }
-    if body.adt_key.is_some() {
-        base.adt_key = body.adt_key.clone();
-    }
-    if body.adt_ca.is_some() {
-        base.adt_ca = body.adt_ca.clone();
-    }
-    if body.adt_sso2.is_some() {
-        base.adt_sso2 = body.adt_sso2.clone();
-    }
-    if body.adt_oauth_token_url.is_some() {
-        base.adt_oauth_token_url = body.adt_oauth_token_url.clone();
-    }
-    if body.adt_oauth_client_id.is_some() {
-        base.adt_oauth_client_id = body.adt_oauth_client_id.clone();
-    }
-    if body.adt_oauth_client_secret.is_some() {
-        base.adt_oauth_client_secret = body.adt_oauth_client_secret.clone();
-    }
-    if body.adt_auth_plugin_command.is_some() {
-        base.adt_auth_plugin_command = body.adt_auth_plugin_command.clone();
-    }
-    if !body.adt_auth_plugin_params.is_empty() {
-        // 提供即整体替换（同 conn 的语义）
-        base.adt_auth_plugin_params = body.adt_auth_plugin_params.clone();
-    }
-    if body.adt_auth_plugin_cache_secs.is_some() {
-        base.adt_auth_plugin_cache_secs = body.adt_auth_plugin_cache_secs;
-    }
     if body.read_only.is_some() {
         base.read_only = body.read_only;
     }
-    if let Some(c) = &body.conn {
-        base.conn = c.clone();
+    if body.conn.is_some() {
+        base.conn = body.conn.clone().unwrap_or_default();
     }
     base
 }
@@ -767,13 +617,16 @@ pub async fn update_handler(
     if state.resolve(&name).is_none() {
         return Err(system_unknown(&state, &name));
     }
-    if body.passwd.as_ref().is_some_and(|p| p.trim().is_empty()) {
+    if body
+        .auth
+        .as_ref()
+        .and_then(|a| a.basic.as_ref())
+        .is_some_and(|b| b.passwd.trim().is_empty())
+    {
         return Err(RfcError {
             code: -1,
             status: 400,
-            message:
-                "passwd 不能为空串——不传该字段即保持原密码（改回环境变量引用则直接传 \"${VAR}\"）"
-                    .into(),
+            message: "auth.basic.passwd 不能为空串——不传 auth 块即保持原鉴权（改回环境变量引用则直接传 \"${VAR}\"）".into(),
             key: "SETUP_PARAM_INVALID".into(),
         });
     }
@@ -1031,26 +884,58 @@ fn system_raw_json(
     from_toml: bool,
 ) -> serde_json::Value {
     let runtime_default = state.default().map(|d| d.name == name).unwrap_or(false);
-    let passwd = match &raw.passwd {
+    // auth 块：密码/票据永不回显——值含 ${VAR} 给 ref，否则只给"已设置"
+    let mask_str = |v: &Option<String>| match v {
         Some(p) if p.contains("${") => serde_json::json!({"ref": p}),
         Some(_) => serde_json::json!({"set": true}),
         None => serde_json::json!({"set": false}),
     };
+    let auth = raw.auth.as_ref().map(|a| {
+        serde_json::json!({
+            "basic": a.basic.as_ref().map(|b| serde_json::json!({
+                "user": b.user, "passwd": mask_str(&Some(b.passwd.clone())),
+            })),
+            "sso2": a.sso2.as_ref().map(|t| serde_json::json!({
+                "ticket": mask_str(&Some(t.ticket.clone())),
+            })),
+            "plugin": a.plugin.as_ref().map(|p| serde_json::json!({
+                "command": p.command, "params": p.params,
+                "cache_secs": p.cache_secs,
+            })),
+            "snc": a.snc,
+        })
+    });
+    let adt = raw.adt.as_ref().map(|a| {
+        serde_json::json!({
+            "base_url": a.base_url,
+            "auth": a.auth.as_ref().map(|aa| serde_json::json!({
+                "basic": aa.basic.as_ref().map(|b| serde_json::json!({
+                    "user": b.user, "passwd": mask_str(&Some(b.passwd.clone())),
+                })),
+                "sso2": aa.sso2.as_ref().map(|t| serde_json::json!({
+                    "ticket": mask_str(&Some(t.ticket.clone())),
+                })),
+                "plugin": aa.plugin.as_ref().map(|p| serde_json::json!({
+                    "command": p.command, "params": p.params,
+                    "cache_secs": p.cache_secs,
+                })),
+                "snc": aa.snc,
+            })),
+            "tls": a.tls,
+        })
+    });
     serde_json::json!({
         "name": name,
         "default": runtime_default,
         "ashost": raw.ashost,
         "sysnr": raw.sysnr,
         "client": raw.client,
-        "user": raw.user,
-        "passwd": passwd,
         "lang": raw.lang,
+        "auth": auth,
+        "adt": adt,
         "pool_size": raw.pool_size,
         "idle_validate_secs": raw.idle_validate_secs,
         "request_timeout_secs": raw.request_timeout_secs,
-        "adt_base_url": raw.adt_base_url,
-        "adt_user": raw.adt_user,
-        "adt_passwd": raw.adt_passwd,
         "read_only": raw.read_only,
         "conn": raw.conn,
         "source": if from_toml { "toml" } else { "env_synthetic" },
@@ -1166,44 +1051,71 @@ fn spec_to_raw(spec: &SystemSpec) -> RawSystem {
             conn.insert(k.to_string(), v.clone());
         }
     }
+    // auth 反解：basic 的 passwd 优先用引用形态（`${VAR}` 不落明文）；
+    // snc 各字段原样。sso2/plugin 形态的 spec 里已是插值后的明文——
+    // 环境合成系统只有 basic，这里走不到；toml 来源的 spec 反解从不发生
+    //（toml 系统读回走 read_system_raw 的原始文件）。
+    let (basic_user, basic_passwd) = spec
+        .auth
+        .primary
+        .basic_ref()
+        .map(|(u, p)| (Some(u.to_string()), Some(p.to_string())))
+        .unwrap_or((get("USER"), get("PASSWD")));
+    let auth = crate::systems::AuthRaw {
+        basic: Some(crate::systems::BasicRaw {
+            user: basic_user.unwrap_or_default(),
+            passwd: spec.passwd_ref.clone().or(basic_passwd).unwrap_or_default(),
+        }),
+        sso2: None,
+        plugin: None,
+        oauth: None,
+        snc: spec.auth.snc.as_ref().map(|sn| crate::systems::SncRaw {
+            qop: sn.qop.clone(),
+            myname: sn.myname.clone(),
+            partnername: sn.partnername.clone(),
+            lib: sn.lib.clone(),
+        }),
+    };
+    // adt 反解：仅 env 合成系统走这里（toml 系统读回走原始文件）
+    let adt = spec.adt.as_ref().map(|a| crate::systems::AdtRaw {
+        base_url: a.base_url.clone(),
+        auth: a.auth.as_ref().map(|aa| crate::systems::AuthRaw {
+            basic: aa.primary.basic_ref().map(|(u, p)| crate::systems::BasicRaw {
+                user: u.to_string(),
+                passwd: p.to_string(),
+            }),
+            sso2: None,
+            plugin: None,
+            oauth: None,
+            snc: aa.snc.as_ref().map(|sn| crate::systems::SncRaw {
+                qop: sn.qop.clone(),
+                myname: sn.myname.clone(),
+                partnername: sn.partnername.clone(),
+                lib: sn.lib.clone(),
+            }),
+        }),
+        tls: a.tls.as_ref().map(|t| crate::systems::TlsRaw {
+            cert: t.cert.clone(),
+            key: t.key.clone(),
+            ca: t.ca.clone(),
+        }),
+    });
     RawSystem {
         ashost: get("ASHOST"),
         sysnr: get("SYSNR"),
         client: get("CLIENT"),
-        user: get("USER"),
-        // 引用形态优先：`${VAR}` 不落明文的约定在反解路径同样成立
-        passwd: spec.passwd_ref.clone().or_else(|| get("PASSWD")),
         lang: get("LANG"),
-        mysapsso2: get("MYSAPSSO2"),
-        snc_qop: get("SNC_QOP"),
-        snc_myname: get("SNC_MYNAME"),
-        snc_partnername: get("SNC_PARTNERNAME"),
-        snc_lib: get("SNC_LIB"),
+        auth: Some(auth),
+        adt,
         default: spec.is_default,
         pool_size: spec.pool_size,
         idle_validate_secs: spec.idle_validate.map(|d| d.as_secs()),
         request_timeout_secs: spec.request_timeout.map(|d| d.as_secs()),
-        adt_base_url: spec.adt_base_url.clone(),
-        adt_user: spec.adt_user.clone(),
-        adt_passwd: spec.adt_passwd.clone(),
-        adt_cert: spec.adt_cert.clone(),
-        adt_key: spec.adt_key.clone(),
-        adt_ca: spec.adt_ca.clone(),
-        adt_sso2: spec.adt_sso2.clone(),
-        adt_oauth_token_url: spec.adt_oauth_token_url.clone(),
-        adt_oauth_client_id: spec.adt_oauth_client_id.clone(),
-        adt_oauth_client_secret: spec.adt_oauth_client_secret.clone(),
-        adt_auth_plugin_command: spec.adt_auth_plugin.as_ref().map(|p| p.command.clone()),
-        adt_auth_plugin_params: spec
-            .adt_auth_plugin
-            .as_ref()
-            .map(|p| p.parameters.clone())
-            .unwrap_or_default(),
-        adt_auth_plugin_cache_secs: spec.adt_auth_plugin.as_ref().map(|p| p.cache_ttl.as_secs()),
         read_only: spec.read_only,
         conn,
     }
 }
+
 
 /// 从 `sap_systems.toml` 删除一个系统条目；删空则整个文件移除（重启后回到
 /// 未配置/`.env` 合成模式）。返回 (条目是否删除, 文件是否被整体移除)；
@@ -1283,8 +1195,6 @@ fn raw_to_table(raw: &RawSystem, is_default: bool) -> toml::Value {
     put_str(&mut t, "ashost", &raw.ashost);
     put_str(&mut t, "sysnr", &raw.sysnr);
     put_str(&mut t, "client", &raw.client);
-    put_str(&mut t, "user", &raw.user);
-    put_str(&mut t, "passwd", &raw.passwd);
     put_str(&mut t, "lang", &raw.lang);
     if let Some(n) = raw.pool_size {
         t.insert("pool_size".into(), toml::Value::Integer(n as i64));
@@ -1298,20 +1208,96 @@ fn raw_to_table(raw: &RawSystem, is_default: bool) -> toml::Value {
             toml::Value::Integer(n as i64),
         );
     }
-    put_str(&mut t, "adt_base_url", &raw.adt_base_url);
-    put_str(&mut t, "adt_user", &raw.adt_user);
-    put_str(&mut t, "adt_passwd", &raw.adt_passwd);
-    put_str(&mut t, "adt_cert", &raw.adt_cert);
-    put_str(&mut t, "adt_key", &raw.adt_key);
-    put_str(&mut t, "adt_ca", &raw.adt_ca);
-    put_str(&mut t, "adt_sso2", &raw.adt_sso2);
-    put_str(&mut t, "adt_oauth_token_url", &raw.adt_oauth_token_url);
-    put_str(&mut t, "adt_oauth_client_id", &raw.adt_oauth_client_id);
-    put_str(
-        &mut t,
-        "adt_oauth_client_secret",
-        &raw.adt_oauth_client_secret,
-    );
+    // auth 块：嵌套表原样落盘（${VAR} 引用形态保持原样）
+    if let Some(auth) = &raw.auth {
+        let mut a = toml::map::Map::new();
+        if let Some(b) = &auth.basic {
+            let mut bt = toml::map::Map::new();
+            bt.insert("user".into(), toml::Value::from(b.user.clone()));
+            bt.insert("passwd".into(), toml::Value::from(b.passwd.clone()));
+            a.insert("basic".into(), toml::Value::Table(bt));
+        }
+        if let Some(t) = &auth.sso2 {
+            let mut tt = toml::map::Map::new();
+            tt.insert("ticket".into(), toml::Value::from(t.ticket.clone()));
+            a.insert("sso2".into(), toml::Value::Table(tt));
+        }
+        if let Some(p) = &auth.plugin {
+            let mut pt = toml::map::Map::new();
+            pt.insert("command".into(), toml::Value::from(p.command.clone()));
+            if !p.params.is_empty() {
+                let mut pp = toml::map::Map::new();
+                for (k, v) in &p.params {
+                    pp.insert(k.clone(), toml::Value::from(v.clone()));
+                }
+                pt.insert("params".into(), toml::Value::Table(pp));
+            }
+            if let Some(c) = p.cache_secs {
+                pt.insert("cache_secs".into(), toml::Value::Integer(c as i64));
+            }
+            a.insert("plugin".into(), toml::Value::Table(pt));
+        }
+        if let Some(s) = &auth.snc {
+            let mut st = toml::map::Map::new();
+            put_str(&mut st, "qop", &s.qop);
+            put_str(&mut st, "myname", &s.myname);
+            put_str(&mut st, "partnername", &s.partnername);
+            put_str(&mut st, "lib", &s.lib);
+            a.insert("snc".into(), toml::Value::Table(st));
+        }
+        t.insert("auth".into(), toml::Value::Table(a));
+    }
+    // adt 块
+    if let Some(adt) = &raw.adt {
+        let mut d = toml::map::Map::new();
+        put_str(&mut d, "base_url", &adt.base_url);
+        if let Some(auth) = &adt.auth {
+            let mut a = toml::map::Map::new();
+            if let Some(b) = &auth.basic {
+                let mut bt = toml::map::Map::new();
+                bt.insert("user".into(), toml::Value::from(b.user.clone()));
+                bt.insert("passwd".into(), toml::Value::from(b.passwd.clone()));
+                a.insert("basic".into(), toml::Value::Table(bt));
+            }
+            if let Some(t) = &auth.sso2 {
+                let mut tt = toml::map::Map::new();
+                tt.insert("ticket".into(), toml::Value::from(t.ticket.clone()));
+                a.insert("sso2".into(), toml::Value::Table(tt));
+            }
+            if let Some(p) = &auth.plugin {
+                let mut pt = toml::map::Map::new();
+                pt.insert("command".into(), toml::Value::from(p.command.clone()));
+                if !p.params.is_empty() {
+                    let mut pp = toml::map::Map::new();
+                    for (k, v) in &p.params {
+                        pp.insert(k.clone(), toml::Value::from(v.clone()));
+                    }
+                    pt.insert("params".into(), toml::Value::Table(pp));
+                }
+                if let Some(c) = p.cache_secs {
+                    pt.insert("cache_secs".into(), toml::Value::Integer(c as i64));
+                }
+                a.insert("plugin".into(), toml::Value::Table(pt));
+            }
+            if let Some(s) = &auth.snc {
+                let mut st = toml::map::Map::new();
+                put_str(&mut st, "qop", &s.qop);
+                put_str(&mut st, "myname", &s.myname);
+                put_str(&mut st, "partnername", &s.partnername);
+                put_str(&mut st, "lib", &s.lib);
+                a.insert("snc".into(), toml::Value::Table(st));
+            }
+            d.insert("auth".into(), toml::Value::Table(a));
+        }
+        if let Some(tls) = &adt.tls {
+            let mut tt = toml::map::Map::new();
+            tt.insert("cert".into(), toml::Value::from(tls.cert.clone()));
+            put_str(&mut tt, "key", &tls.key);
+            put_str(&mut tt, "ca", &tls.ca);
+            d.insert("tls".into(), toml::Value::Table(tt));
+        }
+        t.insert("adt".into(), toml::Value::Table(d));
+    }
     if let Some(b) = raw.read_only {
         t.insert("read_only".into(), toml::Value::Boolean(b));
     }
@@ -1349,31 +1335,79 @@ fn spec_to_table(spec: &SystemSpec, is_default: bool) -> toml::Value {
             t.insert(key.into(), toml::Value::from(v));
         }
     }
-    // 密码：env 合成系统带 ${VAR} 引用形态（passwd_ref）——引用优先于解析值，
-    // 避免 "${VAR} 不落明文" 的约定被打穿（2026-11-05 审计 P1）
-    if let Some(v) = spec.passwd_ref.clone().or_else(|| get("PASSWD")) {
-        t.insert("passwd".into(), toml::Value::from(v));
+    // auth 块：basic 的密码优先用引用形态（passwd_ref = ${SAP_PASSWD}，
+    // 避免 env 解析值落明文——2026-11-05 审计 P1）；snc 原样。
+    {
+        let mut a = toml::map::Map::new();
+        let mut bt = toml::map::Map::new();
+        bt.insert(
+            "user".into(),
+            toml::Value::from(get("USER").unwrap_or_default()),
+        );
+        bt.insert(
+            "passwd".into(),
+            toml::Value::from(spec.passwd_ref.clone().or_else(|| get("PASSWD")).unwrap_or_default()),
+        );
+        a.insert("basic".into(), toml::Value::Table(bt));
+        if let Some(snc) = &spec.auth.snc {
+            let mut st = toml::map::Map::new();
+            for (k, v) in [
+                ("qop", &snc.qop),
+                ("myname", &snc.myname),
+                ("partnername", &snc.partnername),
+                ("lib", &snc.lib),
+            ] {
+                if let Some(v) = v {
+                    st.insert(k.into(), toml::Value::from(v.clone()));
+                }
+            }
+            a.insert("snc".into(), toml::Value::Table(st));
+        }
+        t.insert("auth".into(), toml::Value::Table(a));
     }
-    // adt_base_url 语义：None=按 ashost 推导（不写）、Some("")=禁用（写空串）、
-    // Some(url)=显式（写 url）。env 合成路径禁用时是 Some("")，推导时不写。
-    match &spec.adt_base_url {
-        Some(url) if !url.is_empty() => {
-            t.insert("adt_base_url".into(), toml::Value::from(url.clone()));
+    // adt 块：env 合成系统只在 ADT 凭据与连接凭据**不同**时带 adt.auth 覆盖；
+    // base_url 语义 None=推导（不写）、Some("")=禁用（写空串）、Some(url)=显式。
+    if let Some(adt) = &spec.adt {
+        let mut d = toml::map::Map::new();
+        if let Some(url) = &adt.base_url {
+            d.insert("base_url".into(), toml::Value::from(url.clone()));
         }
-        Some(_) => {
-            t.insert("adt_base_url".into(), toml::Value::from(""));
+        if let Some(aa) = &adt.auth {
+            let mut a = toml::map::Map::new();
+            if let Some((u, p)) = aa.primary.basic_ref() {
+                let mut bt = toml::map::Map::new();
+                bt.insert("user".into(), toml::Value::from(u.to_string()));
+                bt.insert("passwd".into(), toml::Value::from(p.to_string()));
+                a.insert("basic".into(), toml::Value::Table(bt));
+            }
+            if let Some(snc) = &aa.snc {
+                let mut st = toml::map::Map::new();
+                for (k, v) in [
+                    ("qop", &snc.qop),
+                    ("myname", &snc.myname),
+                    ("partnername", &snc.partnername),
+                    ("lib", &snc.lib),
+                ] {
+                    if let Some(v) = v {
+                        st.insert(k.into(), toml::Value::from(v.clone()));
+                    }
+                }
+                a.insert("snc".into(), toml::Value::Table(st));
+            }
+            d.insert("auth".into(), toml::Value::Table(a));
         }
-        None => {}
-    }
-    if let Some(u) = &spec.adt_user {
-        if Some(u.as_str()) != get("USER").as_deref() {
-            t.insert("adt_user".into(), toml::Value::from(u.clone()));
+        if let Some(tls) = &adt.tls {
+            let mut tt = toml::map::Map::new();
+            tt.insert("cert".into(), toml::Value::from(tls.cert.clone()));
+            if let Some(k) = &tls.key {
+                tt.insert("key".into(), toml::Value::from(k.clone()));
+            }
+            if let Some(c) = &tls.ca {
+                tt.insert("ca".into(), toml::Value::from(c.clone()));
+            }
+            d.insert("tls".into(), toml::Value::Table(tt));
         }
-    }
-    if let Some(p) = &spec.adt_passwd {
-        if Some(p.as_str()) != get("PASSWD").as_deref() {
-            t.insert("adt_passwd".into(), toml::Value::from(p.clone()));
-        }
+        t.insert("adt".into(), toml::Value::Table(d));
     }
     if is_default {
         t.insert("default".into(), toml::Value::Boolean(true));
@@ -1427,31 +1461,22 @@ mod tests {
             ashost: Some("vhcala4h".into()),
             sysnr: Some("00".into()),
             client: Some("001".into()),
-            user: Some("dev".into()),
-            passwd: Some(format!("${{{}}}", TEST_PW_VAR)),
             lang: None,
-            mysapsso2: None,
-            snc_qop: None,
-            snc_myname: None,
-            snc_partnername: None,
-            snc_lib: None,
+            auth: Some(crate::systems::AuthRaw {
+                basic: Some(crate::systems::BasicRaw {
+                    user: "dev".into(),
+                    passwd: format!("${{{}}}", TEST_PW_VAR),
+                }),
+                sso2: None,
+                plugin: None,
+                oauth: None,
+                snc: None,
+            }),
+            adt: None,
             default: false,
             pool_size: None,
             idle_validate_secs: None,
             request_timeout_secs: None,
-            adt_base_url: None,
-            adt_user: None,
-            adt_passwd: None,
-            adt_cert: None,
-            adt_key: None,
-            adt_ca: None,
-            adt_sso2: None,
-            adt_oauth_token_url: None,
-            adt_oauth_client_id: None,
-            adt_oauth_client_secret: None,
-            adt_auth_plugin_command: None,
-            adt_auth_plugin_params: BTreeMap::new(),
-            adt_auth_plugin_cache_secs: None,
             read_only: None,
             conn: BTreeMap::new(),
         }
@@ -1672,20 +1697,25 @@ mod tests {
     #[test]
     fn merge_update_keeps_unspecified_fields() {
         let _g = lock_and_set_pw();
-        let existing = sample_raw(); // a4h 形态：ashost/sysnr/client/user/passwd(${VAR})
-        let body_json = serde_json::json!({"user": "newuser"});
+        let existing = sample_raw(); // auth.basic 形态：user/passwd(${VAR})
+        let body_json = serde_json::json!({
+            "auth": {"basic": {"user": "newuser", "passwd": "newpass"}}
+        });
         let body: UpdateSystemRequest = serde_json::from_value(body_json).unwrap();
         let merged = merge_update_raw(existing, &body);
-        assert_eq!(merged.user.as_deref(), Some("newuser"));
+        assert_eq!(
+            merged.auth.as_ref().unwrap().basic.as_ref().unwrap().user,
+            "newuser"
+        );
         assert_eq!(
             merged.ashost.as_deref(),
             Some("vhcala4h"),
             "未提供的字段保持原值"
         );
         assert_eq!(
-            merged.passwd.as_deref(),
-            Some(format!("${{{}}}", TEST_PW_VAR).as_str()),
-            "密码未提供即保持"
+            merged.auth.as_ref().unwrap().basic.as_ref().unwrap().passwd,
+            "newpass",
+            "auth 块整体替换"
         );
 
         // conn 整体替换 + default 翻转

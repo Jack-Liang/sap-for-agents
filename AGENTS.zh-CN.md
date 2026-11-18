@@ -669,42 +669,67 @@ curl -X POST http://127.0.0.1:3000/api/table/osql -H "Content-Type: application/
 
 ### 13. SAP 侧登录方式（v0.21）
 
-经典 user+password 仍是默认。另有三条通道，全部按系统在 `sap_systems.toml` 配置（或经 `POST /api/setup/system`）——混合形态在装载期校验：SSO2 票据或 SNC 四件套任一给出时 `user`/`passwd` 可省。
+鉴权收敛到每系统的 **`auth` 块**——主通道互斥四选一（basic / sso2 / plugin / oauth，装载期强制「恰一」）+ 可选 `snc` 叠加。密码/票据支持 `${VAR}` 插值；同一块形态同时驱动 RFC 连接与（经继承的）ADT 通道。
 
 ```toml
-# RFC 侧：SSO 登录票据（票据自带身份；支持 ${VAR}）
-[systems.sso]
-ashost="…"; sysnr="00"; client="001"
-mysapsso2 = "${SAP_SSO2_TICKET}"
+[systems.prd]
+ashost = "…"
+sysnr = "00"
+client = "001"
 
-# RFC 侧：SNC / Kerberos（Secure Login Client）——passwd 可省
-[systems.snc]
-ashost="…"; sysnr="00"; client="001"
-snc_qop = "8"
-snc_partnername = "p:CN=A4H"
-snc_lib = "/usr/sap/lib/gsskrb5.so"   # snc_myname 可选
+# 主通道——恰选其一：
+[systems.prd.auth.basic]
+user = "DEVELOPER"
+passwd = "${SAP_PASSWD}"
 
-# ADT 侧：现代鉴权（阶梯：plugin > OAuth > SSO2 > Basic；TLS 素材与鉴权正交）
-adt_cert = "/etc/sap/client.pem"      # mTLS 身份（adt_key 缺省 = cert 单文件含私钥；
-                                      # 加密私钥拒收并给出解密提示）
-adt_ca   = "/etc/sap/ca.pem"          # https 端点的自定义 CA bundle
-adt_sso2 = "${SAP_SSO2_TICKET}"       # ADT 通道走 Cookie MYSAPSSO2（缺省复用 mysapsso2）
-adt_oauth_token_url   = "https://…/oauth/token"   # BTP/ABAP Cloud 的 ADT 只认 OAuth2；
-adt_oauth_client_id   = "sb-…"                    # 密码授权 + 进程内 token 缓存 +
-adt_oauth_client_secret = "${SAP_BTP_SECRET}"     # refresh_token 复用；401 自动重新 grant 一次
-adt_auth_plugin_command = "/usr/local/bin/sap-auth-helper"  # 逃生舱：子进程 stdin 收 JSON，
-adt_auth_plugin_params  = { tenant = "a4h" }               # stdout 回 cookies 或 headers
-adt_auth_plugin_cache_secs = 300                           # （content.type: cookie |
-                                                           # http_authorization_header；不支持
-                                                           # certificates 形态——请用 adt_cert/
-                                                           # adt_key 静态配置）。命令必须是绝对
-                                                           # 路径；401 时失效缓存重跑一次插件。
+# [systems.prd.auth.sso2]
+# ticket = "${SAP_SSO2_TICKET}"          # SAP 登录票据（身份在票据里）
+
+# [systems.prd.auth.plugin]              # 外部插件（仅 ADT 通道）
+# command = "/usr/local/bin/sap-auth-helper"   # 强制绝对路径
+# params = { tenant = "a4h" }
+# cache_secs = 300
+
+# [systems.prd.auth.oauth]               # BTP/ABAP Cloud——系统级使用会被拒，
+# token_url = "https://…/oauth/token"    # 请放到 adt.auth（见下）
+# client_id = "sb-…"
+# client_secret = "${SAP_BTP_SECRET}"
+
+# 可选 SNC 叠加层（与任一主通道组合）：
+[systems.prd.auth.snc]
+qop = "8"
+partnername = "p:CN=A4H"
+lib = "gsskrb5"          # myname 可选
 ```
 
-- `GET /api/systems` 现在回显每个系统的 `auth`：`basic` | `sso2` | `snc` | `sso2+snc`。
-- SSO2/SNC 是 RFC 侧透传（已验证参数到达 `RfcOpenConnection`、Basic 路径回归正常；端到端 SSO 需要真实票据/SNC 基础设施，trial 系统签发不了）。
-- OAuth 打开 BTP/ABAP Cloud 目标（Basic 在那边直接被拒）。失败时网关回 `401 ADT_OAUTH_FAILED` 并带 IdP 的原话。
-- 启动期卫生：`sap_systems.toml` 若 world-readable 且含**明文凭据**（非 `${VAR}` 形态），打 WARN 建议 `chmod 600` / 改 `${VAR}` 形态。网关自己写的文件恒 0600。
+ADT 通道有独立的 **`adt` 块**——`base_url`（缺省 `http://<ashost>:50000`，空串 = 禁用）、`tls`（mTLS：`cert`/`key`/`ca`；加密私钥拒收并给解密提示）、`auth` **覆盖**（缺省 = 继承系统级 auth；给出 = 整体替换）：
+
+```toml
+[systems.prd.adt]
+base_url = "https://host:44300"
+
+[systems.prd.adt.tls]
+cert = "/etc/sap/client.pem"    # key 可选（合并单文件）；ca 可选
+
+# 覆盖示例——生产 ADT 走独立账号：
+[systems.prd.adt.auth.basic]
+user = "adt_account"
+passwd = "${SAP_PRD_ADT_PASSWD}"
+
+# BTP/ABAP Cloud（那边拒收 Basic；BTP 无 RFC——oauth 系统只服务 /api/adt/**）：
+[systems.btp.adt.auth.oauth]
+token_url = "https://acme.authentication.eu10.hana.ondemand.com/oauth/token"
+client_id = "sb-…"
+client_secret = "${SAP_BTP_SECRET}"
+```
+
+要点：
+- `GET /api/systems` 回显每系统 `auth`：`basic` | `sso2` | `plugin` | `oauth`（可 +`+snc`）。
+- `conn` 透传在装载期**拒收鉴权键**（`USER`/`PASSWD`/`MYSAPSSO2`/`SNC_*`）——鉴权只认 auth 块（无双重表示）。
+- OAuth token 缓存 + refresh_token 复用在进程内存；401 → 强制重新 grant 一次。插件响应缓存 `cache_secs`；401 → 失效重跑一次。
+- `.env` 单系统路径不变（`SAP_USER`/`SAP_PASSWD` 映射为 basic；`SAP_ADT_USER`/`SAP_ADT_PASSWD` 仅在与连接凭据不同时生效）。
+- 启动期卫生：world-readable 配置含明文凭据（auth 下非 `${VAR}` 值）打 WARN 建议 `chmod 600` / `${VAR}` 形态。
+- ⚠️ **配置破坏性变更（v0.21）**：平铺 `user`/`passwd`/`mysapsso2`/`snc_*`/`adt_user`/`adt_passwd`/`adt_cert`… 字段全部移除——迁移到 `auth.*` / `adt.*` 块（形态见上）。
 
 ## 关键约束（避坑）
 

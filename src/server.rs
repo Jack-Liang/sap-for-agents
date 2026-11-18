@@ -3436,20 +3436,17 @@ mod tests {
                 name: "a4h".into(),
                 is_default: true,
                 conn_params: direct(),
+                auth: crate::systems::AuthConfig {
+                    primary: crate::systems::AuthPrimary::Basic {
+                        user: "u".into(),
+                        passwd: "p".into(),
+                    },
+                    snc: None,
+                },
+                adt: None,
                 pool_size: None,
                 idle_validate: None,
                 request_timeout: None,
-                adt_base_url: Some(String::new()),
-                adt_user: None,
-                adt_passwd: None,
-                adt_cert: None,
-                adt_key: None,
-                adt_ca: None,
-                adt_sso2: None,
-                adt_oauth_token_url: None,
-                adt_oauth_client_id: None,
-                adt_oauth_client_secret: None,
-                adt_auth_plugin: None,
                 read_only: None,
                 passwd_ref: None,
             },
@@ -3457,20 +3454,21 @@ mod tests {
                 name: "prd".into(),
                 is_default: false,
                 conn_params: direct(),
+                auth: crate::systems::AuthConfig {
+                    primary: crate::systems::AuthPrimary::Basic {
+                        user: "u".into(),
+                        passwd: "p".into(),
+                    },
+                    snc: None,
+                },
+                adt: Some(crate::systems::AdtConfig {
+                    base_url: Some(String::new()),
+                    auth: None,
+                    tls: None,
+                }),
                 pool_size: None,
                 idle_validate: None,
                 request_timeout: None,
-                adt_base_url: Some(String::new()),
-                adt_user: None,
-                adt_passwd: None,
-                adt_cert: None,
-                adt_key: None,
-                adt_ca: None,
-                adt_sso2: None,
-                adt_oauth_token_url: None,
-                adt_oauth_client_id: None,
-                adt_oauth_client_secret: None,
-                adt_auth_plugin: None,
                 read_only: Some(true),
                 passwd_ref: None,
             },
@@ -3494,7 +3492,7 @@ mod tests {
                     .header("content-type", "application/json")
                     .header("host", "127.0.0.1:3000")
                     .body(axum::body::Body::from(
-                        r#"{"name":"x1","ashost":"h","sysnr":"00","client":"001","user":"u","passwd":"p","test":false}"#,
+                        r#"{"name":"x1","ashost":"h","sysnr":"00","client":"001","auth":{"basic":{"user":"u","passwd":"p"}},"test":false}"#,
                     ))
                     .unwrap(),
             )
@@ -3514,7 +3512,9 @@ mod tests {
                     .uri("/api/setup/system/a4h")
                     .header("content-type", "application/json")
                     .header("host", "evil.example.com:3000")
-                    .body(axum::body::Body::from(r#"{"user":"attacker"}"#))
+                    .body(axum::body::Body::from(
+                        r#"{"auth":{"basic":{"user":"attacker","passwd":"x"}}}"#,
+                    ))
                     .unwrap(),
             )
             .await
@@ -3941,7 +3941,8 @@ mod tests {
         // 3) 引导写入（test:false 跳过试连——CI 无 SAP SDK）→ 落盘 + 热加载
         let req_body = serde_json::json!({
             "name": "a4h", "ashost": "vhcala4h", "sysnr": "00",
-            "client": "001", "user": "dev", "passwd": "pw", "test": false,
+            "client": "001", "auth": {"basic": {"user": "dev", "passwd": "pw"}},
+            "test": false,
         });
         let resp = app
             .clone()
@@ -4001,7 +4002,7 @@ mod tests {
                     .header("host", "127.0.0.1:3000") // v0.20 安全门：无鉴权写入要求回环 Host
                     .body(axum::body::Body::from(
                         serde_json::json!({"name": "x", "ashost": "h", "sysnr": "00",
-                                           "user": "u", "passwd": "p",
+                                           "auth": {"basic": {"user": "u", "passwd": "p"}},
                                            "hostname_typo": "oops", "test": false})
                         .to_string(),
                     ))
@@ -4022,7 +4023,8 @@ mod tests {
                     .header("content-type", "application/json")
                     .header("host", "127.0.0.1:3000") // v0.20 安全门：无鉴权写入要求回环 Host
                     .body(axum::body::Body::from(
-                        serde_json::json!({"name": "x", "user": "u", "passwd": "p",
+                        serde_json::json!({"name": "x",
+                                           "auth": {"basic": {"user": "u", "passwd": "p"}},
                                            "test": false})
                         .to_string(),
                     ))
