@@ -491,13 +491,15 @@ async function refreshStatus() {
             dot.className = 'w-2 h-2 rounded-full bg-amber-500';
             txt.textContent = r ? '部分系统连接异常' : 'SAP 连接异常';
             const esc = t => String(t).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;');
+            // 行内文字统一用横幅的琥珀色系（#8a5300），连接状态只由 ✓/✗ 符号着色——
+            // 整行绿字与琥珀警告底色相冲，语义色混用
             const lines = ok.map(s =>
-                '<div class="truncate" style="color:#2e7d32">✓ ' + esc(s.name) + (s.default ? '（默认）' : '') +
-                ' — 已连接' + (s.sysid ? '（Sysid: ' + esc(s.sysid) + '）' : '') + '</div>'
+                '<div class="truncate"><span style="color:#2e7d32;font-weight:600">✓</span> <span style="color:#8a5300">' + esc(s.name) + (s.default ? '（默认）' : '') +
+                ' — 已连接' + (s.sysid ? '（Sysid: ' + esc(s.sysid) + '）' : '') + '</span></div>'
             ).concat(bad.map(s => {
                 const err = esc(s.connect_error || '尚未连上');
-                return '<div class="truncate" title="' + err + '" style="color:#b26a00">✗ ' + esc(s.name) +
-                    (s.default ? '（默认）' : '') + ' — ' + err + '</div>';
+                return '<div class="truncate" title="' + err + '"><span style="color:#b3261e;font-weight:600">✗</span> <span style="color:#8a5300">' + esc(s.name) +
+                    (s.default ? '（默认）' : '') + ' — ' + err + '</span></div>';
             }));
             const title = r ? '网关已启动 · 部分 SAP 系统连接异常' : '网关已启动 · SAP 连接异常';
             showBanner(true, title, lines.join(''));

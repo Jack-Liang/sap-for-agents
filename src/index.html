@@ -491,13 +491,27 @@ async function refreshStatus() {
             dot.className = 'w-2 h-2 rounded-full bg-amber-500';
             txt.textContent = r ? 'Some SAP systems unreachable' : 'SAP connection issue(s)';
             const esc = t => String(t).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;');
+            // Backend probe messages are Chinese (repo convention — same mapping
+            // as /setup's probeErrText); the English UI maps them to English.
+            const probeErrText = msg => {
+                if (!msg) return '';
+                if (msg.indexOf('连接超时') === 0) return 'Connection timed out (5s probe)';
+                if (msg.indexOf('探测任务失败') === 0) return 'Probe task failed: ' + msg.slice(7);
+                const um = msg.match(/^目标系统当前不可达.*（(.*)）$/);
+                if (um) return 'Target system currently unreachable, please retry later ('
+                    + um[1].replace(/^连接失败:\s*/, 'connection failed: ') + ')';
+                return msg; // RFC errors are English already
+            };
+            // Row text stays in the banner's amber palette (#8a5300); status is
+            // carried by the colored ✓/✗ glyph only — a full green row clashes
+            // with the amber warning background.
             const lines = ok.map(s =>
-                '<div class="truncate" style="color:#2e7d32">✓ ' + esc(s.name) + (s.default ? ' (default)' : '') +
-                ' — connected' + (s.sysid ? ' (Sysid: ' + esc(s.sysid) + ')' : '') + '</div>'
+                '<div class="truncate"><span style="color:#2e7d32;font-weight:600">✓</span> <span style="color:#8a5300">' + esc(s.name) + (s.default ? ' (default)' : '') +
+                ' — connected' + (s.sysid ? ' (Sysid: ' + esc(s.sysid) + ')' : '') + '</span></div>'
             ).concat(bad.map(s => {
-                const err = esc(s.connect_error || 'not connected yet');
-                return '<div class="truncate" title="' + err + '" style="color:#b26a00">✗ ' + esc(s.name) +
-                    (s.default ? ' (default)' : '') + ' — ' + err + '</div>';
+                const err = esc(probeErrText(s.connect_error) || 'not connected yet');
+                return '<div class="truncate" title="' + err + '"><span style="color:#b3261e;font-weight:600">✗</span> <span style="color:#8a5300">' + esc(s.name) +
+                    (s.default ? ' (default)' : '') + ' — ' + err + '</span></div>';
             }));
             const title = r ? 'Gateway is running · some SAP systems unreachable' : 'Gateway is running · SAP connection issue(s)';
             showBanner(true, title, lines.join(''));
