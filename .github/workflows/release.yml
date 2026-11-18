@@ -151,6 +151,9 @@ jobs:
       # 从 rust-toolchain.toml 解析 channel 显式传入，两个来源强制一致。
       - name: Resolve pinned toolchain
         id: pin
+        # 显式 bash：windows-latest 的 run: 默认 pwsh，$(sed …) 产出空 channel
+        # （第二次 tag 构建实证：toolchain 输入为空 → action 退 1）
+        shell: bash
         run: echo "channel=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
 
       - name: Install Rust toolchain
