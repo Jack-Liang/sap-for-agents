@@ -6,7 +6,11 @@ Thanks for your interest! This guide covers the practical bits of working on thi
 
 ## Prerequisites
 
-- **Rust** (stable toolchain; see `rust-version` in `Cargo.toml` for the MSRV)
+- **Rust** — `rust-toolchain.toml` pins the exact toolchain; rustup selects it
+  automatically. Upgrading is deliberate: change the `channel` line → `rustup
+  update` → full `cargo clippy --all-targets -- -D warnings` locally → push.
+  (A floating stable once made new CI-side clippy lints invisible locally and
+  turned the push red.) The MSRV lives in `rust-version` in `Cargo.toml`.
 - **SAP NWRFC SDK** — SAP's proprietary C library, downloaded from SAP Support Portal
   (cannot be redistributed). Drop the platform zip into `nwrfcsdk/lib/<any-dir>/`
   and `./start.sh` auto-extracts it; see README §Quick Start.
@@ -31,11 +35,22 @@ cargo clippy --all-targets -- -D warnings
 Notes on the integration suite:
 
 - Each test spawns the real HTTP server on a unique port and talks to it over HTTP.
-- The suite covers all endpoint families incl. OpenAPI, MCP (`POST /mcp`) and the
-  connection-pool behavior. Some environment-dependent results (e.g. the where-used
-  index on trial systems) are asserted structurally, not by content.
+- The suite covers all endpoint families incl. OpenAPI, MCP (`POST /mcp`), the
+  connection-pool behavior and the remote ABAP debugger. Some environment-dependent
+  results (e.g. the where-used index on trial systems) are asserted structurally,
+  not by content.
 - The SAP integration tests are skipped automatically when the connection env vars
   are missing — they never fail CI.
+- **On trial systems, run in serial batches** (`--test-threads=1`, grouped by
+  prefix, a quiet minute between batches): a marathon run collapses the trial
+  ICM under write volume — write-heavy tests then fail together with ICM
+  "Service cannot be reached" pages. A failing case rerun individually going
+  green means it was the infra, not your code.
+- **After a container/system restart there is a ~30 min settling window**: RFC
+  probes (`/ready`, discovery) are green almost immediately, but ADT lock-based
+  writes fail with ICM 400 "Service cannot be reached" during it. Don't misread
+  that as a regression. See the header of `tests/sap_integration.rs` for the
+  full run strategy.
 
 ## Design conventions
 
@@ -61,5 +76,15 @@ Notes on the integration suite:
 
 ## Releasing (maintainers)
 
-See README §10 — bump `Cargo.toml`, tag `vX.Y.Z`, push the tag; CI builds the five
-platform binaries and attaches them to the GitHub Release automatically.
+See README §10 — bump `Cargo.toml`, commit (`chore(release): vX.Y.Z`), tag
+`vX.Y.Z`, push the tag; CI builds the five platform binaries and attaches them
+to the GitHub Release automatically. Pipeline gotchas:
+
+- The Release workflow gates on **tag == `Cargo.toml` version** (tag without bump
+  fails the consistency check).
+- Watch with `gh run watch <id> --exit-status` — piping its output eats the
+  exit code.
+- A bad tag: `gh release delete vX.Y.Z --cleanup-tag`, fix, re-tag (re-pushing a
+  deleted tag re-triggers the workflow).
+- Attach human-facing release notes afterwards with
+  `gh release edit vX.Y.Z --notes-file notes.md`.
