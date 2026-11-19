@@ -153,26 +153,25 @@ pub fn capabilities_debug_enabled() -> bool {
 /// 临时短命通道（断点操作用——断点按用户态身份存续，不依赖会话）。
 /// 断点通道（槽内缓存的长命会话；None 或出错时重开）。失败自动失效——
 /// 下次操作重建，不做无谓重试。
-async fn bp_channel(
-    sap: &Sap,
-    slot: &Arc<Slot>,
-) -> Result<tokio::sync::OwnedMutexGuard<Option<DebugSession>>, RfcError> {
-    {
-        let g = slot.bp_chan.lock().await;
-        if g.is_some() {
-            return Ok(slot.bp_chan.clone().lock_owned().await);
-        }
-    }
-    let ep = sap.adt.as_ref().ok_or_else(crate::adt::adt_disabled)?.clone();
-    let fresh = DebugSession::open(ep).await.map_err(|e| {
-        slot_err(502, "ADT_DEBUG_SESSION_FAILED", format!("调试通道建立失败: {}", e.message))
-    })?;
+async fn bp_channel<'a>(
+    sap: &'a Sap,
+    slot: &'a Arc<Slot>,
+) -> Result<tokio::sync::MutexGuard<'a, Option<DebugSession>>, RfcError> {
+    // ⚠️ 单锁设计（2026-11-20 楔死根因修复）：绝不在持有 tokio Mutex 守卫时
+    // 对同一把锁再 lock/lock_owned——tokio Mutex 不可重入，旧快速路径
+    // 「持 g → lock_owned().await」= 永久自死锁（首次 bp 操作后的所有 bp
+    // 操作全部楔死，重启才解）。现在整段持单守卫：慢路径（DebugSession::open
+    // 两次往返）期间持锁串行化，顺带消除并发双开通道的浪费。守卫可跨 await
+    // （tokio MutexGuard: Send），宏在 body 期间持它正是所需的独占语义。
     let mut g = slot.bp_chan.lock().await;
     if g.is_none() {
+        let ep = sap.adt.as_ref().ok_or_else(crate::adt::adt_disabled)?.clone();
+        let fresh = DebugSession::open(ep).await.map_err(|e| {
+            slot_err(502, "ADT_DEBUG_SESSION_FAILED", format!("调试通道建立失败: {}", e.message))
+        })?;
         *g = Some(fresh);
     }
-    drop(g);
-    Ok(slot.bp_chan.clone().lock_owned().await)
+    Ok(g)
 }
 
 /// 通道出错时丢弃缓存（下次操作重开）。
@@ -188,6 +187,9 @@ macro_rules! with_bp_chan {
         match out {
             Ok(v) => Ok(v),
             Err(e) => {
+                // 先释放守卫再 drop_bp_channel——同一把 tokio Mutex，持锁嵌套
+                // 即自死锁（与 bp_channel 快速路径同款错误，见彼处注释）。
+                drop(g);
                 drop_bp_channel($slot).await;
                 Err(e)
             }
