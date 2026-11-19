@@ -807,6 +807,63 @@ pub(crate) async fn activate_object(
     )))
 }
 
+/// GET /sap/bc/adt/activation/inactiveobjects —— 全量未激活对象清单。
+/// 与激活响应**内嵌**的 inactive 清单互补：假成功时（SAP 返回 200 无消息，
+/// 对象却仍 inactive——vsp 在 append 结构上实证）内嵌清单根本不会出现，
+/// 只有这份全量清单能识破。vsp 端点同款（pkg/adt/devtools.go GetInactiveObjects）。
+pub(crate) async fn fetch_inactive_object_uris(adt: &AdtEndpoint) -> Result<Vec<String>, RfcError> {
+    let resp = adt
+        .request_raw(
+            axum::http::Method::GET,
+            "activation/inactiveobjects",
+            &[],
+            None,
+            None,
+            "application/vnd.sap.adt.inactivectsobjects.v1+xml, application/xml;q=0.8",
+            &[],
+            None,
+            None,
+        )
+        .await?;
+    if !(200..300).contains(&resp.status) {
+        let body = String::from_utf8_lossy(&resp.body);
+        return Err(RfcError {
+            code: -1,
+            status: 502,
+            message: format!(
+                "读取未激活清单失败（ADT 返回 {}）: {}",
+                resp.status,
+                truncate(&body, 200)
+            ),
+            key: "INACTIVE_LIST_UNAVAILABLE".into(),
+        });
+    }
+    Ok(parse_inactive_object_uris(&String::from_utf8_lossy(
+        &resp.body,
+    )))
+}
+
+/// 解析 inactiveobjects 清单：`entry > object > ref@uri`。transport 槽里的
+/// ref 不算——那是「对象挂在哪个传输请求下」，不是「对象未激活」。
+fn parse_inactive_object_uris(body: &str) -> Vec<String> {
+    walk_xml(body)
+        .iter()
+        .filter(|e| e.name == "ref" && e.parent_is("object"))
+        .filter_map(|r| r.attr("uri").map(str::to_string))
+        .collect()
+}
+
+/// inactive 清单 URI 与对象 base 的比对：两侧剥掉 /sap/bc/adt 前缀与尾斜杠
+/// 后不区分大小写（vsp objectInactive 同款归一）。
+fn inactive_uri_matches(base: &str, uri: &str) -> bool {
+    fn norm(s: &str) -> String {
+        let s = s.trim();
+        let s = s.strip_prefix("/sap/bc/adt/").unwrap_or(s);
+        s.trim_end_matches('/').to_lowercase()
+    }
+    !base.trim().is_empty() && !uri.trim().is_empty() && norm(uri) == norm(base)
+}
+
 // ========================================================================
 // 语法检查（不写库：源码 base64 内嵌提交）
 // ========================================================================
@@ -2065,11 +2122,36 @@ async fn write_ddic_source(
 
     // ③ 激活（与锁编排同一通道；逻辑结果，不升为传输错误）
     let name_upper = name.trim().to_uppercase();
-    let activated = if activate {
+    let mut warnings: Vec<String> = Vec::new();
+    let mut activated = if activate {
         Some(activate_object(adt, &base, &name_upper).await?)
     } else {
         None
     };
+
+    // ③' 激活「成功」后用全量未激活清单反核（vsp 实证：append 结构激活可
+    //     返回 200 无消息而 DD02L 里只有 inactive 版本——假成功不进内嵌清单，
+    //     parse_activation_result 的 inactive 挡不住）。命中 → 改判失败并给
+    //     问题行；清单读不到（老版本缺该端点等）降级为警告，不改判成功。
+    if let Some(out) = activated.as_mut().filter(|o| o.success) {
+        match fetch_inactive_object_uris(adt).await {
+            Ok(uris) => {
+                if uris.iter().any(|u| inactive_uri_matches(&base, u)) {
+                    out.success = false;
+                    out.problems.push(format!(
+                        "SAP 报告激活成功，但 {} 仍在未激活清单中（inactive 列表核对未通过）",
+                        name_upper
+                    ));
+                }
+            }
+            Err(e) => {
+                warnings.push(format!(
+                    "未激活清单核对失败（不影响写入结果）: {}",
+                    e.message
+                ));
+            }
+        }
+    }
 
     Ok(WriteOutcome {
         obj_type: obj_type.api_name().to_string(),
@@ -2082,7 +2164,7 @@ async fn write_ddic_source(
         // DDIC 写入路径不适用注册表（仅 rfc_enabled 函数会登记）
         registered_alias: None,
         activated,
-        warnings: Vec::new(),
+        warnings,
     })
 }
 
@@ -2947,6 +3029,45 @@ pub fn active_check_supported(obj_type: ObjectType) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inactive_list_parses_object_refs_only() {
+        let body = r#"<?xml version="1.0" encoding="UTF-8"?>
+<ioc:inactiveObjects xmlns:ioc="http://www.sap.com/adt/ioc" xmlns:adtcore="http://www.sap.com/adt/core">
+  <ioc:entry>
+    <ioc:object user="DEVELOPER" deleted="false">
+      <ioc:ref adtcore:name="ZAPPEND_DEMO" adtcore:type="TABL/DA" adtcore:uri="/sap/bc/adt/ddic/structures/zappend_demo"/>
+    </ioc:object>
+    <ioc:transport>
+      <ioc:ref adtcore:name="A4HK900123" adtcore:uri="/sap/bc/adt/cts/transportrequests/A4HK900123"/>
+    </ioc:transport>
+  </ioc:entry>
+  <ioc:entry>
+    <ioc:object user="OTHER">
+      <ioc:ref adtcore:name="ZPROG" adtcore:type="PROG/P" adtcore:uri="/sap/bc/adt/programs/programs/zprog"/>
+    </ioc:object>
+  </ioc:entry>
+</ioc:inactiveObjects>"#;
+        let uris = parse_inactive_object_uris(body);
+        // transport 槽的 ref 必须被排除，object 槽的两条都拿到
+        assert_eq!(uris.len(), 2);
+        assert!(uris.contains(&"/sap/bc/adt/ddic/structures/zappend_demo".to_string()));
+        assert!(uris.contains(&"/sap/bc/adt/programs/programs/zprog".to_string()));
+    }
+
+    #[test]
+    fn inactive_uri_match_normalizes_prefix_case_slash() {
+        let base = "ddic/structures/ZDEMO";
+        assert!(inactive_uri_matches(base, "/sap/bc/adt/ddic/structures/zdemo"));
+        assert!(inactive_uri_matches(
+            "/sap/bc/adt/ddic/structures/zdemo",
+            "ddic/structures/ZDEMO/"
+        ));
+        assert!(!inactive_uri_matches(base, "/sap/bc/adt/ddic/tables/zdemo"));
+        // 空串永不匹配（防止把「无清单」当「命中」）
+        assert!(!inactive_uri_matches(base, ""));
+        assert!(!inactive_uri_matches("", base));
+    }
 
     #[test]
     fn object_type_parses_aliases_and_builds_urls() {
