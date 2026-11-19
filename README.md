@@ -7,7 +7,7 @@ Wraps the SAP NWRFC SDK into a long-running HTTP service that exposes any SAP RF
 - **Stack**: Rust (standard-library FFI linking directly to `sapnwrfc.dll`) + axum + tokio + serde
 - **Zero-SDK clients**: callers only need to send an HTTP POST
 - **Generic interface**: one endpoint, `/api/rfc`, describes any BAPI — no per-BAPI glue code
-- **AI-friendly**: 16 metadata endpoints (self-description / search functions / inspect interfaces / read docs / view source / read transparent tables / query the data dictionary / triage short dumps / **edit ABAP code**) let agents explore and act self-service. The operator guide for AI lives in [`AGENTS.md`](./AGENTS.md)
+- **AI-friendly**: 40+ metadata & action endpoints — self-description, function/object search, interface/doc/source/where-used, transparent tables + OpenSQL, DDIC semantics, short-dump triage, **ABAP code-edit orchestration** (create/replace/syntax/meta), abap/run, tests/ATC, CTS transports, package export+import, and remote debugging (breakpoints/stack/variables/step) — let agents explore and act self-service. The operator guide for AI lives in [`AGENTS.md`](./AGENTS.md)
 
 ![Web UI of the gateway: the agents.md link to paste into your AI, a connectivity check, and the endpoint lists](docs/images/demo.jpg)
 
@@ -406,17 +406,20 @@ Fields you don't read (e.g. you didn't pass `table_outputs`) do **not** appear i
 
 ### 3.3 AI-facing metadata API
 
-16 endpoints let an AI/agent self-service discover functions, understand parameters, query the data dictionary, read docs, view source, read table data, triage short dumps, and **edit code**. Typical workflow: **self-description (`/api/version`) → search → inspect interface → read docs → view source → call**. The full operator guide for AI lives in [`AGENTS.md`](./AGENTS.md).
+AI/agent self-service surface: discover functions, understand parameters, query the data dictionary, read docs, view source, read table data, triage short dumps, **edit code**, run/test/check it, and debug it remotely. Typical workflow: **self-description (`/api/version`) → search → inspect interface → read docs → view source → call**. The full operator guide lives in [`AGENTS.md`](./AGENTS.md); the table below is the core quick-reference.
 
 | Endpoint | Purpose | Example |
 |------|------|------|
 | `GET /api/version` | Self-description first: version/commit + capability switches (auth/read_only/adt/rate limit) + SAP sysid/release (public, cached) | `/api/version` |
 | `POST /api/functions/search` | Search functions by wildcard | `{"pattern":"BAPI_USER_*","max_results":10}` |
+| `GET /api/objects/search?q=X` | Quick search across ALL object types (ADT quick search; term auto-gets a trailing `*`), feeds `ANY /api/adt/:path` | `/api/objects/search?q=BAPIRET2` |
 | `GET /api/functions/:name` | Inspect a function's full interface (parameters/types/direction/nested fields) | `/api/functions/BAPI_USER_GET_DETAIL` |
 | `GET /api/functions/:name/doc` | Read docs (short text + SE37 long doc + parameter descriptions) | `/api/functions/BAPI_USER_GET_DETAIL/doc?lang=EN` |
 | `GET /api/functions/:name/source` | Read a function's ABAP source (how it's implemented); `?prologue=true` appends compact signatures of every `CALL FUNCTION` target | `/api/functions/STFC_CONNECTION/source?prologue=true` |
+| `GET /api/functions/:name/where-used` | Where-used: which programs/function groups call it (needs the SAP usage index; trial systems may return empty) | `/api/functions/BAPI_USER_GETLIST/where-used` |
 | `GET /api/programs/:name/source` | Read program/report/include source | `/api/programs/RSBDCOS0/source` |
 | `POST /api/table/read` | Read transparent-table data (wraps RFC_READ_TABLE) | `{"table":"T000","fields":["MANDT","MTEXT"]}` |
+| `POST /api/table/osql` | OpenSQL SELECT via the ADT data preview — pooled tables & joins that `RFC_READ_TABLE` refuses, no 512-byte row cap | `{"sql":"select mandt, cccategory from t000","rows":10}` |
 | `GET /api/ddic/type/:name` | Query DDIC structure/table field definitions | `/api/ddic/type/BAPIRET2` |
 | `GET /api/ddic/field/:table/:field` | Query field semantics (data element/domain/fixed values) | `/api/ddic/field/BAPIRET2/TYPE` |
 | `GET /api/dumps` | Structured short-dump list (parsed from the ADT Atom feed) | `/api/dumps?limit=50` |
@@ -426,12 +429,19 @@ Fields you don't read (e.g. you didn't pass `table_outputs`) do **not** appear i
 | `PUT /api/objects/:type/:name/source` | Write full source (lock→put→unlock→activate orchestrated in one request; supports `create:true` auto-creation) | `{"source":"REPORT z..."}` |
 | `POST /api/objects/:type/:name/replace` | AI-style unique find-and-replace + activate | `{"old_string":"...","new_string":"..."}` |
 | `POST /api/objects/:type/:name/syntax` | Syntax-check source without writing it | `{"source":"REPORT z..."}` |
+| `GET /api/objects/:type/:name/meta` | exists / locked / active / author of an object **before writing** (one round trip) | `/api/objects/prog/ZFOO/meta` |
 | `ANY /api/adt/:path` | Generic ADT REST proxy (`/sap/bc/adt/**` 1:1): dumps, class sources, anything Eclipse ADT exposes; CSRF handled for write methods | `/api/adt/runtime/dumps` |
 | `POST /api/functions/:name/invoke` | Typed invocation: function name comes from the path, body is structurally identical to `/api/rfc` (no `func_name` needed) | `{"inputs":{"REQUTEXT":"hi"}}` |
-| `GET /openapi.json` | Full OpenAPI 3.0.3 spec of the gateway (public, unauthenticated): 20 endpoints + 33 schemas + auth scheme — feed it to code generators, Postman, or an AI agent's tool registry | `/openapi.json` |
+| `POST /api/abap/run` | Run an ABAP snippet (temp classrun class → activate → execute → auto-delete) | `{"source":"out->write( 'hi' )."}` |
+| `POST /api/tests/aunit` | Run ABAP Unit tests (json / junit4 / raw — CI-ready) | `{"objects":[{"type":"class","name":"ZCL_MINE"}],"format":"json"}` |
+| `POST /api/atc/run` | Run ATC checks (findings as JSON) | `{"objects":[{"type":"class","name":"ZCL_MINE"}]}` |
+| `POST`·`GET`·`DELETE /api/cts/requests…` | Create / read / release / delete CTS transport requests | `/api/cts/requests/A4HK900123` |
+| `GET /api/export/package/:devclass` · `POST /api/import/package/:devclass` | Snapshot a package as an abapGit-style zip / install it back (dependency-ordered, two-phase activation) | `/api/export/package/ZAGT_TEST?manifest=true` |
+| `/api/debug/**` | Remote ABAP debugger: breakpoints / session listen / call stack / **variable read+write** / step-resume (observe-only on read-only systems) — see AGENTS.md §14 | `POST /api/debug/breakpoints` |
+| `GET /openapi.json` | Full OpenAPI 3.0.3 spec of the gateway (public, unauthenticated): 43 paths + 36 schemas + auth scheme — feed it to code generators, Postman, or an AI agent's tool registry | `/openapi.json` |
 | `GET /api/openapi?functions=A,B` | Dynamic spec: generates a typed operation per BAPI from DDIC metadata (params/types/nested fields expanded, targeting `{name}/invoke`; ≤50 per call) | `/api/openapi?functions=BAPI_USER_GETLIST` |
 | `GET /api/functions/:name/where-used` | Where-used list of a function module (REPOSITORY_ENVIRONMENT_SET_RFC; needs the SAP usage index — empty + note on trial systems) | `/api/functions/BAPI_TRANSACTION_COMMIT/where-used` |
-| `POST /mcp` | MCP server (Model Context Protocol): 19 tools for Claude & friends — gateway-info/search/inspect/docs/invoke/source/DDIC/dumps/syntax/where-used/writes. JSON-RPC over stateless Streamable HTTP | `POST /mcp` with `{"method":"tools/list"}` |
+| `POST /mcp` | MCP server (Model Context Protocol): 21 tools for Claude & friends — gateway-info/search/inspect/docs/invoke/source/DDIC/dumps/syntax/where-used/writes/debug. JSON-RPC over stateless Streamable HTTP | `POST /mcp` with `{"method":"tools/list"}` |
 | `POST`·`GET`·`DELETE /api/debug/**` | Remote ABAP debugger (v0.22): breakpoints / session listen / call stack / **variable read+write** / step-over / resume — no Eclipse needed; observe-only on read-only systems. See AGENTS.md §14 | `POST /api/debug/breakpoints` |
 | `GET /docs` | Interactive API docs (Redoc rendering of `/openapi.json`) | `/docs` |
 

@@ -8,7 +8,7 @@
 - **技术栈**：Rust（标准库 FFI 直连 `sapnwrfc.dll`）+ axum + tokio + serde
 - **零 SDK 依赖客户端**：调用方只要会发 HTTP POST
 - **通用接口**：一个端点 `/api/rfc` 描述任意 BAPI，无需为每个 BAPI 写代码
-- **面向 AI**：16 个元数据端点（自描述/搜函数/查接口/查文档/看源码/读透明表/查数据字典/排查短转储/**修改 ABAP 代码**），Agent 能自服务探索与操作。给 AI 的操作指南见 [`AGENTS.md`](./AGENTS.md)
+- **面向 AI**：40+ 元数据与操作端点——自描述、函数/全对象搜索、接口/文档/源码/where-used、透明表+OpenSQL、数据字典语义、短转储排查、**ABAP 代码编辑编排**（create/replace/syntax/meta）、abap/run、测试/ATC、CTS 传输、包导出/导入、远程调试（断点/栈/变量读写/单步）——Agent 能自服务探索与操作。给 AI 的操作指南见 [`AGENTS.md`](./AGENTS.md)
 
 ![网关 Web 首页：粘贴给 AI 的 agents.md 链接、连通性测试与端点列表](docs/images/demo.jpg)
 
@@ -406,17 +406,20 @@ curl -H "Authorization: Bearer $SAP_API_KEY" \
 
 ### 3.3 面向 AI 的元数据 API
 
-16 个端点让 AI/Agent 自服务地发现函数、理解参数、查数据字典、读文档、看源码、读表数据、排查短转储、**修改代码**。典型工作流：**自描述（`/api/version`）→ 搜索 → 查接口 → 查文档 → 看源码 → 调用**。给 AI 的完整操作指南见 [`AGENTS.md`](./AGENTS.md)。
+AI/Agent 自服务面：发现函数、理解参数、查数据字典、读文档、看源码、读表数据、排查短转储、**修改代码**、运行/测试/检查代码、远程调试。典型工作流：**自描述（`/api/version`）→ 搜索 → 查接口 → 查文档 → 看源码 → 调用**。给 AI 的完整操作指南见 [`AGENTS.md`](./AGENTS.md)；下表是核心速查。
 
 | 端点 | 用途 | 示例 |
 |------|------|------|
 | `GET /api/version` | 开局先自描述：版本/commit + 能力开关（鉴权/只读/ADT/限流）+ SAP sysid/release（公开、缓存） | `/api/version` |
 | `POST /api/functions/search` | 按通配符搜索函数 | `{"pattern":"BAPI_USER_*","max_results":10}` |
+| `GET /api/objects/search?q=X` | 全对象类型快速搜索（ADT quick search；词尾自动补 `*`），结果可直接喂 `ANY /api/adt/:path` | `/api/objects/search?q=BAPIRET2` |
 | `GET /api/functions/:name` | 查函数完整接口（参数/类型/方向/嵌套字段） | `/api/functions/BAPI_USER_GET_DETAIL` |
 | `GET /api/functions/:name/doc` | 查文档（短文本+SE37长文档+参数说明） | `/api/functions/BAPI_USER_GET_DETAIL/doc?lang=EN` |
 | `GET /api/functions/:name/source` | 读函数 ABAP 源码（怎么实现的）；`?prologue=true` 附带所调 `CALL FUNCTION` 目标的紧凑签名 | `/api/functions/STFC_CONNECTION/source?prologue=true` |
+| `GET /api/functions/:name/where-used` | 谁在调用：哪些程序/函数组引用了它（需要 SAP 使用索引；试用系统可能为空） | `/api/functions/BAPI_USER_GETLIST/where-used` |
 | `GET /api/programs/:name/source` | 读程序/报表/include 源码 | `/api/programs/RSBDCOS0/source` |
 | `POST /api/table/read` | 读透明表数据（封装 RFC_READ_TABLE） | `{"table":"T000","fields":["MANDT","MTEXT"]}` |
+| `POST /api/table/osql` | OpenSQL SELECT 走 ADT 数据预览——`RFC_READ_TABLE` 拒读的池表/JOIN 都能查，无 512 字节行上限 | `{"sql":"select mandt, cccategory from t000","rows":10}` |
 | `GET /api/ddic/type/:name` | 查 DDIC 结构/表字段定义 | `/api/ddic/type/BAPIRET2` |
 | `GET /api/ddic/field/:table/:field` | 查字段语义（数据元素/域/固定值） | `/api/ddic/field/BAPIRET2/TYPE` |
 | `GET /api/dumps` | 短转储结构化列表（解析自 ADT Atom feed） | `/api/dumps?limit=50` |
@@ -426,12 +429,19 @@ curl -H "Authorization: Bearer $SAP_API_KEY" \
 | `PUT /api/objects/:type/:name/source` | 全量写源码（锁→写→解锁→激活一体；支持 `create:true` 自动创建） | `{"source":"REPORT z..."}` |
 | `POST /api/objects/:type/:name/replace` | AI 式唯一匹配查找替换 + 激活（匹配容忍阶梯：精确 → CRLF 归一 → 末行 \n 修剪 → 大小写不敏感唯一匹配） | `{"old_string":"...","new_string":"..."}` |
 | `POST /api/objects/:type/:name/syntax` | 语法检查（不写库，源码内嵌提交） | `{"source":"REPORT z..."}` |
+| `GET /api/objects/:type/:name/meta` | 写入前探查 exists / locked / active / author（一次往返） | `/api/objects/prog/ZFOO/meta` |
 | `ANY /api/adt/:path` | ADT REST 通用代理（1:1 透传 `/sap/bc/adt/**`）：dump 正文、类源码等 Eclipse ADT 暴露的一切资源；写方法 CSRF 自动处理 | `/api/adt/runtime/dumps` |
 | `POST /api/functions/:name/invoke` | 类型化调用：函数名来自路径，请求体与 `/api/rfc` 同构（免填 `func_name`） | `{"inputs":{"REQUTEXT":"hi"}}` |
-| `GET /openapi.json` | 全网关 OpenAPI 3.0.3 规范（免鉴权公开页）：20 端点 + 33 schema + 认证方案，喂给代码生成器 / Postman / Agent 工具注册表 | `/openapi.json` |
+| `POST /api/abap/run` | 跑一段 ABAP（临时 classrun 类 → 激活 → 执行 → 自动删除） | `{"source":"out->write( 'hi' )."}` |
+| `POST /api/tests/aunit` | 跑 ABAP Unit 测试（json / junit4 / raw——可直接接 CI） | `{"objects":[{"type":"class","name":"ZCL_MINE"}],"format":"json"}` |
+| `POST /api/atc/run` | 跑 ATC 检查（发现项 JSON） | `{"objects":[{"type":"class","name":"ZCL_MINE"}]}` |
+| `POST`·`GET`·`DELETE /api/cts/requests…` | 创建 / 读取 / 释放 / 删除 CTS 传输请求 | `/api/cts/requests/A4HK900123` |
+| `GET /api/export/package/:devclass` · `POST /api/import/package/:devclass` | 包快照为 abapGit 风格 zip / 装回系统（依赖有序、两阶段激活） | `/api/export/package/ZAGT_TEST?manifest=true` |
+| `/api/debug/**` | 远程 ABAP 调试器：断点 / 会话监听 / 调用栈 / **变量读写** / 单步放行（只读系统可观察）——详见 AGENTS.zh-CN.md §14 | `POST /api/debug/breakpoints` |
+| `GET /openapi.json` | 全网关 OpenAPI 3.0.3 规范（免鉴权公开页）：43 路径 + 36 schema + 认证方案，喂给代码生成器 / Postman / Agent 工具注册表 | `/openapi.json` |
 | `GET /api/openapi?functions=A,B` | 动态规范：按 `functions` 列表从 DDIC 元数据为每个 BAPI 生成类型化 operation（参数/类型/嵌套字段全展开，指向 `{name}/invoke`；一次 ≤50 个） | `/api/openapi?functions=BAPI_USER_GETLIST` |
 | `GET /api/functions/:name/where-used` | 函数被谁使用（REPOSITORY_ENVIRONMENT_SET_RFC；依赖 SAP 使用索引——trial 系统返回空 + note） | `/api/functions/BAPI_TRANSACTION_COMMIT/where-used` |
-| `POST /mcp` | MCP 服务器（Model Context Protocol）：19 个工具面向 Claude 等 Agent——网关自描述/搜索/接口/文档/调用/源码/DDIC/转储/语法/引用/写入。无状态 Streamable HTTP 上的 JSON-RPC | `POST /mcp`，body `{"method":"tools/list"}` |
+| `POST /mcp` | MCP 服务器（Model Context Protocol）：21 个工具面向 Claude 等 Agent——网关自描述/搜索/接口/文档/调用/源码/DDIC/转储/语法/引用/写入/调试。无状态 Streamable HTTP 上的 JSON-RPC | `POST /mcp`，body `{"method":"tools/list"}` |
 | `POST`·`GET`·`DELETE /api/debug/**` | 远程 ABAP 调试器（v0.22）：断点 / 会话监听 / 调用栈 / **变量读写** / 单步 / 放行——无需 Eclipse；只读系统可观察。详见 AGENTS.zh-CN.md §14 | `POST /api/debug/breakpoints` |
 | `GET /docs` | 交互式 API 文档（Redoc 渲染 `/openapi.json`） | `/docs` |
 
