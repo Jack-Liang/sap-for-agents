@@ -432,6 +432,7 @@ curl -H "Authorization: Bearer $SAP_API_KEY" \
 | `GET /api/openapi?functions=A,B` | 动态规范：按 `functions` 列表从 DDIC 元数据为每个 BAPI 生成类型化 operation（参数/类型/嵌套字段全展开，指向 `{name}/invoke`；一次 ≤50 个） | `/api/openapi?functions=BAPI_USER_GETLIST` |
 | `GET /api/functions/:name/where-used` | 函数被谁使用（REPOSITORY_ENVIRONMENT_SET_RFC；依赖 SAP 使用索引——trial 系统返回空 + note） | `/api/functions/BAPI_TRANSACTION_COMMIT/where-used` |
 | `POST /mcp` | MCP 服务器（Model Context Protocol）：19 个工具面向 Claude 等 Agent——网关自描述/搜索/接口/文档/调用/源码/DDIC/转储/语法/引用/写入。无状态 Streamable HTTP 上的 JSON-RPC | `POST /mcp`，body `{"method":"tools/list"}` |
+| `POST`·`GET`·`DELETE /api/debug/**` | 远程 ABAP 调试器（v0.22）：断点 / 会话监听 / 调用栈 / **变量读写** / 单步 / 放行——无需 Eclipse；只读系统可观察。详见 AGENTS.zh-CN.md §14 | `POST /api/debug/breakpoints` |
 | `GET /docs` | 交互式 API 文档（Redoc 渲染 `/openapi.json`） | `/docs` |
 
 端到端示例（列出用户）：

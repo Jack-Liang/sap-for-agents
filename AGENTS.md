@@ -741,6 +741,61 @@ Notes:
 - Startup hygiene: world-readable config with plaintext credentials (non-`${VAR}` values under auth) logs a WARN suggesting `chmod 600` / `${VAR}` form.
 - ⚠️ **Config breaking change (v0.21)**: flat `user`/`passwd`/`mysapsso2`/`snc_*`/`adt_user`/`adt_passwd`/`adt_cert`… fields are gone — migrate to `auth.*` / `adt.*` blocks (structure above).
 
+### 14. ABAP debugger (v0.22): breakpoints / step / variables
+
+Remote ABAP debugging through the gateway's own stateful ADT channel — no Eclipse needed. Workflow: **set breakpoint → start session (listen) → trigger same-user code → poll → inspect → step/resume → close**.
+
+| Goal | Endpoint |
+|------|----------|
+| Set breakpoints (no session needed; whole-set replace) | `POST /api/debug/breakpoints` |
+| List breakpoints | `GET /api/debug/breakpoints` |
+| Delete one / clear all | `DELETE /api/debug/breakpoints/{id}` · `DELETE /api/debug/breakpoints?all=true` |
+| Start session (listen runs server-side; agent polls) | `POST /api/debug/sessions` |
+| Poll status | `GET /api/debug/sessions/{sid}` |
+| Call stack | `GET /api/debug/sessions/{sid}/stack` |
+| Variables (auto-descends `@ROOT`→`@LOCALS`; `?parent=ID` expands structures/tables) | `GET /api/debug/sessions/{sid}/variables` |
+| **Write variable** (read_only systems: 403) | `PUT /api/debug/sessions/{sid}/variables/{name}` |
+| Step / resume (`step_into`/`step_over`/`step_out`/`resume`) | `POST /api/debug/sessions/{sid}/control` |
+| Close (detach + remove listener + clear breakpoints) | `DELETE /api/debug/sessions/{sid}` |
+
+```bash
+# 1) Breakpoint first — targets: kind=prog/class/fm (+group) or kind=uri; names are
+#    lowercased automatically (the breakpoint URI-mapper is case-sensitive)
+curl -X POST http://127.0.0.1:3000/api/debug/breakpoints -H "Content-Type: application/json" \
+  -d '{"targets":[{"kind":"class","name":"ZCL_MINE","line":42}]}'
+
+# 2) Session: server blocks on the ADT listener (listen_secs is also the debuggee's
+#    wait window); agent polls GET /api/debug/sessions/{sid}
+curl -X POST http://127.0.0.1:3000/api/debug/sessions -H "Content-Type: application/json" \
+  -d '{"listen_secs":60,"system_debug":false}'
+# → 202 {"sid":"dbg-…","state":"listening"}
+
+# 3) Trigger the same user's code (gateway user = breakpoint owner):
+#    /api/abap/run (fresh session — ideal) or /api/rfc
+
+# 4) Poll → state "stopped" → stack / variables → step/resume → close
+curl http://127.0.0.1:3000/api/debug/sessions/{sid}            # {"state":"stopped","position":{...}}
+curl http://127.0.0.1:3000/api/debug/sessions/{sid}/stack
+curl http://127.0.0.1:3000/api/debug/sessions/{sid}/variables   # LV_X=1 → PUT 99 → step_over → 100
+curl -X PUT http://127.0.0.1:3000/api/debug/sessions/{sid}/variables/LV_X \
+  -H "Content-Type: application/json" -d '{"value":"99"}'
+curl -X POST http://127.0.0.1:3000/api/debug/sessions/{sid}/control \
+  -H "Content-Type: application/json" -d '{"action":"step_over"}'   # or "resume"
+curl -X DELETE http://127.0.0.1:3000/api/debug/sessions/{sid}
+```
+
+Key behaviors (all verified on A4H/816, see `docs/DEBUGGER-CONTRACT.zh-CN.md`):
+
+- **Debugger and debuggee are separate sessions** — triggering via `/api/abap/run` is ideal (it forces a fresh session). Polling reads in-memory state: zero SAP round trips.
+- **`DELETE /api/debug/sessions/{sid}` ends external debugging for the gateway user and wipes ALL of the user's external breakpoints** — that is SAP semantics, not a choice. It is also the cleanup lever: a stale listener or breakpoints can be cleared with `DELETE /api/debug/breakpoints?all=true` or by closing the session.
+- **An external breakpoint with no listening session is skipped, never hangs** the trigger. A stopped debuggee waits ≈ `listen_secs`, then continues on its own.
+- **One session per system** (debugging holds a work process): second `POST` → `409 DEBUG_SESSION_EXISTS`. Session idle > 30 min is torn down automatically.
+- **resume ends with `ended: true`** (`debuggeeEnded`) — that is the normal terminal state, not an error.
+- **read_only grading**: observe (listen/stack/variables read/step) works on read-only systems; only variable writes get `403 READ_ONLY`.
+- `system_debug: true` arms breakpoints in SAP standard code (without it they are accepted but never fire). Line targets without a statement come back in `rejected[]` with SAP's reason.
+- Capability flag: `GET /api/version` → `capabilities.debug`. Multi-system scope applies (`/api/s/{system}/debug/**`); the scoped `DELETE …/sessions/{sid}` still verifies sid ownership.
+- MCP mirror tools are planned for a follow-up; the REST surface is complete.
+
 ## Key constraints (pitfalls to avoid)
 
 1. **Parameter names must be uppercase**: SAP parameter names are case-sensitive; in JSON always use uppercase (e.g. `USERNAME`, not `username`).
@@ -754,7 +809,7 @@ Notes:
 9. **Calls have timeouts**: a single SAP call times out after 60s by default (configurable via `SAP_REQUEST_TIMEOUT_SECS`); timeout returns `504`. `/api/rfc` accepts a per-request `timeout_secs` in the body to override it (relax it for slow endpoints like batch BAPIs or large table queries).
 10. **Rate limiting**: when `SAP_RATE_LIMIT_RPS` is set, `/api` is rate-limited per caller IP; exceeding the limit returns `429` (`key=RATE_LIMITED`). No rate limit by default.
 11. **Source endpoints fall back to ADT automatically**: `/api/functions/{name}/source` and `/api/programs/{name}/source` try the RFC path (`RPY_FUNCTIONMODULE_READ` / `RPY_PROGRAM_READ`) first; on failure (except NOT_FOUND) they re-read via ADT. The response's `source_via` field says which channel served it (`rfc` / `adt`). This matters because sources with lines wider than 72 chars (common in modern ABAP) fail the RPY path on some systems.
-12. **Activation failure is not an HTTP error**: write endpoints return 200 with `activated.success=false` + `problems[]` when SAP refuses to activate — always check `activated` in the response body.
+12. **Activation failure is not an HTTP error**: write endpoints return 200 with `activated.success=false` + `problems[]` when SAP refuses to activate — always check `activated` in the response body. Table/structure writes additionally **cross-check activation against the full inactive-objects list** (`GET /sap/bc/adt/activation/inactiveobjects`) after SAP reports success: SAP can answer an activation with 200 and no messages while leaving only the inactive version in DD02L (observed on append structures) — such a false success is downgraded to `activated.success=false` with a problem line. If the list itself can't be read (older releases without the endpoint), the result stays as reported and a warning notes the unverified activation.
 13. **FM signature lives in the source (SEDI form)**: modern ADT systems store a function module's parameter signature **inline in the FUNCTION statement** — `FUNCTION zfm IMPORTING VALUE(iv) TYPE i EXPORTING VALUE(ev) TYPE i.` — and **reject** the classic `*" IMPORTING ...` comment block (400 "Parameter comment blocks are not allowed"). The gateway converts classic blocks automatically on write, and the RFC read endpoint (`/api/functions/{n}/source`) still shows the classic form — prefer `GET /api/objects/func/{n}/source` (ADT form) when doing read-modify-write. Signature changes **do** register in the FM interface — **except** for modules that are (or ever were) `rfc_enabled`: those keep a frozen interface (SAP ignores source-level signature changes); delete + recreate to change them. After such a change, interface reads are immediately fresh, and since v0.18.1 **invoking** works immediately too — the write hook drops the SDK's stale descriptor entry. Only a signature changed outside the gateway (SE37) can leave the SDK stale until `POST /api/admin/reload` — the `409 SIGNATURE_STALE` (flat port) or the `/api/rfc` parameter error will point there; no process restart is ever required for signature changes.
 
 ## Typical task example

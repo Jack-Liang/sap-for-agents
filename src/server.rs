@@ -213,6 +213,14 @@ fn is_read_only_blocked(method: &axum::http::Method, uri: &axum::http::Uri) -> b
     if path.contains("/cts/") && *method != axum::http::Method::GET {
         return true;
     }
+    // 调试面（v0.22）read_only 分级：观察类（listen/栈/变量读/步进）放行——只读
+    // 系统也能排障；仅变量写拦（改值会改变真实执行走向）
+    if *method == axum::http::Method::PUT
+        && path.contains("/debug/sessions/")
+        && path.contains("/variables/")
+    {
+        return true;
+    }
     false
 }
 
@@ -478,6 +486,9 @@ pub fn app(state: SharedState) -> Router {
         .merge(crate::cts::router())
         .merge(crate::run::router())
         .merge(crate::checks::router())
+        // 远程 ABAP 调试面（v0.22）：断点/listen/栈/变量读写/步进。
+        // read_only 分级：观察类放行，仅变量写被只读守卫拦（见 is_read_only_blocked）
+        .merge(crate::debug::router())
         // ABAP 对象写入编排（锁→写→解锁→激活一体；replace/syntax 见 dispatcher）
         .route(
             "/api/objects/{*path}",

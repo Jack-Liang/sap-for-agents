@@ -426,9 +426,14 @@ impl AdtEndpoint {
         })
     }
 
+    /// HTTP 客户端（debug_session 复用；单请求超时可在 RequestBuilder 上覆盖）。
+    pub(crate) fn http(&self) -> &reqwest::Client {
+        &self.client
+    }
+
     /// 当前鉴权对应的 `Authorization` 头值（Sso2 返回 None——身份在 Cookie 里；
     /// OAuth 取缓存 token，必要时先发 grant）。
-    async fn auth_header(&self) -> Result<Option<String>, RfcError> {
+    pub(crate) async fn auth_header(&self) -> Result<Option<String>, RfcError> {
         match &self.auth {
             AuthState::Basic(h) => Ok(Some(h.clone())),
             AuthState::Sso2(_) | AuthState::Plugin(..) => Ok(None),
@@ -437,7 +442,7 @@ impl AdtEndpoint {
     }
 
     /// SSO2 票据 Cookie 串（非 Sso2 形态恒 None）。
-    fn sso2_cookie(&self) -> Option<String> {
+    pub(crate) fn sso2_cookie(&self) -> Option<String> {
         match &self.auth {
             AuthState::Sso2(ticket) => Some(format!("MYSAPSSO2={ticket}")),
             _ => None,
@@ -486,7 +491,7 @@ impl AdtEndpoint {
     }
 
     /// 插件产物 → (额外请求头, 额外 Cookie 串)。非 Plugin 形态返回空。
-    async fn plugin_extras(&self) -> Result<(Vec<(String, String)>, Option<String>), RfcError> {
+    pub(crate) async fn plugin_extras(&self) -> Result<(Vec<(String, String)>, Option<String>), RfcError> {
         if !matches!(self.auth, AuthState::Plugin(..)) {
             return Ok((Vec::new(), None));
         }
@@ -1416,7 +1421,7 @@ fn percent_decode(s: &str) -> Result<Vec<u8>, RfcError> {
 
 /// 校验原始（percent-encoded）路径：解码后拒绝 `..` 段与控制字符。
 /// 返回原样路径供转发。
-fn validate_raw_path(raw: &str) -> Result<&str, RfcError> {
+pub(crate) fn validate_raw_path(raw: &str) -> Result<&str, RfcError> {
     let bad = |msg: &str| RfcError {
         code: -1,
         status: 400,

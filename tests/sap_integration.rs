@@ -2868,3 +2868,197 @@ fn cts_invalid_number_rejected() {
         .unwrap();
     assert_eq!(resp.status(), 400);
 }
+
+// ========================================================================
+// 远程 ABAP 调试面（v0.22）：全闭环——断点→触发→命中→栈→变量读写→步进→放行
+// ========================================================================
+
+/// 端到端调试闭环（P2 验收）：
+/// 建测试类 → 设断点（临时通道，会话前） → 建会话（listen） → abap/run 触发
+/// → 轮询至 stopped → 栈 → 读 LV_X=1 → 写 99 → 步过 → 读 100 → resume
+/// → 触发方完成 → 关会话 → 断点被摘 listener 连带清空。
+#[test]
+#[ignore]
+fn debug_session_full_loop() {
+    let s = start_server();
+    let c = http_client();
+    let base = s.base_url.clone();
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let cls = format!("ZDBGIT{}", &stamp.to_string()[10..16]); // ≤30 字符
+    let cls_lower = cls.to_lowercase();
+
+    // 1) 建测试类（行号固定：run 方法里 lv_x = lv_x + 1 在第 12 行）
+    let src = format!(
+        "CLASS {cls_lower} DEFINITION PUBLIC FINAL CREATE PUBLIC.\n  PUBLIC SECTION.\n    INTERFACES if_oo_adt_classrun.\n    CLASS-METHODS run.\nENDCLASS.\nCLASS {cls_lower} IMPLEMENTATION.\n  METHOD if_oo_adt_classrun~main.\n    out->write( 'main' ).\n  ENDMETHOD.\n  METHOD run.\n    DATA(lv_x) = 1.\n    lv_x = lv_x + 1.\n  ENDMETHOD.\nENDCLASS."
+    );
+    let r = c
+        .post(format!("{base}/api/objects/class/{cls}/create"))
+        .json(&serde_json::json!({"description": "v0.22 debug integration probe", "source": src}))
+        .send()
+        .unwrap();
+    assert_eq!(r.status(), 200, "建类失败: {}", r.text().unwrap());
+    let created: serde_json::Value = serde_json::from_str(&{
+        // 重新取响应体（上面 text 已消费）——改发一次 meta 确认激活
+        let m = c
+            .get(format!("{base}/api/objects/class/{cls}/meta"))
+            .send()
+            .unwrap();
+        m.text().unwrap()
+    })
+    .unwrap();
+    assert_eq!(created["active"], true, "测试类应已激活");
+
+    // 2) 设断点（会话不存在也能设——断点是用户态身份，P0 实证）
+    let r = c
+        .post(format!("{base}/api/debug/breakpoints"))
+        .json(&serde_json::json!({
+            "targets": [{"kind": "class", "name": cls, "line": 12}]
+        }))
+        .send()
+        .unwrap();
+    assert_eq!(r.status(), 200, "设断点失败: {}", r.text().unwrap());
+    let bp: serde_json::Value = r.json().unwrap();
+    assert_eq!(bp["count"], 1, "断点应落位: {bp}");
+    assert!(!bp["breakpoints"][0]["id"].as_str().unwrap_or("").is_empty(), "断点应有 id");
+
+    // 3) 建会话（listen 30s；也是 debuggee 的等待窗）
+    let r = c
+        .post(format!("{base}/api/debug/sessions"))
+        .json(&serde_json::json!({"listen_secs": 30}))
+        .send()
+        .unwrap();
+    assert_eq!(r.status(), 202, "建会话失败: {}", r.text().unwrap());
+    let sess: serde_json::Value = r.json().unwrap();
+    let sid = sess["sid"].as_str().unwrap().to_string();
+
+    // 4) 后台触发（阻塞至 debug 结束）
+    let trig_base = base.clone();
+    let trigger = std::thread::spawn(move || {
+        let long = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(90))
+            .build()
+            .unwrap();
+        long.post(format!("{trig_base}/api/abap/run"))
+            .json(&serde_json::json!({"source": format!("{cls_lower}=>run( ).")}))
+            .send()
+            .unwrap()
+            .json::<serde_json::Value>()
+            .unwrap()
+    });
+
+    // 5) 轮询状态至 stopped（最长 25s）
+    let deadline = Instant::now() + Duration::from_secs(25);
+    let mut status = serde_json::Value::Null;
+    loop {
+        assert!(Instant::now() < deadline, "25s 内未命中断点（state={status}）");
+        status = c
+            .get(format!("{base}/api/debug/sessions/{sid}"))
+            .send()
+            .unwrap()
+            .json()
+            .unwrap();
+        if status["state"] == "stopped" {
+            break;
+        }
+        assert_eq!(status["state"], "listening", "意外状态: {status}");
+        std::thread::sleep(Duration::from_millis(400));
+    }
+    assert_eq!(status["position"]["line"], 12, "命中位置应为断点行: {status}");
+
+    // 6) 栈：帧 0 = 测试类 run 方法
+    let r = c
+        .get(format!("{base}/api/debug/sessions/{sid}/stack"))
+        .send()
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let stack: serde_json::Value = r.json().unwrap();
+    assert_eq!(stack["frames"][0]["line"], 12);
+
+    // 7) 变量：LV_X == "1"
+    let r = c
+        .get(format!("{base}/api/debug/sessions/{sid}/variables"))
+        .send()
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let vars: serde_json::Value = r.json().unwrap();
+    let lvx = vars["variables"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|v| v["name"] == "LV_X")
+        .expect("本地变量应含 LV_X")
+        .clone();
+    assert_eq!(lvx["value"].as_str().unwrap().trim(), "1", "步进前 LV_X 应为 1");
+
+    // 8) 写变量 99（写后回读确认）
+    let r = c
+        .put(format!("{base}/api/debug/sessions/{sid}/variables/LV_X"))
+        .json(&serde_json::json!({"value": "99"}))
+        .send()
+        .unwrap();
+    assert_eq!(r.status(), 200, "写变量失败: {}", r.text().unwrap());
+    let w: serde_json::Value = r.json().unwrap();
+    assert_eq!(w["confirmed"].as_str().unwrap().trim(), "99");
+
+    // 9) 步过（lv_x = lv_x + 1 → 100）
+    let r = c
+        .post(format!("{base}/api/debug/sessions/{sid}/control"))
+        .json(&serde_json::json!({"action": "step_over"}))
+        .send()
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let st: serde_json::Value = r.json().unwrap();
+    assert_eq!(st["state"], "stopped");
+    assert_eq!(st["position"]["line"], 13, "步过后应到第 13 行");
+
+    // 10) 验证步进 + 写值的联合效果
+    let r = c
+        .get(format!("{base}/api/debug/sessions/{sid}/variables"))
+        .send()
+        .unwrap();
+    let vars: serde_json::Value = r.json().unwrap();
+    let lvx = vars["variables"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|v| v["name"] == "LV_X")
+        .expect("LV_X 仍在");
+    assert_eq!(lvx["value"].as_str().unwrap().trim(), "100", "99 + 1 = 100（写入真实生效）");
+
+    // 11) 放行（debuggee 结束）
+    let r = c
+        .post(format!("{base}/api/debug/sessions/{sid}/control"))
+        .json(&serde_json::json!({"action": "resume"}))
+        .send()
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let fin: serde_json::Value = r.json().unwrap();
+    assert_eq!(fin["ended"], true, "resume 应结束 debuggee: {fin}");
+
+    // 12) 触发方正常返回
+    let out = trigger.join().unwrap();
+    assert_eq!(out["ok"], true, "触发方应完成: {out}");
+
+    // 13) 关会话（detach + 摘 listener——连带清该用户全部外部断点）
+    let r = c
+        .delete(format!("{base}/api/debug/sessions/{sid}"))
+        .send()
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let closed: serde_json::Value = r.json().unwrap();
+    assert_eq!(closed["closed"], true);
+
+    // 14) 断点台账已被连带清空（SAP 语义实证）
+    let r = c
+        .get(format!("{base}/api/debug/breakpoints"))
+        .send()
+        .unwrap();
+    let bps: serde_json::Value = r.json().unwrap();
+    assert_eq!(bps["count"], 0, "摘 listener 后断点应为空: {bps}");
+
+    // 15) 清理测试类
+    let _ = c.delete(format!("{base}/api/objects/class/{cls}")).send();
+}

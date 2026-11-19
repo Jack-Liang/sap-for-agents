@@ -184,6 +184,8 @@ pub fn local_info() -> Value {
             "read_only": crate::server::read_only_active(),
             // true = 默认系统 ADT 代理可用（ADT 代理与 dumps 端点按系统启用）
             "adt": crate::adt::capabilities_adt_enabled(),
+            // true = 默认系统可调试（/api/debug/**——断点/栈/变量/步进，按系统继承 ADT）
+            "debug": crate::debug::capabilities_debug_enabled(),
             // true = API 注册表已启用（GET /api/registry；Agent 跨会话记忆）
             "registry": crate::registry::is_enabled(),
             // 基础开关（SAP_SETUP=off → false）；「已配置后锁定」的最终值由
@@ -374,7 +376,7 @@ mod tests {
         assert_eq!(v["version"], env!("CARGO_PKG_VERSION"));
         assert!(!v["commit"].as_str().unwrap().is_empty(), "commit 必有值");
         // 五个能力开关字段都在，且类型正确（rate_limit_rps 可为 null）
-        for key in ["auth", "read_only", "adt", "registry"] {
+        for key in ["auth", "read_only", "adt", "debug", "registry"] {
             assert!(
                 v["capabilities"][key].is_boolean(),
                 "capabilities.{key} 应为布尔"

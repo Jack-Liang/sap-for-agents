@@ -432,6 +432,7 @@ Fields you don't read (e.g. you didn't pass `table_outputs`) do **not** appear i
 | `GET /api/openapi?functions=A,B` | Dynamic spec: generates a typed operation per BAPI from DDIC metadata (params/types/nested fields expanded, targeting `{name}/invoke`; ≤50 per call) | `/api/openapi?functions=BAPI_USER_GETLIST` |
 | `GET /api/functions/:name/where-used` | Where-used list of a function module (REPOSITORY_ENVIRONMENT_SET_RFC; needs the SAP usage index — empty + note on trial systems) | `/api/functions/BAPI_TRANSACTION_COMMIT/where-used` |
 | `POST /mcp` | MCP server (Model Context Protocol): 19 tools for Claude & friends — gateway-info/search/inspect/docs/invoke/source/DDIC/dumps/syntax/where-used/writes. JSON-RPC over stateless Streamable HTTP | `POST /mcp` with `{"method":"tools/list"}` |
+| `POST`·`GET`·`DELETE /api/debug/**` | Remote ABAP debugger (v0.22): breakpoints / session listen / call stack / **variable read+write** / step-over / resume — no Eclipse needed; observe-only on read-only systems. See AGENTS.md §14 | `POST /api/debug/breakpoints` |
 | `GET /docs` | Interactive API docs (Redoc rendering of `/openapi.json`) | `/docs` |
 
 End-to-end example (list users):

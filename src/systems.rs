@@ -772,8 +772,8 @@ pub struct SystemHandle {
     pub name: String,
     /// 该系统的连接池（默认系统急切建首连；其余惰性）
     pub pool: Arc<RfcConnectionPool>,
-    /// 该系统的 ADT 端点（None = 未启用）
-    pub adt: Option<crate::adt::AdtEndpoint>,
+    /// 该系统的 ADT 端点（None = 未启用；Arc 共享——debug 会话持有独立引用计数）
+    pub adt: Option<Arc<crate::adt::AdtEndpoint>>,
     /// 该系统的函数/DDIC 元数据缓存（按系统实例化，防跨系统同名污染）
     pub meta: crate::metadata::MetadataCache,
     /// 该系统只读（写端点 403）
@@ -1153,7 +1153,7 @@ fn conn_param(params: &[(&'static str, String)], key: &str) -> Option<String> {
 /// 组装该系统的 ADT 端点：
 /// 显式空串 = 禁用；未配置 = 按该系统 ashost 推导（MSHOST 形态无法推导 → 禁用）；
 /// 认证默认同该系统连接的 USER/PASSWD。
-fn build_adt(spec: &SystemSpec, timeout: Duration) -> Option<crate::adt::AdtEndpoint> {
+fn build_adt(spec: &SystemSpec, timeout: Duration) -> Option<Arc<crate::adt::AdtEndpoint>> {
     let adt_cfg = spec.adt.as_ref();
 
     // 基地址：显式 > ashost 推导；"" = 显式禁用
@@ -1228,7 +1228,7 @@ fn build_adt(spec: &SystemSpec, timeout: Duration) -> Option<crate::adt::AdtEndp
         responsible = %responsible,
         "ADT 代理已启用（/api/adt/**）"
     );
-    Some(ep)
+    Some(Arc::new(ep))
 }
 
 /// 组装单个系统运行句柄（启动装配与 setup 热加载共用）。

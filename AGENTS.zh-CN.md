@@ -731,6 +731,61 @@ client_secret = "${SAP_BTP_SECRET}"
 - 启动期卫生：world-readable 配置含明文凭据（auth 下非 `${VAR}` 值）打 WARN 建议 `chmod 600` / `${VAR}` 形态。
 - ⚠️ **配置破坏性变更（v0.21）**：平铺 `user`/`passwd`/`mysapsso2`/`snc_*`/`adt_user`/`adt_passwd`/`adt_cert`… 字段全部移除——迁移到 `auth.*` / `adt.*` 块（形态见上）。
 
+### 14. ABAP 调试器（v0.22）：断点 / 单步 / 变量
+
+经网关自有有状态 ADT 通道做远程 ABAP 调试——不需要 Eclipse。流程：**设断点 → 建会话（listen）→ 触发同用户代码 → 轮询 → 检视 → 步进/放行 → 关会话**。
+
+| 目标 | 端点 |
+|------|------|
+| 设断点（无需会话；整集合替换语义） | `POST /api/debug/breakpoints` |
+| 列断点 | `GET /api/debug/breakpoints` |
+| 删一个 / 清全部 | `DELETE /api/debug/breakpoints/{id}` · `DELETE /api/debug/breakpoints?all=true` |
+| 建会话（listen 在服务端阻塞；agent 轮询） | `POST /api/debug/sessions` |
+| 轮询状态 | `GET /api/debug/sessions/{sid}` |
+| 调用栈 | `GET /api/debug/sessions/{sid}/stack` |
+| 变量（自动下探 `@ROOT`→`@LOCALS`；`?parent=ID` 展开结构/内表） | `GET /api/debug/sessions/{sid}/variables` |
+| **写变量**（只读系统 403） | `PUT /api/debug/sessions/{sid}/variables/{name}` |
+| 步进/放行（`step_into`/`step_over`/`step_out`/`resume`） | `POST /api/debug/sessions/{sid}/control` |
+| 关会话（detach + 摘 listener + 清断点） | `DELETE /api/debug/sessions/{sid}` |
+
+```bash
+# 1) 先设断点——targets: kind=prog/class/fm(+group) 或 kind=uri；name 自动小写化
+#    （断点 URI-mapping 大小写敏感）
+curl -X POST http://127.0.0.1:3000/api/debug/breakpoints -H "Content-Type: application/json" \
+  -d '{"targets":[{"kind":"class","name":"ZCL_MINE","line":42}]}'
+
+# 2) 建会话：服务端阻塞等 ADT listener（listen_secs 同时是 debuggee 的等待窗）；
+#    agent 轮询 GET /api/debug/sessions/{sid}
+curl -X POST http://127.0.0.1:3000/api/debug/sessions -H "Content-Type: application/json" \
+  -d '{"listen_secs":60,"system_debug":false}'
+# → 202 {"sid":"dbg-…","state":"listening"}
+
+# 3) 触发同用户代码（网关用户 = 断点归属用户）：
+#    /api/abap/run（每次强制新会话——最理想）或 /api/rfc
+
+# 4) 轮询 → state=stopped → 栈/变量 → 步进/放行 → 关会话
+curl http://127.0.0.1:3000/api/debug/sessions/{sid}            # {"state":"stopped","position":{...}}
+curl http://127.0.0.1:3000/api/debug/sessions/{sid}/stack
+curl http://127.0.0.1:3000/api/debug/sessions/{sid}/variables   # LV_X=1 → PUT 99 → 步过 → 100
+curl -X PUT http://127.0.0.1:3000/api/debug/sessions/{sid}/variables/LV_X \
+  -H "Content-Type: application/json" -d '{"value":"99"}'
+curl -X POST http://127.0.0.1:3000/api/debug/sessions/{sid}/control \
+  -H "Content-Type: application/json" -d '{"action":"step_over"}'   # 或 "resume"
+curl -X DELETE http://127.0.0.1:3000/api/debug/sessions/{sid}
+```
+
+关键行为（全部在 A4H/816 实测，见 `docs/DEBUGGER-CONTRACT.zh-CN.md`）：
+
+- **调试器与 debuggee 分属两会话**——用 `/api/abap/run` 触发最理想（它每次强制新会话）。状态轮询纯读内存：零 SAP 往返。
+- **`DELETE /api/debug/sessions/{sid}` 会结束该网关用户的外部调试并连带清掉该用户全部外部断点**——这是 SAP 语义，不是可选项。它同时是清场手段：残留监听/断点用 `DELETE /api/debug/breakpoints?all=true` 或关会话清掉。
+- **外部断点没有监听会话时直接跳过，不会挂死触发方**。停住的 debuggee 等待 ≈ `listen_secs` 后自行放行。
+- **每系统至多一个会话**（调试独占工作进程）：第二个 `POST` → `409 DEBUG_SESSION_EXISTS`。闲置超 30 分钟自动拆除。
+- **resume 以 `ended: true` 收尾**（`debuggeeEnded`）——这是正常终局，不是错误。
+- **read_only 分级**：观察类（listen/栈/变量读/步进）在只读系统可用；仅变量写 403 READ_ONLY。
+- `system_debug: true` 才能让 SAP 标准码断点生效（否则被接受但永不触发）。无语句的行会进 `rejected[]` 并带 SAP 原因。
+- 能力开关：`GET /api/version` → `capabilities.debug`。多系统作用域照常（`/api/s/{system}/debug/**`）；作用域形式的关会话仍校验 sid 归属。
+- MCP 镜像工具规划在后续批次；REST 面已完整。
+
 ## 关键约束（避坑）
 
 1. **参数名必须大写**：SAP 参数名区分大小写，JSON 里永远用大写（如 `USERNAME` 不是 `username`）。
@@ -744,7 +799,7 @@ client_secret = "${SAP_BTP_SECRET}"
 9. **调用有超时**：单次 SAP 调用默认 60s 超时（`SAP_REQUEST_TIMEOUT_SECS` 可配），超时返回 `504`。`/api/rfc` 可在请求体传 `timeout_secs` per-request 覆盖（慢接口如批量 BAPI、大表查询可放宽）。
 10. **限流**：设了 `SAP_RATE_LIMIT_RPS` 时，`/api` 按调用方 IP 限速；超限返回 `429`（`key=RATE_LIMITED`）。默认不限流。
 11. **源码端点自动降级 ADT**：`/api/functions/{name}/source` 与 `/api/programs/{name}/source` 先走 RFC（`RPY_FUNCTIONMODULE_READ` / `RPY_PROGRAM_READ`），失败（NOT_FOUND 除外）自动改走 ADT 重读，响应的 `source_via` 字段标明来源（`rfc` / `adt`）。背景：源码行宽超 72 字符（现代 ABAP 常见）在部分系统上会让 RPY 路径直接报错。
-12. **激活失败不是 HTTP 错误**：写入端点在 SAP 拒绝激活时返回 200 + `activated.success=false` + `problems[]`——必须检查响应体里的 `activated` 字段。
+12. **激活失败不是 HTTP 错误**：写入端点在 SAP 拒绝激活时返回 200 + `activated.success=false` + `problems[]`——必须检查响应体里的 `activated` 字段。表/结构写入在 SAP 报告成功后还会**用全量未激活清单反核**（`GET /sap/bc/adt/activation/inactiveobjects`）：SAP 可能对激活返回 200 且无消息、DD02L 里却只有未激活版本（append 结构上实证过）——这种假成功会被改判为 `activated.success=false` 并附问题行。清单读不到（老版本无该端点）时不改判，仅以警告标注激活未经核对。
 13. **函数模块签名写在源码里（SEDI 形态）**：新版 ADT 系统把 FM 参数签名**内联存在 FUNCTION 语句里**——`FUNCTION zfm IMPORTING VALUE(iv) TYPE i EXPORTING VALUE(ev) TYPE i.`——并**拒绝**经典 `*" IMPORTING ...` 注释块（400 "Parameter comment blocks are not allowed"）。网关写入时自动转换经典块；RFC 读端点（`/api/functions/{n}/source`）返回的仍是经典形态——做读改写时优先用 `GET /api/objects/func/{n}/source`（ADT 形态）。签名变更**会**注册进 FM 接口——**例外**：曾/现 `rfc_enabled` 的模块接口冻结（SAP 忽略源码级签名变更），改签名请删除重建。改过签名之后，接口读取立即新鲜，且 v0.18.1 起**调用**也立即可用——写后钩子已移除 SDK 旧描述符条目。只有网关之外（SE37）的签名变更才可能让 SDK 陈旧直到 `POST /api/admin/reload`——`409 SIGNATURE_STALE`（交付端口）或 `/api/rfc` 参数错误会指路；签名变更在任何情况下都不需要重启进程。
 
 ## 典型任务示例

@@ -219,6 +219,46 @@ pub fn tools_manifest() -> Vec<Value> {
                 "source": str_param("Full ABAP source to check")
             }, "required": ["type", "name", "source"] }
         }),
+        json!({
+            "name": "debug_manage",
+            "description": "Remote ABAP debugger management: bp_set / bp_list / bp_clear / bp_delete (breakpoints; no session needed, whole-set replace) / session_start (server-side blocking listen) / session_close (detach + wipe listener AND the user's breakpoints). Workflow: bp_set → session_start → trigger same-user code via abap_run → debug_inspect.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": { "type": "string", "enum": ["bp_set", "bp_list", "bp_clear", "bp_delete", "session_start", "session_close"], "description": "Management action" },
+                    "targets": { "type": "array", "items": { "type": "object", "properties": {
+                        "kind": { "type": "string", "enum": ["prog", "class", "fm", "uri"], "description": "Target type (names lowercased automatically — breakpoint URI-mapping is case-sensitive)" },
+                        "name": { "type": "string", "description": "Object name (or full ADT URI when kind=uri)" },
+                        "group": { "type": "string", "description": "Function group (required when kind=fm)" },
+                        "line": { "type": "integer", "description": "Source line (1-based)" },
+                        "condition": { "type": "string", "description": "Optional ABAP condition" } },
+                        "required": ["line"] }, "description": "bp_set only" },
+                    "id": { "type": "string", "description": "bp_delete: breakpoint id" },
+                    "listen_secs": { "type": "integer", "description": "session_start: listener wait window (default 60; also the debuggee wait window)" },
+                    "system_debug": { "type": "boolean", "description": "session_start: allow breakpoints in SAP standard code to fire (default false)" },
+                    "sid": { "type": "string", "description": "session_close: session id" },
+                    "system": { "type": "string", "description": "Target system (default = default system)" }
+                },
+                "required": ["action"]
+            }
+        }),
+        json!({
+            "name": "debug_inspect",
+            "description": "Remote ABAP debugger inspection on a stopped session: status / stack / variables (auto-descends to locals; parent=<id> expands structures/tables) / var_write (changes real execution; blocked on read-only systems) / step (step_into/step_over/step_out/resume — resume ending ended:true is the normal finish).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": { "type": "string", "enum": ["status", "stack", "variables", "var_write", "step"], "description": "Inspection action" },
+                    "sid": { "type": "string", "description": "Session id (from debug_manage session_start)" },
+                    "parent": { "type": "string", "description": "variables: parent variable id to expand" },
+                    "name": { "type": "string", "description": "var_write: variable name" },
+                    "value": { "type": "string", "description": "var_write: new value" },
+                    "step": { "type": "string", "enum": ["step_into", "step_over", "step_out", "resume"], "description": "step: step action" },
+                    "system": { "type": "string", "description": "Target system (default = default system)" }
+                },
+                "required": ["action", "sid"]
+            }
+        }),
     ]
 }
 
@@ -253,6 +293,20 @@ fn accepted() -> Response {
 }
 
 /// tools/call 的成功载荷：结果 JSON 装进 text content（MCP 惯例）
+/// 调试面 handler 复用：axum Response → JSON Value（这些 handler 恒回 JSON）。
+async fn debug_resp_json(resp: axum::response::Response) -> Result<Value, RfcError> {
+    let (_parts, body) = resp.into_parts();
+    let bytes = axum::body::to_bytes(body, 8 * 1024 * 1024)
+        .await
+        .map_err(|e| RfcError { code: -1, status: 502, message: format!("调试响应读取失败: {e}"), key: "ADT_INTERNAL".into() })?;
+    serde_json::from_slice(&bytes).map_err(|e| RfcError {
+        code: -1,
+        status: 502,
+        message: format!("调试响应非 JSON: {e}"),
+        key: "ADT_INTERNAL".into(),
+    })
+}
+
 fn tool_ok(payload: Value) -> Value {
     json!({
         "content": [{ "type": "text", "text": payload.to_string() }],
@@ -772,6 +826,98 @@ async fn call_tool(state: SharedState, name: &str, args: Value) -> Result<Value,
             };
             let issues = crate::objects::syntax_check(adt, &base, &source).await?;
             Ok(json!({ "type": otype, "name": name, "count": issues.len(), "issues": issues }))
+        }
+        "debug_manage" => {
+            let sys = tool_system(&state, &args)?;
+            let action = req_str(&args, "action")?;
+            let resp = match action.as_str() {
+                "bp_set" => {
+                    // args 里带协议级 `action`（和 `system`），BpSetBody 是 deny_unknown_fields——剥掉再反序列化
+                    let mut a = args.clone();
+                    if let Some(m) = a.as_object_mut() {
+                        m.remove("action");
+                        m.remove("system");
+                    }
+                    let body: crate::debug::BpSetBody = serde_json::from_value(a).map_err(|e| {
+                        RfcError { code: -1, status: 400, message: format!("bp_set arguments: {e}"), key: "JSON_INVALID".into() }
+                    })?;
+                    crate::debug::bp_set_handler(crate::systems::Sap(std::sync::Arc::clone(&sys)), axum::Json(body)).await?
+                }
+                "bp_list" => crate::debug::bp_list_handler(crate::systems::Sap(std::sync::Arc::clone(&sys))).await?,
+                "bp_clear" => crate::debug::bp_clear_handler(crate::systems::Sap(std::sync::Arc::clone(&sys))).await?,
+                "bp_delete" => {
+                    let id = req_str(&args, "id")?;
+                    crate::debug::bp_delete_handler(crate::systems::Sap(std::sync::Arc::clone(&sys)), axum::extract::Path(id)).await?
+                }
+                "session_start" => {
+                    let body = crate::debug::SessionCreateBody {
+                        listen_secs: args.get("listen_secs").and_then(|v| v.as_u64()).unwrap_or(60),
+                        system_debug: args.get("system_debug").and_then(|v| v.as_bool()).unwrap_or(false),
+                    };
+                    crate::debug::session_create_handler(crate::systems::Sap(std::sync::Arc::clone(&sys)), Some(axum::Json(body))).await?
+                }
+                "session_close" => {
+                    let sid = req_str(&args, "sid")?;
+                    crate::debug::session_close_handler(crate::systems::Sap(std::sync::Arc::clone(&sys)), axum::extract::Path(sid)).await?
+                }
+                other => return Err(RfcError {
+                    code: -1,
+                    status: 400,
+                    message: format!("未知 debug_manage action: {other}（bp_set/bp_list/bp_clear/bp_delete/session_start/session_close）"),
+                    key: "MCP_ARG_INVALID".into(),
+                }),
+            };
+            debug_resp_json(resp).await
+        }
+        "debug_inspect" => {
+            let sys = tool_system(&state, &args)?;
+            let action = req_str(&args, "action")?;
+            let sid = req_str(&args, "sid")?;
+            // 只读分级与 HTTP 中间件同规：变量写被 read_only 系统拦
+            if action == "var_write" && sys.read_only {
+                return Err(RfcError {
+                    code: -1,
+                    status: 403,
+                    message: "该系统为只读（read_only）：调试观察可用，变量写被禁".into(),
+                    key: "READ_ONLY".into(),
+                });
+            }
+            let resp = match action.as_str() {
+                "status" => crate::debug::session_status_handler(crate::systems::Sap(std::sync::Arc::clone(&sys)), axum::extract::Path(sid)).await?,
+                "stack" => crate::debug::session_stack_handler(crate::systems::Sap(std::sync::Arc::clone(&sys)), axum::extract::Path(sid)).await?,
+                "variables" => {
+                    let parent = args.get("parent").and_then(|v| v.as_str()).map(String::from);
+                    crate::debug::session_variables_handler(
+                        crate::systems::Sap(std::sync::Arc::clone(&sys)),
+                        axum::extract::Path(sid),
+                        axum::extract::Query(crate::debug::VarQuery { parent }),
+                    ).await?
+                }
+                "var_write" => {
+                    let name = req_str(&args, "name")?;
+                    let value = req_str(&args, "value")?;
+                    crate::debug::variable_write_handler(
+                        crate::systems::Sap(std::sync::Arc::clone(&sys)),
+                        axum::extract::Path((sid, name)),
+                        axum::Json(crate::debug::VarWriteBody { value }),
+                    ).await?
+                }
+                "step" => {
+                    let step = req_str(&args, "step")?;
+                    crate::debug::session_control_handler(
+                        crate::systems::Sap(std::sync::Arc::clone(&sys)),
+                        axum::extract::Path(sid),
+                        axum::Json(crate::debug::ControlBody { action: step }),
+                    ).await?
+                }
+                other => return Err(RfcError {
+                    code: -1,
+                    status: 400,
+                    message: format!("未知 debug_inspect action: {other}（status/stack/variables/var_write/step）"),
+                    key: "MCP_ARG_INVALID".into(),
+                }),
+            };
+            debug_resp_json(resp).await
         }
         _ => Err(RfcError {
             code: -1,

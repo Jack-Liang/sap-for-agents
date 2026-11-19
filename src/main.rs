@@ -5,6 +5,8 @@ mod checks;
 mod config;
 mod connection;
 mod cts;
+mod debug;
+mod debug_session;
 mod discovery;
 mod dumps;
 mod error;
@@ -170,6 +172,8 @@ async fn run_client() -> Result<(), Box<dyn std::error::Error>> {
     // ADT 能力自描述按默认系统视角（每系统真实开关看 /api/version 的 systems 块）；
     // 未配置模式为 false（setup 首个默认系统热加载时会翻转）
     adt::init_capability_adt(state.default().is_some_and(|d| d.adt.is_some()));
+    // 调试面能力同源（有 ADT 即可调试——/api/debug/** 按系统继承 ADT 配置）
+    debug::init_capability_debug(state.default().is_some_and(|d| d.adt.is_some()));
     // 引导式配置开关（SAP_SETUP=off 禁用 POST /api/setup/system；GET 状态仍公开）
     setup::init(cfg.setup_enabled, cfg.setup_force);
     if !cfg.setup_enabled {
