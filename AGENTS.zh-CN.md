@@ -733,7 +733,7 @@ client_secret = "${SAP_BTP_SECRET}"
 
 ### 14. ABAP 调试器（v0.22）：断点 / 单步 / 变量
 
-经网关自有有状态 ADT 通道做远程 ABAP 调试——不需要 Eclipse。流程：**设断点 → 建会话（listen）→ 触发同用户代码 → 轮询 → 检视 → 步进/放行 → 关会话**。
+经网关自有有状态 ADT 通道做远程 ABAP 调试——不需要 Eclipse。调试面移植自 [oisee/vibing-steampunk](https://github.com/oisee/vibing-steampunk)（MIT）端到端验证过的 ADT 契约（契约笔记见 `docs/DEBUGGER-CONTRACT.zh-CN.md`）。流程：**设断点 → 建会话（listen）→ 触发同用户代码 → 轮询 → 检视 → 步进/放行 → 关会话**。
 
 | 目标 | 端点 |
 |------|------|

@@ -13,6 +13,12 @@
 //! ⚠️ be reached"（连 SIGKILL 已改 SIGTERM 排水也扛不住纯写入量）。请分批
 //! ⚠️ 串行跑：`--test-threads=1` + 按前缀过滤（如先 objects 再 package 再
 //! ⚠️ mcp），批间静默 1-2 分钟；失败用例单独重跑即绿即正确。
+//!
+//! ⚠️ 容器重启后的稳态窗口（2026-11-20 实证）：热重启后 /ready 75s 即绿、
+//! ⚠️ discovery/classrun 正常，但 ADT lock 服务仍有 ~30 分钟稳态期——此窗口
+//! ⚠️ 内 write 编排（LOCK 步）返回 ICM 400 "Service cannot be reached"
+//! ⚠️ （ADT_LOCK_FAILED 502），而 RFC 探针全绿，极易误判为代码回归。
+//! ⚠️ 等窗口过去再跑 write-heavy 用例；或先跑一个 create 探针确认。
 
 mod common;
 

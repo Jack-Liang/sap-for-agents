@@ -789,6 +789,14 @@ src/
 
 > CI 工作流：[`.github/workflows/release.yml`](./.github/workflows/release.yml)。改动 [build.rs](./build.rs) 让 `SAP_SDK_DIR` 环境变量可指向任意 SDK 安装目录，方便 Docker / CI / 自定义路径使用。
 
+## 致谢与出处
+
+本网关的部分设计与契约吸收自优秀的开源 ABAP 工具——均为宽松许可，Rust 实现全部为原创：
+
+- [abapGit](https://github.com/larshp/abapGit)（MIT）——包导出/导入模型：文件命名 + FULL 目录逻辑、序列化约定、依赖有序创建与两阶段激活（AGENTS.md §10/§11）
+- [jfilak/sapcli](https://github.com/jfilak/sapcli)（Apache-2.0）——Agent 运行面的灵感来源：`abap run`、ABAP Unit、ATC、CTS、数据预览与快速搜索端点（§12）
+- [oisee/vibing-steampunk](https://github.com/oisee/vibing-steampunk)（MIT）——远程调试面移植了它端到端验证过的 ADT 调试器契约；对象创建 XML 契约也以其为交叉参照（AGENTS.md §9/§14；契约笔记见 `docs/DEBUGGER-CONTRACT.zh-CN.md`）
+
 ## License
 
 本项目基于 [MIT License](LICENSE) 开源。

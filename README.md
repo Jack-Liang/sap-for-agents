@@ -788,6 +788,14 @@ Full details (how it works, SM59 configuration, the webhook protocol, examples) 
 
 > CI workflow: [`.github/workflows/release.yml`](./.github/workflows/release.yml). Changes to [build.rs](./build.rs) let the `SAP_SDK_DIR` environment variable point to any SDK install directory, for use with Docker / CI / custom paths.
 
+## Acknowledgments
+
+Parts of this gateway absorb design and contracts from great open-source ABAP tooling — all permissively licensed, all implemented from scratch in Rust:
+
+- [abapGit](https://github.com/larshp/abapGit) (MIT) — the package export/import model: file-naming + FULL folder logic, serialization conventions, dependency-ordered creation and two-phase activation (§10/§11 in AGENTS.md)
+- [jfilak/sapcli](https://github.com/jfilak/sapcli) (Apache-2.0) — inspiration for the agent runtime surface: `abap run`, ABAP Unit, ATC, CTS, data preview and quick search endpoints (§12)
+- [oisee/vibing-steampunk](https://github.com/oisee/vibing-steampunk) (MIT) — the remote debugger surface ports the ADT debugger contract it proved end-to-end, and the object-creation XML contract is cross-checked against it (§9/§14 in AGENTS.md; contract notes in `docs/DEBUGGER-CONTRACT.zh-CN.md`)
+
 ## License
 
 This project is open-sourced under the [MIT License](LICENSE).

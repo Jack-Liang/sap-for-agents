@@ -743,7 +743,7 @@ Notes:
 
 ### 14. ABAP debugger (v0.22): breakpoints / step / variables
 
-Remote ABAP debugging through the gateway's own stateful ADT channel — no Eclipse needed. Workflow: **set breakpoint → start session (listen) → trigger same-user code → poll → inspect → step/resume → close**.
+Remote ABAP debugging through the gateway's own stateful ADT channel — no Eclipse needed. The debugger surface ports the ADT contract proven end-to-end by [oisee/vibing-steampunk](https://github.com/oisee/vibing-steampunk) (MIT; contract notes in `docs/DEBUGGER-CONTRACT.zh-CN.md`). Workflow: **set breakpoint → start session (listen) → trigger same-user code → poll → inspect → step/resume → close**.
 
 | Goal | Endpoint |
 |------|----------|
