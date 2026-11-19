@@ -235,7 +235,7 @@ pub fn tools_manifest() -> Vec<Value> {
                         "required": ["line"] }, "description": "bp_set only" },
                     "id": { "type": "string", "description": "bp_delete: breakpoint id" },
                     "listen_secs": { "type": "integer", "description": "session_start: listener wait window (default 60; also the debuggee wait window)" },
-                    "system_debug": { "type": "boolean", "description": "session_start: allow breakpoints in SAP standard code to fire (default false)" },
+                    "system_debug": { "type": "boolean", "description": "bp_set only: allow breakpoints in SAP standard code to fire (default false — accepted but never fire without it)" },
                     "sid": { "type": "string", "description": "session_close: session id" },
                     "system": { "type": "string", "description": "Target system (default = default system)" }
                 },
@@ -251,6 +251,7 @@ pub fn tools_manifest() -> Vec<Value> {
                     "action": { "type": "string", "enum": ["status", "stack", "variables", "var_write", "step"], "description": "Inspection action" },
                     "sid": { "type": "string", "description": "Session id (from debug_manage session_start)" },
                     "parent": { "type": "string", "description": "variables: parent variable id to expand" },
+                    "frame": { "type": "integer", "description": "variables: switch to stack frame N first (read caller-frame locals)" },
                     "name": { "type": "string", "description": "var_write: variable name" },
                     "value": { "type": "string", "description": "var_write: new value" },
                     "step": { "type": "string", "enum": ["step_into", "step_over", "step_out", "resume"], "description": "step: step action" },
@@ -852,7 +853,6 @@ async fn call_tool(state: SharedState, name: &str, args: Value) -> Result<Value,
                 "session_start" => {
                     let body = crate::debug::SessionCreateBody {
                         listen_secs: args.get("listen_secs").and_then(|v| v.as_u64()).unwrap_or(60),
-                        system_debug: args.get("system_debug").and_then(|v| v.as_bool()).unwrap_or(false),
                     };
                     crate::debug::session_create_handler(crate::systems::Sap(std::sync::Arc::clone(&sys)), Some(axum::Json(body))).await?
                 }
@@ -887,10 +887,11 @@ async fn call_tool(state: SharedState, name: &str, args: Value) -> Result<Value,
                 "stack" => crate::debug::session_stack_handler(crate::systems::Sap(std::sync::Arc::clone(&sys)), axum::extract::Path(sid)).await?,
                 "variables" => {
                     let parent = args.get("parent").and_then(|v| v.as_str()).map(String::from);
+                    let frame = args.get("frame").and_then(|v| v.as_u64());
                     crate::debug::session_variables_handler(
                         crate::systems::Sap(std::sync::Arc::clone(&sys)),
                         axum::extract::Path(sid),
-                        axum::extract::Query(crate::debug::VarQuery { parent }),
+                        axum::extract::Query(crate::debug::VarQuery { parent, frame }),
                     ).await?
                 }
                 "var_write" => {

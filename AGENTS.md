@@ -753,7 +753,7 @@ Remote ABAP debugging through the gateway's own stateful ADT channel — no Ecli
 | Start session (listen runs server-side; agent polls) | `POST /api/debug/sessions` |
 | Poll status | `GET /api/debug/sessions/{sid}` |
 | Call stack | `GET /api/debug/sessions/{sid}/stack` |
-| Variables (auto-descends `@ROOT`→`@LOCALS`; `?parent=ID` expands structures/tables) | `GET /api/debug/sessions/{sid}/variables` |
+| Variables (auto-descends `@ROOT`→`@LOCALS`; `?parent=ID` expands structures/tables; `?frame=N` reads caller-frame locals) | `GET /api/debug/sessions/{sid}/variables` |
 | **Write variable** (read_only systems: 403) | `PUT /api/debug/sessions/{sid}/variables/{name}` |
 | Step / resume (`step_into`/`step_over`/`step_out`/`resume`) | `POST /api/debug/sessions/{sid}/control` |
 | Close (detach + remove listener + clear breakpoints) | `DELETE /api/debug/sessions/{sid}` |
@@ -770,7 +770,9 @@ curl -X POST http://127.0.0.1:3000/api/debug/sessions -H "Content-Type: applicat
   -d '{"listen_secs":60,"system_debug":false}'
 # → 202 {"sid":"dbg-…","state":"listening"}
 
-# 3) Trigger the same user's code (gateway user = breakpoint owner):
+# 3) Trigger the same user's code (gateway user = breakpoint owner) ~1s AFTER
+#    session create (the listener needs a beat to register server-side; a debuggee
+#    hitting the breakpoint before registration is simply skipped):
 #    /api/abap/run (fresh session — ideal) or /api/rfc
 
 # 4) Poll → state "stopped" → stack / variables → step/resume → close
@@ -792,7 +794,8 @@ Key behaviors (all verified on A4H/816, see `docs/DEBUGGER-CONTRACT.zh-CN.md`):
 - **One session per system** (debugging holds a work process): second `POST` → `409 DEBUG_SESSION_EXISTS`. Session idle > 30 min is torn down automatically.
 - **resume ends with `ended: true`** (`debuggeeEnded`) — that is the normal terminal state, not an error.
 - **read_only grading**: observe (listen/stack/variables read/step) works on read-only systems; only variable writes get `403 READ_ONLY`.
-- `system_debug: true` arms breakpoints in SAP standard code (without it they are accepted but never fire). Line targets without a statement come back in `rejected[]` with SAP's reason.
+- `system_debug: true` (bp_set body flag — NOT a session flag) arms breakpoints in SAP standard code (without it they are accepted but never fire). Line targets without a statement come back in `rejected[]` with SAP's reason.
+- **Graceful shutdown cleans up**: on SIGTERM/drain the gateway tears down every debug session (detach + listener removal + breakpoint wipe) within ~20s before exiting — a stale listener row would silently swallow the user's next debuggee.
 - Capability flag: `GET /api/version` → `capabilities.debug`. Multi-system scope applies (`/api/s/{system}/debug/**`); the scoped `DELETE …/sessions/{sid}` still verifies sid ownership.
 - MCP mirror tools are planned for a follow-up; the REST surface is complete.
 

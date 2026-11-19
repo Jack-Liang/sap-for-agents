@@ -71,6 +71,8 @@ struct Run {
     /// 结束/丢失原因。
     note: Mutex<Option<String>>,
     keepalive: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// 当前选中的栈帧 index（变量读写上下文；catch/步进后 = 光标帧 frames[0]）
+    frame: Mutex<u64>,
     created: Instant,
     /// 最近一次 REST 交互（TTL 依据）。
     last_used: Mutex<Instant>,
@@ -112,6 +114,9 @@ struct StackFrame {
     event_type: String,
     event_name: String,
     uri: String,
+    /// 帧切换的 PUT 目标（`/sap/bc/adt/debugger/stack/type/ABAP/position/N`；
+    /// 版本缺该属性时按 index 推导）
+    stack_uri: String,
 }
 
 #[derive(Clone, Serialize)]
@@ -232,7 +237,7 @@ fn set_phase(run: &Run, phase: Phase, note: Option<String>) {
 
 /// catch 后台任务：listen → attach → 栈，背靠背（防 attach 竞态窗）。
 /// listen 阻塞至 debuggee 命中或超时（200 空体 = 无人命中）。
-async fn catch_loop(run: Arc<Run>, listen_secs: u64, _system_debug: bool) {
+async fn catch_loop(run: Arc<Run>, listen_secs: u64) {
     let mut chan = run.chan.lock().await;
     let user = run.user.clone();
 
@@ -315,7 +320,7 @@ async fn catch_loop(run: Arc<Run>, listen_secs: u64, _system_debug: bool) {
     }
 
     // 3) 栈（816 走资源 GET 形态；404 = 老版本，回落 dispatcher POST——契约 §5）
-    match fetch_stack(&mut chan, _system_debug).await {
+    match fetch_stack(&mut chan).await {
         Ok(frames) => {
             let pos = frames.first().map(|f| Position {
                 program: f.program.clone(),
@@ -323,8 +328,11 @@ async fn catch_loop(run: Arc<Run>, listen_secs: u64, _system_debug: bool) {
                 line: f.line,
                 uri: f.uri.clone(),
             });
+            // 帧编号从内向外递增（stackPosition），光标帧 = frames[0]
+            let cursor = frames.first().map(|f| f.index).unwrap_or(0);
             *run.stack.lock().unwrap() = frames;
             *run.position.lock().unwrap() = pos.or(Some(position));
+            *run.frame.lock().unwrap() = cursor;
             set_phase(&run, Phase::Stopped, None);
             metrics::counter!("sap_debug_catches_total").increment(1);
         }
@@ -333,10 +341,7 @@ async fn catch_loop(run: Arc<Run>, listen_secs: u64, _system_debug: bool) {
 }
 
 /// 读调用栈：资源 GET 形态失败且 404 时回落 dispatcher POST（其余错误原样上抛）。
-async fn fetch_stack(
-    chan: &mut DebugSession,
-    _system_debug: bool,
-) -> Result<Vec<StackFrame>, RfcError> {
+async fn fetch_stack(chan: &mut DebugSession) -> Result<Vec<StackFrame>, RfcError> {
     let q = "debugger/stack?method=getStack&emode=_&semanticURIs=true";
     let r = chan
         .request(
@@ -425,15 +430,17 @@ async fn step_and_refresh(
             ),
         ));
     }
-    let frames = fetch_stack(chan, false).await?;
+    let frames = fetch_stack(chan).await?;
     let pos = frames.first().map(|f| Position {
         program: f.program.clone(),
         include: f.include.clone(),
         line: f.line,
         uri: f.uri.clone(),
     });
+    let cursor = frames.first().map(|f| f.index).unwrap_or(0);
     *run.stack.lock().unwrap() = frames.clone();
     *run.position.lock().unwrap() = pos.clone();
+    *run.frame.lock().unwrap() = cursor;
     Ok((false, pos, frames))
 }
 
@@ -650,14 +657,24 @@ fn parse_stack(s: &str) -> Vec<StackFrame> {
         .into_iter()
         .filter_map(|chunk| {
             let g = |a: &str| xml_attr(&chunk, "stackEntry", a).unwrap_or_default();
+            let index: u64 = g("stackPosition").trim().parse().ok()?;
+            let stack_uri = {
+                let su = g("stackUri");
+                if su.is_empty() {
+                    format!("/sap/bc/adt/debugger/stack/type/ABAP/position/{index}")
+                } else {
+                    su
+                }
+            };
             Some(StackFrame {
-                index: g("stackPosition").trim().parse().ok()?,
+                index,
                 program: g("programName"),
                 include: g("includeName"),
                 line: g("line").trim().parse().unwrap_or(0),
                 event_type: g("eventType"),
                 event_name: g("eventName"),
                 uri: g("uri"),
+                stack_uri,
             })
         })
         .collect()
@@ -788,6 +805,11 @@ fn require_stopped(run: &Run) -> Result<(), RfcError> {
 pub(crate) struct BpSetBody {
     #[serde(default)]
     targets: Vec<BpTarget>,
+    /// 允许 SAP 标准代码断点生效（默认 false——不开时标准码断点被接受但
+    /// 永不触发，契约 §2）。语义上属于断点集合而非会话（断点不绑会话），
+    /// 挂 POST 根属性 systemDebugging="true"。
+    #[serde(default)]
+    pub(crate) system_debug: bool,
 }
 
 #[derive(Clone, Deserialize)]
@@ -882,6 +904,7 @@ async fn bp_replace(
     chan: &mut DebugSession,
     user: &str,
     targets: &[BpTarget],
+    system_debug: bool,
 ) -> Result<Vec<Bp>, RfcError> {
     let mut items = String::new();
     for t in targets {
@@ -897,10 +920,12 @@ async fn bp_replace(
             xml_escape(&full)
         ));
     }
+    let sysattr = if system_debug { " systemDebugging=\"true\"" } else { "" };
     let body = format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
-<dbg:breakpoints xmlns:dbg="http://www.sap.com/adt/debugger" xmlns:adtcore="http://www.sap.com/adt/core" debuggingMode="user" scope="external" requestUser="{}" terminalId="{TERMINAL_ID}" ideId="{IDE_ID}">{items}</dbg:breakpoints>"#,
+<dbg:breakpoints xmlns:dbg="http://www.sap.com/adt/debugger" xmlns:adtcore="http://www.sap.com/adt/core" debuggingMode="user" scope="external" requestUser="{}" terminalId="{TERMINAL_ID}" ideId="{IDE_ID}"{}>{items}</dbg:breakpoints>"#,
         user,
+        sysattr,
     );
     let r = chan
         .request(
@@ -960,7 +985,7 @@ pub(crate) async fn bp_set_handler(
 ) -> Result<axum::response::Response, RfcError> {
     let user = adt_user(&sap)?;
     let slot = slot_for(sap.name.as_str())?;
-    let placed = with_bp_chan!(&sap, &slot, chan, bp_replace(chan, &user, &body.targets).await)?;
+    let placed = with_bp_chan!(&sap, &slot, chan, bp_replace(chan, &user, &body.targets, body.system_debug).await)?;
     let ok: Vec<Bp> = placed.iter().filter(|b| b.error.is_none()).cloned().collect();
     let rejected: Vec<&Bp> = placed.iter().filter(|b| b.error.is_some()).collect();
     *slot.bps.lock().unwrap() = ok.clone();
@@ -1014,7 +1039,7 @@ pub(crate) async fn bp_list_handler(sap: Sap) -> Result<axum::response::Response
 pub(crate) async fn bp_clear_handler(sap: Sap) -> Result<axum::response::Response, RfcError> {
     let user = adt_user(&sap)?;
     let slot = slot_for(sap.name.as_str())?;
-    with_bp_chan!(&sap, &slot, chan, bp_replace(chan, &user, &[]).await)?;
+    with_bp_chan!(&sap, &slot, chan, bp_replace(chan, &user, &[], false).await)?;
     slot.bps.lock().unwrap().clear();
     Ok(axum::Json(json!({ "cleared": true })).into_response())
 }
@@ -1046,7 +1071,7 @@ pub(crate) async fn bp_delete_handler(
         return Err(slot_err(404, "DEBUG_BP_UNKNOWN", format!("断点 {id} 不在本会话台账中")));
     }
     let user = adt_user(&sap)?;
-    let placed = with_bp_chan!(&sap, &slot, chan, bp_replace(chan, &user, &keep).await)?;
+    let placed = with_bp_chan!(&sap, &slot, chan, bp_replace(chan, &user, &keep, false).await)?;
     *slot.bps.lock().unwrap() = placed.iter().filter(|b| b.error.is_none()).cloned().collect();
     Ok(axum::Json(json!({ "deleted": id, "remaining": keep.len() })).into_response())
 }
@@ -1059,9 +1084,6 @@ pub(crate) struct SessionCreateBody {
     /// listen 等待窗（秒）；也是 debuggee 的等待窗
     #[serde(default = "default_listen_secs")]
     pub(crate) listen_secs: u64,
-    /// 允许 SAP 标准代码断点生效（默认关——开了才拦得住标准码）
-    #[serde(default)]
-    pub(crate) system_debug: bool,
 }
 
 fn default_listen_secs() -> u64 {
@@ -1072,9 +1094,8 @@ pub(crate) async fn session_create_handler(
     sap: Sap,
     body: Option<axum::Json<SessionCreateBody>>,
 ) -> Result<axum::response::Response, RfcError> {
-    let SessionCreateBody { listen_secs, system_debug } = body.map(|axum::Json(b)| b).unwrap_or(SessionCreateBody {
+    let SessionCreateBody { listen_secs } = body.map(|axum::Json(b)| b).unwrap_or(SessionCreateBody {
         listen_secs: DEFAULT_LISTEN_SECS,
-        system_debug: false,
     });
     let listen_secs = listen_secs.clamp(1, 600);
     let ep = sap.adt.as_ref().ok_or_else(crate::adt::adt_disabled)?.clone();
@@ -1123,6 +1144,7 @@ pub(crate) async fn session_create_handler(
         stack: Mutex::new(Vec::new()),
         note: Mutex::new(None),
         keepalive: Mutex::new(None),
+        frame: Mutex::new(0),
         created: Instant::now(),
         last_used: Mutex::new(Instant::now()),
     });
@@ -1155,7 +1177,7 @@ pub(crate) async fn session_create_handler(
     // catch 后台任务
     let crun = Arc::clone(&run);
     tokio::spawn(async move {
-        catch_loop(crun, listen_secs, system_debug).await;
+        catch_loop(crun, listen_secs).await;
     });
 
     Ok((
@@ -1377,19 +1399,76 @@ pub(crate) async fn session_variables_handler(
     let run = take_run(sap.name.as_str(), &sid)?;
     require_stopped(&run)?;
     let mut chan = run_chan(&run).await;
+    if let Some(f) = q.frame {
+        if f != *run.frame.lock().unwrap() {
+            switch_frame(&mut chan, &run, f).await?;
+        }
+    }
+    let frame_now = *run.frame.lock().unwrap();
     let (kids, vars) = list_variables(&mut chan, q.parent.as_deref()).await?;
     Ok(axum::Json(json!({
+        "frame": frame_now,
         "hierarchy": kids.iter().map(|(id, name)| json!({"id": id, "name": name})).collect::<Vec<_>>(),
         "variables": vars,
-        "note": "结构/内表用 ?parent=<id> 展开；@ROOT 自动下探到本地变量层",
+        "note": "结构/内表用 ?parent=<id> 展开；@ROOT 自动下探到本地变量层；?frame=N 切换栈帧读调用者变量",
     }))
     .into_response())
+}
+
+/// 切帧：PUT 帧的 stackUri（契约 §5），服务端当前帧随之改变——后续
+/// getVariables/getChildVariables 读的就是该帧的本地变量。
+async fn switch_frame(
+    chan: &mut DebugSession,
+    run: &Arc<Run>,
+    target: u64,
+) -> Result<(), RfcError> {
+    let frames = run.stack.lock().unwrap().clone();
+    let f = frames.iter().find(|x| x.index == target).ok_or_else(|| {
+        slot_err(
+            404,
+            "DEBUG_FRAME_UNKNOWN",
+            format!("帧 {target} 不在调用栈中（0..={}）", frames.len().saturating_sub(1)),
+        )
+    })?;
+    let rel = f
+        .stack_uri
+        .strip_prefix("/sap/bc/adt/")
+        .unwrap_or(&f.stack_uri)
+        .to_string();
+    let r = chan
+        .request(
+            Method::PUT,
+            &rel,
+            &DebugRequest {
+                accept: "*/*",
+                timeout: Some(Duration::from_secs(10)),
+                ..Default::default()
+            },
+        )
+        .await?;
+    if r.status != 200 {
+        let sub = adt_error_subtype(&r.body);
+        return Err(slot_err(
+            r.status,
+            "ADT_DEBUG_FAILED",
+            format!(
+                "切帧 {target} 失败: ADT {}{}",
+                r.status,
+                sub.map(|s| format!(" ({s})")).unwrap_or_default()
+            ),
+        ));
+    }
+    *run.frame.lock().unwrap() = target;
+    Ok(())
 }
 
 #[derive(Deserialize)]
 pub(crate) struct VarQuery {
     #[serde(default)]
     pub(crate) parent: Option<String>,
+    /// 目标栈帧（缺省 = 当前帧；?frame=N 先 PUT 切帧再读——调用者的本地变量）
+    #[serde(default)]
+    pub(crate) frame: Option<u64>,
 }
 
 pub(crate) async fn variable_write_handler(
@@ -1484,6 +1563,37 @@ pub(crate) async fn session_control_handler(
 pub(crate) struct ControlBody {
     /// step_into | step_over | step_out | resume
     pub(crate) action: String,
+}
+
+/// 优雅停机：teardown 全部活动调试会话（detach + 摘 listener + 连带清断点）。
+/// 残留 listener 行会静默吞掉该用户的下一个 debuggee（契约 §3），进程退出前
+/// 必须清掉。并发执行、总预算 20s（超时放弃仅 WARN——停机不可被 SAP 卡死；
+/// 极端残留可用 DELETE /api/debug/breakpoints?all=true 手工清场）。
+pub(crate) async fn shutdown_all() {
+    let runs: Vec<(String, Arc<Run>)> = {
+        let Ok(m) = SLOTS.lock() else { return };
+        m.iter()
+            .filter_map(|(name, slot)| {
+                slot.run
+                    .lock()
+                    .ok()
+                    .and_then(|r| r.as_ref().map(|x| (name.clone(), Arc::clone(x))))
+            })
+            .collect()
+    };
+    if runs.is_empty() {
+        return;
+    }
+    tracing::info!(count = runs.len(), "停机清理调试会话");
+    let mut set = tokio::task::JoinSet::new();
+    for (name, run) in runs {
+        set.spawn(async move {
+            let _ = teardown(&name, &run).await;
+        });
+    }
+    if tokio::time::timeout(Duration::from_secs(20), set.join_all()).await.is_err() {
+        tracing::warn!("停机清理调试会话超时（20s），放弃剩余清理");
+    }
 }
 
 fn poisoned() -> RfcError {

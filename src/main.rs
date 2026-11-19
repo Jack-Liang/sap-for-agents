@@ -276,6 +276,10 @@ async fn wait_shutdown_signal() {
         _ = terminate => tracing::info!("收到 SIGTERM 信号"),
     }
 
+    // 调试会话善后（v0.22）：detach + 摘 listener + 清断点——残留 listener 行
+    // 会静默吞掉该用户的下一个 debuggee，绝不能带进进程退出。限时 20s 自保。
+    debug::shutdown_all().await;
+
     // 排空窗口：先把 /ready 打成 503，但监听继续服务——给上游负载均衡器/前端
     // 一个「摘流量 + 退避」的机会。直接关监听的话，调用方看到的是 ECONNREFUSED，
     // 多数 HTTP 客户端对它不走重试逻辑，比 503 难处理得多。

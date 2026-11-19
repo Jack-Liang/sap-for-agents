@@ -2934,7 +2934,10 @@ fn debug_session_full_loop() {
     let sess: serde_json::Value = r.json().unwrap();
     let sid = sess["sid"].as_str().unwrap().to_string();
 
-    // 4) 后台触发（阻塞至 debug 结束）
+    // 4) 后台触发（阻塞至 debug 结束）。留 2s 让 listener 完成服务端登记——
+    //    202 返回时 listen POST 尚在途中，登记前撞断点的 debuggee 会被直接
+    //    跳过（无 listener = 断点不生效），listener 便等满超时。
+    std::thread::sleep(Duration::from_secs(2));
     let trig_base = base.clone();
     let trigger = std::thread::spawn(move || {
         let long = reqwest::blocking::Client::builder()

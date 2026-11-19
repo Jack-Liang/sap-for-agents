@@ -743,7 +743,7 @@ client_secret = "${SAP_BTP_SECRET}"
 | 建会话（listen 在服务端阻塞；agent 轮询） | `POST /api/debug/sessions` |
 | 轮询状态 | `GET /api/debug/sessions/{sid}` |
 | 调用栈 | `GET /api/debug/sessions/{sid}/stack` |
-| 变量（自动下探 `@ROOT`→`@LOCALS`；`?parent=ID` 展开结构/内表） | `GET /api/debug/sessions/{sid}/variables` |
+| 变量（自动下探 `@ROOT`→`@LOCALS`；`?parent=ID` 展开结构/内表；`?frame=N` 切栈帧读调用者变量） | `GET /api/debug/sessions/{sid}/variables` |
 | **写变量**（只读系统 403） | `PUT /api/debug/sessions/{sid}/variables/{name}` |
 | 步进/放行（`step_into`/`step_over`/`step_out`/`resume`） | `POST /api/debug/sessions/{sid}/control` |
 | 关会话（detach + 摘 listener + 清断点） | `DELETE /api/debug/sessions/{sid}` |
@@ -760,7 +760,8 @@ curl -X POST http://127.0.0.1:3000/api/debug/sessions -H "Content-Type: applicat
   -d '{"listen_secs":60,"system_debug":false}'
 # → 202 {"sid":"dbg-…","state":"listening"}
 
-# 3) 触发同用户代码（网关用户 = 断点归属用户）：
+# 3) 建会话后等 ~1s 再触发同用户代码（listener 服务端登记需要一拍——
+#    登记完成前撞断点的 debuggee 会被直接跳过）：
 #    /api/abap/run（每次强制新会话——最理想）或 /api/rfc
 
 # 4) 轮询 → state=stopped → 栈/变量 → 步进/放行 → 关会话
@@ -782,7 +783,8 @@ curl -X DELETE http://127.0.0.1:3000/api/debug/sessions/{sid}
 - **每系统至多一个会话**（调试独占工作进程）：第二个 `POST` → `409 DEBUG_SESSION_EXISTS`。闲置超 30 分钟自动拆除。
 - **resume 以 `ended: true` 收尾**（`debuggeeEnded`）——这是正常终局，不是错误。
 - **read_only 分级**：观察类（listen/栈/变量读/步进）在只读系统可用；仅变量写 403 READ_ONLY。
-- `system_debug: true` 才能让 SAP 标准码断点生效（否则被接受但永不触发）。无语句的行会进 `rejected[]` 并带 SAP 原因。
+- `system_debug: true`（**bp_set 的 body 参数**，不是会话参数）才能让 SAP 标准码断点生效（否则被接受但永不触发）。无语句的行会进 `rejected[]` 并带 SAP 原因。
+- **优雅停机会善后**：SIGTERM/排空时网关在退出前 ~20s 内 teardown 全部调试会话（detach + 摘 listener + 清断点）——残留 listener 行会静默吞掉该用户的下一个 debuggee。
 - 能力开关：`GET /api/version` → `capabilities.debug`。多系统作用域照常（`/api/s/{system}/debug/**`）；作用域形式的关会话仍校验 sid 归属。
 - MCP 镜像工具规划在后续批次；REST 面已完整。
 
