@@ -623,7 +623,7 @@ fn xml_attr(s: &str, tag: &str, attr: &str) -> Option<String> {
     let open = format!("<{tag}");
     let i = s.find(&open)?;
     let rest = &s[i + open.len()..];
-    let end = rest.find('>').map(|j| j).unwrap_or(rest.len());
+    let end = rest.find('>').unwrap_or(rest.len());
     let head = &rest[..end];
     let needle = format!("{attr}=\"");
     let a = head.find(&needle)?;

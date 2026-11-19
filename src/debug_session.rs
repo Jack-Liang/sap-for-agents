@@ -20,7 +20,7 @@ use axum::body::Bytes;
 use axum::http::Method;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// 每请求必带的 stateful 标记（ICF 无它即按无状态回收上下文）。
 const STATEFUL_HEADER: &str = "X-sap-adt-sessiontype";
@@ -39,14 +39,11 @@ pub(crate) struct DebugSession {
     cookies: Mutex<BTreeMap<String, String>>,
     /// 会话内 CSRF token（同会话签发；None = 尚未签发）。
     csrf: Mutex<Option<String>>,
-    created: Instant,
-    last_used: Mutex<Instant>,
 }
 
 /// [`DebugSession::request`] 的响应（ADT 原样透出，调用方自行解读）。
 pub(crate) struct DebugResponse {
     pub status: u16,
-    pub content_type: Option<String>,
     /// 同响应携带的 CSRF token（CSRF fetch 时取用）
     pub csrf_token: Option<String>,
     pub body: Bytes,
@@ -72,8 +69,6 @@ impl DebugSession {
             ep,
             cookies: Mutex::new(BTreeMap::new()),
             csrf: Mutex::new(None),
-            created: Instant::now(),
-            last_used: Mutex::new(Instant::now()),
         };
         // ① 建上下文（set-cookie 落 jar）
         s.request(Method::GET, "discovery", &DebugRequest {
@@ -130,17 +125,10 @@ impl DebugSession {
             .get("x-csrf-token")
             .and_then(|v| v.to_str().ok())
             .map(str::to_owned);
-        let content_type = resp
-            .headers()
-            .get("content-type")
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_owned);
         self.absorb_set_cookies(&resp);
         let body = resp.bytes().await.map_err(adt_unreachable)?;
-        *self.last_used.lock().map_err(|_| poisoned())? = Instant::now();
         Ok(DebugResponse {
             status,
-            content_type,
             csrf_token,
             body,
         })
@@ -288,19 +276,6 @@ impl DebugSession {
     /// ADT 登录用户（listener 的 requestUser / 断点 requestUser）。
     pub(crate) fn user(&self) -> &str {
         self.ep.user()
-    }
-
-    /// 建会话至今。
-    pub(crate) fn age(&self) -> Duration {
-        self.created.elapsed()
-    }
-
-    /// 距上次使用（TTL 回收与诊断用）。
-    pub(crate) fn idle_for(&self) -> Duration {
-        self.last_used
-            .lock()
-            .map(|g| g.elapsed())
-            .unwrap_or_else(|_| Duration::ZERO)
     }
 
     /// jar → Cookie 头串（SSO2 形态并入 MYSAPSSO2——身份在票据里）。
