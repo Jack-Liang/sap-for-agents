@@ -76,6 +76,7 @@ curl -H "Authorization: Bearer <SAP_API_KEY>" http://127.0.0.1:3000/api/function
 | Create / read / release / delete CTS transport requests | `POST`·`GET` `/api/cts/requests…` |
 | Search ALL object types by name (ADT quick search) | `GET /api/objects/search?q=` |
 | OpenSQL SELECT via ADT data preview (pooled tables, joins) | `POST /api/table/osql` |
+| Debug ABAP remotely (breakpoints / listen / stack / **variable write** / step-resume; observe-only on read-only systems) | `POST`·`GET`·`DELETE /api/debug/**` |
 | Per-system login: SSO2 / SNC / ADT mTLS+OAuth2 / auth plugin | `auth.*` / `adt.*` blocks in `sap_systems.toml` (see §13) |
 | Human-friendly interactive API docs | `GET /docs` (Redoc rendering of the spec) |
 
@@ -767,7 +768,7 @@ curl -X POST http://127.0.0.1:3000/api/debug/breakpoints -H "Content-Type: appli
 # 2) Session: server blocks on the ADT listener (listen_secs is also the debuggee's
 #    wait window); agent polls GET /api/debug/sessions/{sid}
 curl -X POST http://127.0.0.1:3000/api/debug/sessions -H "Content-Type: application/json" \
-  -d '{"listen_secs":60,"system_debug":false}'
+  -d '{"listen_secs":60}'
 # → 202 {"sid":"dbg-…","state":"listening"}
 
 # 3) Trigger the same user's code (gateway user = breakpoint owner) ~1s AFTER
@@ -797,7 +798,7 @@ Key behaviors (all verified on A4H/816, see `docs/DEBUGGER-CONTRACT.zh-CN.md`):
 - `system_debug: true` (bp_set body flag — NOT a session flag) arms breakpoints in SAP standard code (without it they are accepted but never fire). Line targets without a statement come back in `rejected[]` with SAP's reason.
 - **Graceful shutdown cleans up**: on SIGTERM/drain the gateway tears down every debug session (detach + listener removal + breakpoint wipe) within ~20s before exiting — a stale listener row would silently swallow the user's next debuggee.
 - Capability flag: `GET /api/version` → `capabilities.debug`. Multi-system scope applies (`/api/s/{system}/debug/**`); the scoped `DELETE …/sessions/{sid}` still verifies sid ownership.
-- MCP mirror tools are planned for a follow-up; the REST surface is complete.
+- MCP mirrors ship as `debug_manage` + `debug_inspect` (`tools/list`).
 
 ## Key constraints (pitfalls to avoid)
 
@@ -871,6 +872,7 @@ curl http://127.0.0.1:3000/api/version
 #     "auth": false,                     # true = /api/* needs Bearer token (this endpoint excepted)
 #     "read_only": false,                # true = write endpoints return 403 READ_ONLY
 #     "adt": true,                       # true = /api/adt/** and /api/dumps* are usable
+#     "debug": true,                     # true = /api/debug/** (breakpoints/step/variables) usable
 #     "registry": true,                  # true = /api/registry** (cross-session API memory) is usable
 #     "rate_limit_rps": null             # per-IP cap; null = unlimited
 #   },

@@ -80,7 +80,7 @@ listening ──(catch: debuggee 命中→attach→栈)──→ stopped ⇄(ste
 | `POST /api/debug/breakpoints` | 设断点：`{"targets":[{"kind":"prog","name":"ZFOO","line":42}]}`（类/FM 同理），返回 ADT 断点 id |
 | `GET /api/debug/breakpoints` | 列出（网关视角 + ADT 实况） |
 | `DELETE /api/debug/breakpoints/{id}`、`?all=true` | 删（`all` = 该用户全部外部断点——清残留利器） |
-| `POST /api/debug/sessions` | 建会话并开始 listen：`{"listen_secs":120,"system_debug":false}` → `202 {"sid":…}` |
+| `POST /api/debug/sessions` | 建会话并开始 listen：`{"listen_secs":120}` → `202 {"sid":…}`（`system_debug` 旗标在 bp_set body，见断点行） |
 | `GET /api/debug/sessions/{sid}` | 状态轮询：`listening / stopped / finished / session_lost` + 当前位置（program/line/URI） |
 | `GET /api/debug/sessions/{sid}/stack` | 调用栈（每帧 index/program/include/line/procedure/uri） |
 | `GET /api/debug/sessions/{sid}/stack/{frame}/variables` | 变量树：`?depth=&max_elements=` 限深防爆（结构展开/内表分页） |
@@ -88,9 +88,9 @@ listening ──(catch: debuggee 命中→attach→栈)──→ stopped ⇄(ste
 | `POST /api/debug/sessions/{sid}/control` | `{"action":"step_over"\|"step_into"\|"step_out"\|"resume"\|"to_line","line":…}` |
 | `DELETE /api/debug/sessions/{sid}` | detach（debuggee 恢复运行）；`?delete_breakpoints=true` 顺带清本会话相关断点 |
 
-MCP 侧镜像（**缓期至下一批次**——REST 面已完整服务 agent，MCP 工具需先把
-handlers 抽成 `Arc<SystemHandle>` 入参的核函数，纯机械重构不影响契约）：
-倾向收敛为 2 个带 action 参数的工具 `debug_manage` + `debug_inspect`。
+MCP 侧镜像已实现（`debug_manage` + `debug_inspect` 两工具，直调 REST handler
+复用同一套语义——前提是 debug.rs 的 handler/DTO 提为 `pub(crate)`，`Sap`/
+`axum::Json` 可直接构造所以零重构）。
 
 ### 3.4 策略决策（写死，不留给实现时摇摆）
 

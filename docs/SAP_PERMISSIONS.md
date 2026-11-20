@@ -14,6 +14,13 @@ By default it uses `DEVELOPER` (a developer account with broad privileges). This
 
 ## Configuration Steps (Basis Administration)
 
+> **v0.22 note — remote debugging**: `POST /api/debug/**` additionally requires
+> external-debugger authorization for the gateway account (typically `S_DEVELOP`
+> with activity `DEBUG` on the target package(s), plus the account being allowed
+> external breakpoints). Without it, session/listen calls fail with SAP's own
+> authorization error; the surface still starts and reports honestly.
+
+
 ### 1. Create a Dedicated Service Account (SU01)
 
 - In transaction `SU01`, create a new user (e.g. `SAP_RFC_GW`).

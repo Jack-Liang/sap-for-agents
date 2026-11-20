@@ -2783,6 +2783,405 @@
           }
         }
       }
+    },
+    "/api/debug/breakpoints": {
+      "post": {
+        "tags": [
+          "debug"
+        ],
+        "summary": "Set breakpoints (whole-set replace, no session needed)",
+        "description": "Registers exactly this set of external line breakpoints for the gateway user (requestUser+ideId+terminalId identity), replacing whatever that identity had — a POST is a whole-set replace, so add/drop one = read-modify-write the set. Names are lowercased automatically (the breakpoint URI-mapper is case-sensitive). Lines without a statement come back in `rejected[]` with SAP's reason. `system_debug: true` arms SAP standard-code breakpoints (without it they are accepted but never fire). Cleaned automatically when the listener is removed (DELETE /api/debug/sessions/{sid}).",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "targets"
+                ],
+                "properties": {
+                  "targets": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "required": [
+                        "line"
+                      ],
+                      "properties": {
+                        "kind": {
+                          "type": "string",
+                          "enum": [
+                            "prog",
+                            "class",
+                            "fm",
+                            "uri"
+                          ]
+                        },
+                        "name": {
+                          "type": "string"
+                        },
+                        "group": {
+                          "type": "string",
+                          "description": "Function group (required when kind=fm)"
+                        },
+                        "line": {
+                          "type": "integer"
+                        },
+                        "condition": {
+                          "type": "string",
+                          "description": "ABAP logical expression"
+                        }
+                      }
+                    }
+                  },
+                  "system_debug": {
+                    "type": "boolean",
+                    "default": false
+                  }
+                }
+              }
+            }
+          },
+          "responses": {
+            "200": {
+              "description": "Placed + rejected breakpoints with ids"
+            },
+            "502": {
+              "description": "ADT error"
+            }
+          }
+        }
+      },
+      "get": {
+        "tags": [
+          "debug"
+        ],
+        "summary": "List breakpoints (gateway ledger, cross-checked against SAP)",
+        "responses": {
+          "200": {
+            "description": "count + breakpoints"
+          },
+          "409": {
+            "description": "Conflict — e.g. DEBUG_SESSION_EXISTS (one session per system), DEBUG_NOT_STOPPED, DEBUG_NO_SESSION"
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "debug"
+        ],
+        "summary": "Clear all breakpoints (empty-set replace)",
+        "responses": {
+          "200": {
+            "description": "cleared"
+          },
+          "409": {
+            "description": "Conflict — e.g. DEBUG_SESSION_EXISTS (one session per system), DEBUG_NOT_STOPPED, DEBUG_NO_SESSION"
+          }
+        }
+      }
+    },
+    "/api/debug/breakpoints/{id}": {
+      "delete": {
+        "tags": [
+          "debug"
+        ],
+        "summary": "Delete one breakpoint by id (read-modify-write the set)",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "deleted + remaining count"
+          },
+          "404": {
+            "description": "DEBUG_BP_UNKNOWN"
+          },
+          "409": {
+            "description": "Conflict — e.g. DEBUG_SESSION_EXISTS (one session per system), DEBUG_NOT_STOPPED, DEBUG_NO_SESSION"
+          }
+        }
+      }
+    },
+    "/api/debug/sessions": {
+      "post": {
+        "tags": [
+          "debug"
+        ],
+        "summary": "Start a debug session: blocking ADT listener runs server-side",
+        "description": "One session per system (409 DEBUG_SESSION_EXISTS). listen_secs is also the debuggee's wait window. Trigger same-user code ~1s AFTER creating (listener registration needs a beat; a debuggee hitting the breakpoint before registration is simply skipped). Poll GET /api/debug/sessions/{sid}. Idle sessions are torn down after 30 min.",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "listen_secs": {
+                    "type": "integer",
+                    "default": 60,
+                    "maximum": 600
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "sid + state listening"
+          },
+          "409": {
+            "description": "Conflict — e.g. DEBUG_SESSION_EXISTS (one session per system), DEBUG_NOT_STOPPED, DEBUG_NO_SESSION"
+          },
+          "503": {
+            "description": "ADT_DISABLED"
+          }
+        }
+      }
+    },
+    "/api/debug/sessions/{sid}": {
+      "get": {
+        "tags": [
+          "debug"
+        ],
+        "summary": "Poll session status (in-memory, zero SAP round trips)",
+        "description": "state: listening / stopped (with position) / finished / lost. Polling never touches SAP.",
+        "parameters": [
+          {
+            "name": "sid",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "status document"
+          },
+          "404": {
+            "description": "DEBUG_SESSION_UNKNOWN"
+          },
+          "409": {
+            "description": "Conflict — e.g. DEBUG_SESSION_EXISTS (one session per system), DEBUG_NOT_STOPPED, DEBUG_NO_SESSION"
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "debug"
+        ],
+        "summary": "Close session: detach + remove listener + wipe that user's breakpoints",
+        "description": "SAP semantics: removing the listener ends external debugging for the user and deletes ALL of the user's external breakpoints — also the cleanup lever for stale state.",
+        "parameters": [
+          {
+            "name": "sid",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "closed"
+          },
+          "404": {
+            "description": "DEBUG_SESSION_UNKNOWN"
+          },
+          "409": {
+            "description": "Conflict — e.g. DEBUG_SESSION_EXISTS (one session per system), DEBUG_NOT_STOPPED, DEBUG_NO_SESSION"
+          }
+        }
+      }
+    },
+    "/api/debug/sessions/{sid}/stack": {
+      "get": {
+        "tags": [
+          "debug"
+        ],
+        "summary": "Call stack of the stopped program (innermost first, cursor frame = frames[0])",
+        "parameters": [
+          {
+            "name": "sid",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "frames"
+          },
+          "409": {
+            "description": "DEBUG_NOT_STOPPED"
+          }
+        }
+      }
+    },
+    "/api/debug/sessions/{sid}/variables": {
+      "get": {
+        "tags": [
+          "debug"
+        ],
+        "summary": "Variables of the current frame (auto-descends @ROOT to locals)",
+        "description": "?parent=ID expands structures/tables; ?frame=N PUTs the frame switch first (read caller-frame locals).",
+        "parameters": [
+          {
+            "name": "sid",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "parent",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "frame",
+            "in": "query",
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "hierarchy + variables"
+          },
+          "404": {
+            "description": "DEBUG_FRAME_UNKNOWN"
+          },
+          "409": {
+            "description": "Conflict — e.g. DEBUG_SESSION_EXISTS (one session per system), DEBUG_NOT_STOPPED, DEBUG_NO_SESSION"
+          }
+        }
+      }
+    },
+    "/api/debug/sessions/{sid}/variables/{name}": {
+      "put": {
+        "tags": [
+          "debug"
+        ],
+        "summary": "Write a variable's value (changes real execution; read-back confirmed)",
+        "description": "403 READ_ONLY on read-only systems. Only valid while stopped.",
+        "parameters": [
+          {
+            "name": "sid",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "value"
+                ],
+                "properties": {
+                  "value": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "written + confirmed read-back"
+          },
+          "403": {
+            "description": "READ_ONLY"
+          },
+          "409": {
+            "description": "Conflict — e.g. DEBUG_SESSION_EXISTS (one session per system), DEBUG_NOT_STOPPED, DEBUG_NO_SESSION"
+          }
+        }
+      }
+    },
+    "/api/debug/sessions/{sid}/control": {
+      "post": {
+        "tags": [
+          "debug"
+        ],
+        "summary": "Step / resume (step_into | step_over | step_out | resume)",
+        "description": "resume ending with ended:true (debuggeeEnded) is the normal terminal state.",
+        "parameters": [
+          {
+            "name": "sid",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "action"
+                ],
+                "properties": {
+                  "action": {
+                    "type": "string",
+                    "enum": [
+                      "step_into",
+                      "step_over",
+                      "step_out",
+                      "resume"
+                    ]
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "step result / ended"
+          },
+          "409": {
+            "description": "DEBUG_NOT_STOPPED"
+          }
+        }
+      }
     }
   },
   "components": {

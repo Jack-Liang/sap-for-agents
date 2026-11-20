@@ -70,6 +70,14 @@ curl -H "Authorization: Bearer <SAP_API_KEY>" http://127.0.0.1:3000/api/function
 | 想要**按 BAPI 生成类型化 operation** 的规范（参数/类型/字段全展开） | `GET /api/openapi?functions=BAPI_X,BAPI_Y` |
 | 改函数前想知道**谁在调用它**（where-used 引用查询） | `GET /api/functions/{name}/where-used` |
 | 你是 MCP 客户端（Claude 等）——把网关挂载为 MCP 工具服务器 | `POST /mcp`（Streamable HTTP 无状态） |
+| 跑一段 ABAP 代码（临时 classrun 类，自动删除） | `POST /api/abap/run` |
+| 跑 ABAP Unit 测试（json / junit4 / raw 输出） | `POST /api/tests/aunit` |
+| 跑 ATC 代码检查（发现项 JSON） | `POST /api/atc/run` |
+| 创建 / 读取 / 释放 / 删除 CTS 传输请求 | `POST`·`GET` `/api/cts/requests…` |
+| 按名称搜索**所有**对象类型（ADT quick search） | `GET /api/objects/search?q=` |
+| OpenSQL SELECT 走 ADT 数据预览（池表、JOIN） | `POST /api/table/osql` |
+| 远程调试 ABAP（断点 / 监听 / 调用栈 / **变量写** / 单步放行；只读系统可观察） | `POST`·`GET`·`DELETE /api/debug/**` |
+| 每系统登录方式：SSO2 / SNC / ADT mTLS+OAuth2 / 鉴权插件 | `sap_systems.toml` 的 `auth.*` / `adt.*` 块（见 §13） |
 | 人类友好的交互式 API 文档 | `GET /docs`（Redoc 渲染规范） |
 
 ## 首次启动引导（Agent 引导配置）
@@ -757,7 +765,7 @@ curl -X POST http://127.0.0.1:3000/api/debug/breakpoints -H "Content-Type: appli
 # 2) 建会话：服务端阻塞等 ADT listener（listen_secs 同时是 debuggee 的等待窗）；
 #    agent 轮询 GET /api/debug/sessions/{sid}
 curl -X POST http://127.0.0.1:3000/api/debug/sessions -H "Content-Type: application/json" \
-  -d '{"listen_secs":60,"system_debug":false}'
+  -d '{"listen_secs":60}'
 # → 202 {"sid":"dbg-…","state":"listening"}
 
 # 3) 建会话后等 ~1s 再触发同用户代码（listener 服务端登记需要一拍——
@@ -786,7 +794,7 @@ curl -X DELETE http://127.0.0.1:3000/api/debug/sessions/{sid}
 - `system_debug: true`（**bp_set 的 body 参数**，不是会话参数）才能让 SAP 标准码断点生效（否则被接受但永不触发）。无语句的行会进 `rejected[]` 并带 SAP 原因。
 - **优雅停机会善后**：SIGTERM/排空时网关在退出前 ~20s 内 teardown 全部调试会话（detach + 摘 listener + 清断点）——残留 listener 行会静默吞掉该用户的下一个 debuggee。
 - 能力开关：`GET /api/version` → `capabilities.debug`。多系统作用域照常（`/api/s/{system}/debug/**`）；作用域形式的关会话仍校验 sid 归属。
-- MCP 镜像工具规划在后续批次；REST 面已完整。
+- MCP 镜像工具已随版发布：`debug_manage` + `debug_inspect`（`tools/list` 可见）。
 
 ## 关键约束（避坑）
 
@@ -860,6 +868,7 @@ curl http://127.0.0.1:3000/api/version
 #     "auth": false,                     # true = /api/* 需 Bearer token（本端点除外）
 #     "read_only": false,                # true = 写端点返回 403 READ_ONLY
 #     "adt": true,                       # true = /api/adt/** 与 /api/dumps* 可用
+#     "debug": true,                     # true = /api/debug/**（断点/单步/变量）可用
 #     "registry": true,                  # true = /api/registry**（跨会话 API 记忆）可用
 #     "rate_limit_rps": null             # 按 IP 每秒上限；null = 不限流
 #   },
