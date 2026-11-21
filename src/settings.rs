@@ -415,6 +415,7 @@ mod tests {
             adt_passwd: String::new(),
             read_only: false,
             registry_file: "test-registry.json".into(),
+            oauth_state_file: std::env::temp_dir().join("sap-oauth-test-state.json"),
             runtime_mode: false,
             update_check: false,
             systems_file: std::env::temp_dir().join("no-such-systems.toml"),

@@ -49,3 +49,5 @@ servers.toml
 registry.json
 sap_systems.toml
 sap_gateway.toml
+# OAuth authorization_code 流的 refresh token（v0.23，运行期获取的密钥，不提交）
+sap_oauth_state.json

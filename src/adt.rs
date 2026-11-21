@@ -38,6 +38,14 @@ use std::time::{Duration, Instant};
 /// - `OAuth`：OAuth 2.0 密码授权（BTP/ABAP Cloud ADT 只认这个）——Bearer
 ///   token 懒取 + 进程内缓存 + 401 强制刷新重试一次；password 可省
 ///   （缓存里有 refresh token 时），刷新失败回落 password grant。
+///   - `grant = authorization_code`（v0.23）：BTP XSUAA `binding-secret` 类
+///     credential 只放 client_credentials——trial 的 ABAP 系统拒收这种无用户
+///     身份的 token（实测 401）。改走浏览器授权：`POST /api/setup/system/{n}/authorize`
+///     拿 authorize_url → 用户登录 → 回调换 token → refresh_token 种子注入 +
+///     落盘。运行期只靠 refresh_token grant 静默续期，**刷新失败不回落**
+///     （client_credentials 产物必被 ABAP 拒收，静默回落只会把错误变成更难
+///     排查的 401），直接 fail-fast 指引重授权。
+///
 ///   mTLS 客户端证书与鉴权**正交**（identity 见 `AdtEndpointOpts`）。
 pub(crate) enum AdtAuthSpec {
     Basic {
@@ -57,7 +65,32 @@ pub(crate) enum AdtAuthSpec {
         client_secret: String,
         user: Option<String>,
         passwd: Option<String>,
+        grant: OAuthGrant,
     },
+}
+
+/// OAuth grant 形态：直取族（password / client_credentials，按 user/passwd
+/// 有无派生——旧行为）vs authorization_code 种子族（依赖 refresh_token）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OAuthGrant {
+    /// 完整 grant 直取：配了 user/passwd 走 password，否则 client_credentials。
+    ClientCredentials,
+    /// authorization_code 种子流：refresh_token 由浏览器授权注入，无完整
+    /// grant 可回落（见 [`AdtAuthSpec::OAuth`] 文档）。
+    AuthorizationCode,
+}
+
+impl OAuthGrant {
+    /// 从 toml 字符串解析（非法值给出合法名单）。
+    pub(crate) fn parse(value: &str, ctx: &str) -> Result<Self, String> {
+        match value.trim() {
+            "client_credentials" => Ok(OAuthGrant::ClientCredentials),
+            "authorization_code" => Ok(OAuthGrant::AuthorizationCode),
+            other => Err(format!(
+                "{ctx}.oauth.grant 取值 '{other}' 不支持（合法: client_credentials, authorization_code）"
+            )),
+        }
+    }
 }
 
 /// OAuth 缓存状态（token + 拿到时刻；提前 60s 视为过期，sapcli 同款余量）
@@ -67,12 +100,29 @@ struct OAuthState {
     client_secret: String,
     user: Option<String>,
     passwd: Option<String>,
+    grant: OAuthGrant,
+    /// 持久化键（= 系统名；None = 不落盘，测试/工具调用形态）
+    state_key: Option<String>,
     token: Mutex<Option<(String, Instant)>>,
-    /// refresh token（grant 响应带就存；内存态，重启后重新 password grant）
+    /// refresh token（grant 响应带就存 + authcode 形态落盘；重启后水合回填）
     refresh: Mutex<Option<String>>,
 }
 
 const OAUTH_REFRESH_MARGIN: Duration = Duration::from_secs(60);
+
+/// 归一 token 端点：配置的 `token_url` 有两种约定——裸 base
+/// （`https://tenant.authentication…`）与带 `/oauth/token` 后缀
+/// （AGENTS.md §13 文档形态）。两种都收：已带后缀的剥掉再统一拼，
+/// 防止 `…/oauth/token/oauth/token` 这种双重拼接。
+pub(crate) fn oauth_token_base(token_url: &str) -> String {
+    let base = token_url.trim_end_matches('/');
+    base.strip_suffix("/oauth/token").unwrap_or(base).to_string()
+}
+
+/// token 端点全 URL（`{base}/oauth/token`，base 见 [`oauth_token_base`]）。
+pub(crate) fn oauth_token_endpoint(token_url: &str) -> String {
+    format!("{}/oauth/token", oauth_token_base(token_url))
+}
 
 /// 外部鉴权插件配置（sapcli auth_plugin 借鉴 B3，网关版收缩到 ADT 通道）。
 ///
@@ -201,6 +251,7 @@ impl AdtEndpoint {
             },
             &[],
             None,
+            None,
             timeout,
         )
         .expect("Basic 形态构造不会失败（无 TLS 素材读取）")
@@ -208,11 +259,14 @@ impl AdtEndpoint {
 
     /// 完整构造：鉴权形态 + TLS 素材（mTLS identity / CA bundle）。
     /// `tls_files`：cert PEM 路径 + 可选 key PEM 路径（key 缺省 = cert 单文件含私钥）。
+    /// `state_key`：OAuth 持久化键（= 系统名，refresh token 轮换时落盘；
+    /// None = 不落盘——测试/工具调用形态）。
     pub(crate) fn new_with_auth(
         base_url: &str,
         auth: AdtAuthSpec,
         tls_files: &[&str],
         ca_bundle: Option<&str>,
+        state_key: Option<&str>,
         timeout: Duration,
     ) -> Result<Self, String> {
         use base64::Engine;
@@ -232,6 +286,7 @@ impl AdtEndpoint {
                 client_secret,
                 user,
                 passwd,
+                grant,
             } => (
                 AuthState::OAuth(OAuthState {
                     token_url,
@@ -239,6 +294,8 @@ impl AdtEndpoint {
                     client_secret,
                     user: user.clone(),
                     passwd,
+                    grant,
+                    state_key: state_key.map(|s| s.to_string()),
                     token: Mutex::new(None),
                     refresh: Mutex::new(None),
                 }),
@@ -511,6 +568,21 @@ impl AdtEndpoint {
 
     /// OAuth token：缓存未过期直接用 → refresh_token 换新 → password grant。
     /// `force=true` 丢弃缓存强制重取（401 后用）。
+    /// 注入 authorization_code 流的 refresh_token 种子（浏览器授权完成后由
+    /// setup 层热注入**运行中的端点**，无需重建句柄；`None` 仅清空——重授权
+    /// 前使旧种子失效）。仅 OAuth 形态且为 authcode grant 时生效。
+    pub(crate) fn seed_oauth_refresh(&self, token: Option<String>) -> bool {
+        if let AuthState::OAuth(st) = &self.auth {
+            if st.grant == OAuthGrant::AuthorizationCode {
+                if let Ok(mut g) = st.refresh.lock() {
+                    *g = token;
+                }
+                return true;
+            }
+        }
+        false
+    }
+
     async fn oauth_token(&self, force: bool) -> Result<String, RfcError> {
         let state = match &self.auth {
             AuthState::OAuth(st) => st,
@@ -535,7 +607,7 @@ impl AdtEndpoint {
         }
         // refresh 优先（有就先试，失败回落 password grant——sapcli get_token 同序）
         let refresh = state.refresh.lock().ok().and_then(|g| g.clone());
-        let token_url = format!("{}/oauth/token", state.token_url.trim_end_matches('/'));
+        let token_url = oauth_token_endpoint(&state.token_url);
         let send_grant = |form: Vec<(&str, String)>| {
             self.client
                 .post(&token_url)
@@ -543,17 +615,52 @@ impl AdtEndpoint {
                 .header("Accept", "application/json")
                 .form(&form)
         };
-        // 刷新失败不致命：走完整 grant（refresh token 可能已过期/吊销）
-        let response = if let Some(rt) = refresh {
+        // 刷新失败不致命：走完整 grant（refresh token 可能已过期/吊销）。
+        // authcode 形态必须区分「被明确拒收」（token 真死了 → 指引重授权）与
+        // 「请求本身失败」（网络/5xx 抖动 → 可重试，别误导用户去重新授权）。
+        enum RefreshOutcome {
+            Ok,
+            Rejected { status: u16, body: String },
+            Failed(String),
+        }
+        let mut refresh_outcome: Option<RefreshOutcome> = None;
+        let response: Option<reqwest::Response> = if let Some(ref rt) = refresh {
             match send_grant(vec![
                 ("grant_type", "refresh_token".into()),
-                ("refresh_token", rt),
+                ("refresh_token", rt.clone()),
             ])
             .send()
             .await
             {
-                Ok(r) if r.status().is_success() => Some(r),
-                _ => None,
+                Ok(r) if r.status().is_success() => {
+                    refresh_outcome = Some(RefreshOutcome::Ok);
+                    Some(r)
+                }
+                Ok(r) => {
+                    // XSUAA 的错误体必须留痕——静默吞掉会把可诊断问题变成谜团
+                    let status = r.status().as_u16();
+                    let body = r.text().await.unwrap_or_default();
+                    tracing::warn!(
+                        system = state.state_key.as_deref().unwrap_or("?"),
+                        status,
+                        resp = %crate::explore::first_line(&body),
+                        "OAuth refresh token 换新被拒"
+                    );
+                    refresh_outcome = Some(RefreshOutcome::Rejected {
+                        status,
+                        body: crate::explore::first_line(&body),
+                    });
+                    None
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        system = state.state_key.as_deref().unwrap_or("?"),
+                        error = %e,
+                        "OAuth refresh 请求发送失败"
+                    );
+                    refresh_outcome = Some(RefreshOutcome::Failed(e.to_string()));
+                    None
+                }
             }
         } else {
             None
@@ -561,8 +668,59 @@ impl AdtEndpoint {
 
         let response = match response {
             Some(r) => r,
+            None if state.grant == OAuthGrant::AuthorizationCode => {
+                // authcode 种子流没有可回落的完整 grant：client_credentials 产物
+                // 无用户身份（BTP binding-secret 只放这个 grant），ABAP 系统必拒
+                // 收（实测 401）——静默回落只会把错误变成更难排查的下游 401。
+                let sys = state.state_key.as_deref().unwrap_or("<system>");
+                return Err(match refresh_outcome.as_ref() {
+                    // 明确被拒：token 真死了（过期/吊销）→ 指引重授权
+                    Some(RefreshOutcome::Rejected { status, body }) => RfcError {
+                        code: -1,
+                        status: 401,
+                        message: format!(
+                            "OAuth authorization_code 形态：refresh token 被 XSUAA 拒收\
+                             （HTTP {status}: {body}）。重新授权：\
+                             POST /api/setup/system/{sys}/authorize \
+                             （打开返回的 authorize_url 完成浏览器登录即可）"
+                        ),
+                        key: "ADT_OAUTH_REAUTH".into(),
+                    },
+                    // 请求本身失败：可能瞬时（网络抖动/限流）→ 可重试，别误导重授权
+                    Some(RefreshOutcome::Failed(detail)) => RfcError {
+                        code: -1,
+                        status: 502,
+                        message: format!(
+                            "OAuth refresh 请求失败（{detail}）——可能瞬时，下一周期探测会重试；\
+                             持续失败再重新授权：POST /api/setup/system/{sys}/authorize"
+                        ),
+                        key: "ADT_OAUTH_REFRESH_RETRY".into(),
+                    },
+                    // 无种子：还没做过浏览器授权
+                    _ => RfcError {
+                        code: -1,
+                        status: 401,
+                        message: format!(
+                            "OAuth authorization_code 形态：尚未完成浏览器授权（没有 refresh token 种子）。\
+                             授权：POST /api/setup/system/{sys}/authorize \
+                             （打开返回的 authorize_url 完成浏览器登录即可）"
+                        ),
+                        key: "ADT_OAUTH_REAUTH".into(),
+                    },
+                });
+            }
             None => {
-                let mut form = vec![("grant_type", "password".to_string())];
+                // 无 user/passwd 的 OAuth(BTP XSUAA service key)走 client_credentials;
+                // 配了 user/passwd(经典 SAP ICM OAuth 账号)保持 password grant。
+                let is_client_credentials = state.user.is_none() && state.passwd.is_none();
+                let mut form = vec![(
+                    "grant_type",
+                    if is_client_credentials {
+                        "client_credentials".to_string()
+                    } else {
+                        "password".to_string()
+                    },
+                )];
                 if let Some(u) = &state.user {
                     form.push(("username", u.clone()));
                 }
@@ -604,9 +762,29 @@ impl AdtEndpoint {
                 key: "ADT_OAUTH_FAILED".into(),
             })?
             .to_string();
-        if let Some(rt) = data.get("refresh_token").and_then(|v| v.as_str()) {
-            if let Ok(mut g) = state.refresh.lock() {
-                *g = Some(rt.to_string());
+        if let Some(rt) = data
+            .get("refresh_token")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+        {
+            // 值真的轮换了才动（XSUAA refresh grant 可能原样返回旧 token）
+            let rotated = state.refresh.lock().ok().map(|mut g| {
+                let changed = g.as_deref() != Some(rt.as_str());
+                *g = Some(rt.clone());
+                changed
+            });
+            // authcode 形态必须落盘：XSUAA 轮换 refresh token 时旧值可能即时
+            // 失效，新值赶在下次换新前持久化，否则重启即丢授权。
+            if rotated == Some(true) && state.grant == OAuthGrant::AuthorizationCode {
+                if let Some(key) = &state.state_key {
+                    if let Err(e) = crate::oauth_state::store_refresh(key, &rt) {
+                        tracing::warn!(
+                            system = %key,
+                            error = %e,
+                            "refresh token 落盘失败——重启后需重新浏览器授权"
+                        );
+                    }
+                }
             }
         }
         let expires_in = data
@@ -621,6 +799,25 @@ impl AdtEndpoint {
             ));
         }
         Ok(access)
+    }
+
+    /// ADT 就绪探针（ADT-only 系统的 "ping"）：轻量 GET discovery，带鉴权与
+    /// 401 重试（`get_raw` 内建）。200 级 = 可用；其余状态/网络错误 = 不可达。
+    /// 不做语义校验——body 内容无关紧要，能拿到响应就是通道健康。
+    pub(crate) async fn ping(&self) -> Result<(), RfcError> {
+        let (status, _, _) = self
+            .get_raw("discovery", "application/atomsvc+xml")
+            .await?;
+        if (200..300).contains(&status) {
+            Ok(())
+        } else {
+            Err(RfcError {
+                code: -1,
+                status: if status == 401 || status == 403 { 503 } else { 502 },
+                message: format!("ADT 探测失败（HTTP {status}）"),
+                key: "ADT_PING_FAILED".into(),
+            })
+        }
     }
 
     /// 内部 GET 通道：供网关自身的结构化端点（`/api/dumps/**`）复用 ADT 配置、
@@ -1458,6 +1655,101 @@ pub(crate) fn encode_path_segment(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---------------- OAuth authorization_code 门禁（v0.23） ----------------
+
+    /// authcode 形态端点（state_key 登记——持久化钩子只在真正拿到 token 时触发，
+    /// 本组测试不产生落盘）。
+    fn authcode_ep(token_url: String) -> AdtEndpoint {
+        AdtEndpoint::new_with_auth(
+            "http://127.0.0.1:1",
+            AdtAuthSpec::OAuth {
+                token_url,
+                client_id: "cid".into(),
+                client_secret: "sec".into(),
+                user: None,
+                passwd: None,
+                grant: OAuthGrant::AuthorizationCode,
+            },
+            &[],
+            None,
+            Some("sfa-test-sys"),
+            Duration::from_secs(5),
+        )
+        .expect("authcode endpoint")
+    }
+
+    #[tokio::test]
+    async fn oauth_authcode_without_seed_fails_fast_with_reauth_hint() {
+        let ep = authcode_ep("http://127.0.0.1:1".into());
+        let e = ep.oauth_token(false).await.unwrap_err();
+        assert_eq!(e.key, "ADT_OAUTH_REAUTH");
+        assert_eq!(e.status, 401);
+        assert!(e.message.contains("authorize"), "got: {}", e.message);
+    }
+
+    #[tokio::test]
+    async fn oauth_authcode_dead_refresh_never_falls_back_to_client_credentials() {
+        // mock token server：refresh grant 一律 400——旧行为会静默回落
+        // client_credentials 拿到一个 ABAP 必拒收的 token；新行为 fail-fast。
+        let app = axum::Router::new().route(
+            "/oauth/token",
+            axum::routing::post(|| async {
+                (
+                    axum::http::StatusCode::BAD_REQUEST,
+                    r#"{"error":"invalid_grant"}"#,
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let ep = authcode_ep(format!("http://{addr}"));
+        assert!(ep.seed_oauth_refresh(Some("stale-token".into())));
+        let e = ep.oauth_token(false).await.unwrap_err();
+        assert_eq!(e.key, "ADT_OAUTH_REAUTH", "got: {}", e.message);
+        // 明确拒收 → 指引重授权，且 XSUAA 错误体留痕（可诊断）
+        assert!(e.message.contains("被 XSUAA 拒收"), "got: {}", e.message);
+        assert!(e.message.contains("invalid_grant"), "got: {}", e.message);
+        assert!(e.message.contains("authorize"), "got: {}", e.message);
+    }
+
+    #[tokio::test]
+    async fn adt_ping_2xx_ok_and_error_status() {
+        // 200 mock → ping Ok
+        let app = axum::Router::new().route(
+            "/sap/bc/adt/discovery",
+            axum::routing::get(|| async { (axum::http::StatusCode::OK, "<service/>") }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let ep = AdtEndpoint::new(
+            &format!("http://{addr}"),
+            "u",
+            "p",
+            Duration::from_secs(5),
+        );
+        assert!(ep.ping().await.is_ok(), "200 → ping Ok");
+
+        // 500 mock → ping Err（ADT_PING_FAILED）
+        let app2 = axum::Router::new().route(
+            "/sap/bc/adt/discovery",
+            axum::routing::get(|| async { (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "") }),
+        );
+        let listener2 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr2 = listener2.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener2, app2).await.unwrap() });
+        let ep2 = AdtEndpoint::new(
+            &format!("http://{addr2}"),
+            "u",
+            "p",
+            Duration::from_secs(5),
+        );
+        let e = ep2.ping().await.unwrap_err();
+        assert_eq!(e.key, "ADT_PING_FAILED");
+        assert_eq!(e.status, 502);
+    }
 
     #[test]
     fn validate_allows_normal_paths_verbatim() {

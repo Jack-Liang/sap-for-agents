@@ -78,6 +78,7 @@ curl -H "Authorization: Bearer <SAP_API_KEY>" http://127.0.0.1:3000/api/function
 | OpenSQL SELECT via ADT data preview (pooled tables, joins) | `POST /api/table/osql` |
 | Debug ABAP remotely (breakpoints / listen / stack / **variable write** / step-resume; observe-only on read-only systems) | `POST`·`GET`·`DELETE /api/debug/**` |
 | Per-system login: SSO2 / SNC / ADT mTLS+OAuth2 / auth plugin | `auth.*` / `adt.*` blocks in `sap_systems.toml` (see §13) |
+| **Browser-authorize** a BTP trial oauth system (authorization_code → refresh token, v0.23) | `POST /api/setup/system/{name}/authorize` |
 | Human-friendly interactive API docs | `GET /docs` (Redoc rendering of the spec) |
 
 ## First-run setup (agent-guided configuration)
@@ -732,7 +733,50 @@ passwd = "${SAP_PRD_ADT_PASSWD}"
 token_url = "https://acme.authentication.eu10.hana.ondemand.com/oauth/token"
 client_id = "sb-…"
 client_secret = "${SAP_BTP_SECRET}"
+# grant = "authorization_code"            # optional (default client_credentials);
+# user = "you@example.com"                # optional — set BOTH to use the password grant
+# passwd = "${SAP_BTP_PASSWD}"
 ```
+
+**BTP trial / `binding-secret` bindings (v0.23)**: the broker client only allows `client_credentials`, but a trial ABAP system **rejects** those tokens (no user identity → 401 "Anmeldung fehlgeschlagen"). Two working paths, pick one:
+
+- **Password grant** (simplest — sapcli's way): if the XSUAA client allows the password grant, add `user` + `passwd` (your BTP login) to the oauth block — the gateway fetches user-backed tokens directly, refresh token reused automatically. Probe your client first: a dummy password returning *"User authentication failed"* (not *"unauthorized_client"*) means the grant is enabled.
+- **Browser authorization** (works everywhere): set `grant = "authorization_code"`, then run the flow once:
+  ```bash
+  # 1) Start the flow → get the authorize URL
+  curl -X POST http://127.0.0.1:3000/api/setup/system/btp/authorize
+  #    → 202 {"authorize_url": "https://<tenant>.authentication.../oauth/authorize?…",
+  #           "redirect_uri": "http://localhost:3000/oauth/callback", "state": "…", "expires_in_secs": 600}
+  # 2) Open authorize_url in the browser, log in with the BTP user — the callback
+  #    lands on the local gateway and the refresh token is stored + hot-injected.
+  #    Gateway on a remote host (callback unreachable)? Copy the ?code= from the
+  #    browser address bar and finish manually:
+  curl -X POST http://127.0.0.1:3000/api/setup/system/btp/authorize \
+    -H "Content-Type: application/json" -d '{"code":"<paste>"}'
+  # 3) GET /api/setup/system/btp → "oauth": {"grant":"authorization_code","authorized":true,"user":"…"}
+  ```
+  - The refresh token lives in `sap_oauth_state.json` (`SAP_OAUTH_STATE_FILE`, 0600) and survives restarts; the setup console shows an **Authorize** button for such systems.
+  - Refresh failure is **fail-fast** (`ADT_OAUTH_REAUTH`) — the gateway never falls back to a user-less `client_credentials` token the ABAP system would reject; just re-run the authorize flow.
+  - Redirect default is `http://localhost:<port>/oauth/callback` (XSUAA without `redirect-uris` only allows `localhost`), so **the browser must run on the gateway host**; `redirect_uri` override available on the authorize call.
+
+**ADT-only systems (v0.23)**: a system with **no RFC coordinates** (`ashost`/`conn` absent) and an `adt` block with `base_url` + `auth` is an ADT-only system — the BTP/ABAP Cloud shape. No placeholder system-level `auth` needed:
+
+```toml
+[systems.btp]
+# no ashost / sysnr / conn — RFC does not exist on BTP
+
+[systems.btp.adt]
+base_url = "https://1bc3fa3b-….abap.ap21.hana.ondemand.com"
+
+[systems.btp.adt.auth.oauth]
+token_url = "https://<tenant>.authentication.ap21.hana.ondemand.com/oauth/token"
+client_id = "sb-…"
+client_secret = "${SAP_BTP_SECRET}"
+grant = "authorization_code"        # then run the authorize flow once (above)
+```
+
+- `/api/systems` reports `auth: "adt-only"`; the readiness probe (`/ready`, the console Test button, the 60s probe loop) pings **ADT** (light discovery GET) instead of `RFC_PING` — the card shows real health, not a permanent "unreachable".
+- RFC-side calls (`/api/rfc`, `/api/functions/**`, `/api/table/**`, …) are rejected at the entry with **400 `RFC_NOT_AVAILABLE`** instead of timing out against a nonexistent RFC port. The system's API surface is `/api/s/{name}/adt/**` (same shapes as `/api/adt/**`) plus the `/api/s/{name}/dumps/**`, `/api/s/{name}/tests/**`, `/api/s/{name}/atc/**` ADT-derived endpoints.
 
 Notes:
 - `GET /api/systems` reports each system's `auth`: `basic` | `sso2` | `plugin` | `oauth` (+`+snc`).

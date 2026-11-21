@@ -20,6 +20,7 @@ mod invoke;
 mod mcp;
 mod metadata;
 mod objects;
+mod oauth_state;
 mod openapi;
 mod pool;
 mod registry;
@@ -192,6 +193,12 @@ async fn run_client() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!(
         path = %cfg.registry_file.display(),
         "API 注册表已启用（GET /api/registry）"
+    );
+    // OAuth authorization_code 流的 refresh token 持久化（v0.23：BTP trial 支持）
+    oauth_state::init(cfg.oauth_state_file.clone());
+    tracing::debug!(
+        path = %cfg.oauth_state_file.display(),
+        "OAuth state 文件已就位（authorization_code 系统授权后落盘）"
     );
     // OpenAPI 目录的多系统注入（条目按 system 各自取接口）
     openapi::init_shared_state(Arc::clone(&state));

@@ -228,7 +228,7 @@ pub async fn status_handler(
             "auth_basic": "auth.basic={user,passwd}——经典账密",
             "auth_sso2": "auth.sso2={ticket}——SAP 登录票据，不需要账密",
             "auth_snc": "auth.basic/sso2 + auth.snc={qop,partnername,lib?,myname?}——Kerberos/Secure Login Client",
-            "auth_oauth_adt": "adt.auth.oauth={token_url,client_id,client_secret}——BTP/ABAP Cloud 的 ADT 通道",
+            "auth_oauth_adt": "adt.auth.oauth={token_url,client_id,client_secret,grant?}——BTP/ABAP Cloud 的 ADT 通道；grant=\"authorization_code\"（v0.23）时 POST /api/setup/system/{n}/authorize 走浏览器授权（BTP trial 只认这种）",
         },
         "example": {
             "name": "a4h",
@@ -261,7 +261,7 @@ fn field_schema() -> serde_json::Value {
          "description": "登录客户端号（三位数字，如开发 001 / 生产 100）", "example": "001"},
         {"name": "auth", "required": true,
          "description": "鉴权块（主通道互斥四选一 + 可选 snc 叠加）：auth.basic={user,passwd} 经典账密 | auth.sso2={ticket} 登录票据 | \
-auth.oauth={token_url,client_id,client_secret}（仅 ADT 通道） | \
+auth.oauth={token_url,client_id,client_secret,grant?}（仅 ADT 通道；grant=\"authorization_code\" 时配置后还要 POST /api/setup/system/{n}/authorize 完成浏览器授权——BTP trial 适用） | \
 auth.plugin={command,params?,cache_secs?} 外部插件；auth.snc={qop?,myname?,partnername?,lib?} 叠加。\n密码/票据一律支持 ${VAR} 引用（推荐）",
          "example": {"basic": {"user": "DEVELOPER", "passwd": "${SAP_A4H_PASSWD}"}},
          "variants": ["basic", "sso2", "oauth(adt-only)", "plugin(adt-only)", "snc(overlay)"]},
@@ -346,6 +346,52 @@ impl SetupSystemRequest {
 async fn test_and_register(
     handle: &Arc<crate::systems::SystemHandle>,
 ) -> Result<crate::connection::RemoteSystemInfo, RfcError> {
+    // ADT-only 系统（BTP/ABAP Cloud，无 RFC）：连接测试改打轻量 ADT 请求，
+    // 不登记 SYSID（没有 RFC 连接属性可读，也不参与 SYSID 查重）
+    if handle.adt_only {
+        let Some(adt) = handle.adt.clone() else {
+            return Err(RfcError {
+                code: -1,
+                status: 500,
+                message: "ADT-only 系统缺少 ADT 端点（内部不一致）".into(),
+                key: "SETUP_INTERNAL".into(),
+            });
+        };
+        let joined = tokio::time::timeout(TEST_TIMEOUT, adt.ping()).await;
+        match joined {
+            Err(_) => {
+                return Err(RfcError {
+                    code: -1,
+                    status: 502,
+                    message: format!(
+                        "ADT 连接测试超时（{}s，未写入）。检查 adt.base_url/网络/防火墙后重试",
+                        TEST_TIMEOUT.as_secs()
+                    ),
+                    key: "SETUP_CONNECT_TIMEOUT".into(),
+                })
+            }
+            Ok(Err(e)) => {
+                return Err(RfcError {
+                    code: e.code,
+                    status: 502,
+                    message: format!(
+                        "ADT 连接测试失败（未写入）: {} [{}]。检查 adt.base_url 与鉴权配置",
+                        e.message, e.key
+                    ),
+                    key: "SETUP_CONNECT_FAILED".into(),
+                })
+            }
+            Ok(Ok(())) => {}
+        }
+        tracing::info!(system = %handle.name, "setup 连接测试成功（ADT-only）");
+        return Ok(crate::connection::RemoteSystemInfo {
+            sysid: "ADT-ONLY".into(),
+            release: "cloud".into(),
+            host: handle.name.clone(),
+            os: "-".into(),
+            destination: format!("adt:{}", handle.name),
+        });
+    }
     let pool = Arc::clone(&handle.pool);
     let joined = tokio::time::timeout(
         TEST_TIMEOUT,
@@ -761,6 +807,8 @@ pub async fn delete_handler(
     let Some((_handle, was_default)) = state.remove_system(&name) else {
         return Err(system_unknown(&state, &name));
     };
+    // OAuth 授权状态同步清理（v0.23；残留条目无害但会误导授权状态展示）
+    crate::oauth_state::drop_system(&name);
 
     // toml 同步：条目删除；删空整个文件移除
     let file_outcome = remove_system_from_toml(state.cfg(), &name).map_err(|e| RfcError {
@@ -860,6 +908,467 @@ pub async fn set_default_handler(
     })))
 }
 
+// ========================================================================
+// OAuth authorization_code 流（v0.23）：浏览器授权 → refresh token 种子
+// ========================================================================
+//
+// 为什么需要：BTP XSUAA 的 `binding-secret` credential 只放 client_credentials
+// grant，而 trial 的 ABAP 系统拒收这种无用户身份的 token（实测 401）。ADT
+// 工具（Eclipse / vscode-abap-remote-fs）靠**浏览器授权**（authorization_code）
+// 拿到带用户身份的 token——本节把这条路搬进网关：
+//
+//   POST /api/setup/system/{n}/authorize      起流 → authorize_url
+//   （浏览器打开 XSUAA 登录页）                ← 用户完成登录
+//   GET  /oauth/callback?code&state           回调 → code 换 token →
+//                                             refresh token 落盘 + 热注入
+//
+// 之后运行态自动走 adt.rs 的 refresh_token 换新（改动量为零的复用）。
+// 回调不可达的兜底：浏览器地址栏仍有 ?code=…，手工 POST authorize 端点
+// 带 {"code":"…"} 补完。XSUAA security descriptor 未配 redirect-uris 时
+// 默认只放行 `http://localhost:*`——redirect_uri 用 localhost 字面量。
+
+/// pending 授权流：state → 目标系统 + redirect_uri（单次使用，10min TTL）
+struct PendingFlow {
+    system: String,
+    redirect_uri: String,
+    created: std::time::Instant,
+}
+
+static PENDING: Mutex<BTreeMap<String, PendingFlow>> = Mutex::new(BTreeMap::new());
+const PENDING_TTL: Duration = Duration::from_secs(600);
+
+/// 清掉过期 pending（起流前调用；独立成函数供 TTL 测试直打）。
+fn prune_pending() {
+    let now = std::time::Instant::now();
+    PENDING
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|_, f| now.duration_since(f.created) < PENDING_TTL);
+}
+
+/// 128-bit 授权 state：优先 /dev/urandom（macOS/Linux 部署形态），
+/// 回退 RandomState（进程级 OS 熵种子）+ 时间纳秒的 xorshift 混合。
+/// 单次使用 + 短 TTL + 回调门禁下，不可猜测性要求已满足。
+fn generate_state_token() -> String {
+    let mut bytes = [0u8; 16];
+    let urandom_ok = std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| {
+            use std::io::Read;
+            f.read_exact(&mut bytes)
+        })
+        .is_ok();
+    if !urandom_ok {
+        // Windows 等无 /dev/urandom 平台的回退：多源熵混合
+        use std::hash::{BuildHasher, Hasher};
+        let mut acc = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0x9E3779B97F4A7C15);
+        for chunk in bytes.chunks_mut(8) {
+            acc ^= std::collections::hash_map::RandomState::new().build_hasher().finish();
+            acc ^= acc << 13;
+            acc ^= acc >> 7;
+            acc ^= acc << 17;
+            chunk.copy_from_slice(&acc.to_le_bytes()[..chunk.len()]);
+        }
+    }
+    bytes.iter().map(|b| format!("{b:02X}")).collect()
+}
+
+/// 取该系统的 oauth 配置块（adt.auth 覆盖 > auth 继承，未插值原样）。
+fn oauth_block_of(raw: &crate::systems::RawSystem) -> Option<&crate::systems::OAuthRaw> {
+    raw.adt
+        .as_ref()
+        .and_then(|a| a.auth.as_ref())
+        .and_then(|a| a.oauth.as_ref())
+        .or_else(|| raw.auth.as_ref().and_then(|a| a.oauth.as_ref()))
+}
+
+/// 起流/补完请求体。省略整个 body = 起流；带 `code` = 手工补完
+/// （回调不可达时从浏览器地址栏复制 code）。
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuthorizeRequest {
+    /// 回调 URL 里的 `code` 参数（手工补完路径）
+    code: Option<String>,
+    /// redirect_uri 覆盖（默认 `http://localhost:{端口}/oauth/callback`；
+    /// XSUAA 未配 redirect-uris 时只放行 localhost 字面量）
+    redirect_uri: Option<String>,
+}
+
+/// `POST /api/setup/system/{name}/authorize`（v0.23）。
+///
+/// 不带 body：生成 state、返回 authorize_url（浏览器打开完成登录）。
+/// 带 `{"code": "…"}`：手工补完——直接换 token、落盘、热注入。
+pub async fn authorize_handler(
+    axum::extract::State(state): axum::extract::State<SharedState>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+    headers: axum::http::HeaderMap,
+    body: Option<Json<AuthorizeRequest>>,
+) -> Result<(axum::http::StatusCode, Json<serde_json::Value>), RfcError> {
+    admin_write_gate(&state, &headers)?;
+    if state.resolve(&name).is_none() {
+        return Err(system_unknown(&state, &name));
+    }
+    let raw = read_system_raw(state.cfg(), &name).map_err(|e| RfcError {
+        code: -1,
+        status: 500,
+        message: format!("读取系统 '{name}' 配置失败: {e}"),
+        key: "SETUP_READ_FAILED".into(),
+    })?;
+    let Some(raw) = raw else {
+        return Err(system_unknown(&state, &name));
+    };
+    let Some(o) = oauth_block_of(&raw) else {
+        return Err(RfcError {
+            code: -1,
+            status: 400,
+            message: format!(
+                "系统 '{name}' 没有配置 oauth 鉴权块——BTP/ABAP Cloud 用 \
+                 [systems.{name}.adt.auth.oauth] = {{token_url, client_id, client_secret, grant}}"
+            ),
+            key: "SETUP_OAUTH_NO_BLOCK".into(),
+        });
+    };
+    if o.grant.as_deref().unwrap_or("client_credentials").trim() != "authorization_code" {
+        return Err(RfcError {
+            code: -1,
+            status: 400,
+            message: format!(
+                "系统 '{name}' 的 oauth 块未启用 authorization_code——在 oauth 块里加 \
+                 grant = \"authorization_code\"（client_credentials 形态走 BTP trial 会 401，\
+                 见 AGENTS.md §13）"
+            ),
+            key: "SETUP_OAUTH_NOT_AUTHCODE".into(),
+        });
+    }
+    let interp = |v: &str, field: &str| -> Result<String, RfcError> {
+        crate::systems::interpolate(v, &format!("systems.{name}")).map_err(|e| RfcError {
+            code: -1,
+            status: 500,
+            message: format!("oauth.{field} 插值失败: {e}"),
+            key: "SETUP_INTERNAL".into(),
+        })
+    };
+    let token_url = interp(&o.token_url, "token_url")?;
+    let client_id = interp(&o.client_id, "client_id")?;
+    let client_secret = interp(&o.client_secret, "client_secret")?;
+
+    // 手工补完路径：body 里带 code
+    if let Some(Json(req)) = body {
+        if let Some(code) = req.code.as_deref().map(str::trim).filter(|c| !c.is_empty()) {
+            let redirect = req
+                .redirect_uri
+                .clone()
+                .unwrap_or_else(|| default_redirect_uri(&state));
+            let result = complete_authorization(&state, &name, &token_url, &client_id, &client_secret, code, &redirect).await?;
+            return Ok((axum::http::StatusCode::OK, Json(result)));
+        }
+    }
+
+    // 起流：state 登记 pending → authorize_url 返回给 agent / 控制台
+    let redirect = default_redirect_uri(&state);
+    let st = generate_state_token();
+    prune_pending();
+    let now = std::time::Instant::now();
+    PENDING
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(
+            st.clone(),
+            PendingFlow {
+                system: name.clone(),
+                redirect_uri: redirect.clone(),
+                created: now,
+            },
+        );
+    let authorize_url = reqwest::Url::parse_with_params(
+        &format!("{}/oauth/authorize", crate::adt::oauth_token_base(&token_url)),
+        &[
+            ("response_type", "code"),
+            ("client_id", client_id.as_str()),
+            ("redirect_uri", redirect.as_str()),
+            ("state", st.as_str()),
+        ],
+    )
+    .map_err(|e| RfcError {
+        code: -1,
+        status: 500,
+        message: format!("构造 authorize_url 失败: {e}"),
+        key: "SETUP_INTERNAL".into(),
+    })?
+    .to_string();
+    tracing::info!(system = %name, "OAuth 授权流已起（等待浏览器完成登录）");
+    Ok((
+        axum::http::StatusCode::ACCEPTED,
+        Json(serde_json::json!({
+            "system": name,
+            "authorize_url": authorize_url,
+            "redirect_uri": redirect,
+            "state": st,
+            "expires_in_secs": PENDING_TTL.as_secs(),
+            "next": "① 浏览器打开 authorize_url 完成 XSUAA 登录（自动回调本机网关）；\
+                     ② 回调不可达（网关在远程主机）时，从浏览器地址栏复制 ?code= 的值，\
+                     再 POST 本端点带 {\"code\":\"…\"} 补完",
+        })),
+    ))
+}
+
+/// 默认 redirect_uri：`http://localhost:{监听端口}/oauth/callback`。
+/// 用 `localhost` 字面量（XSUAA 默认规则不匹配 `127.0.0.1`）；浏览器对
+/// localhost 的连接会回退到 127.0.0.1 绑定，无需网关监听 0.0.0.0。
+fn default_redirect_uri(state: &SharedState) -> String {
+    let port = state
+        .cfg()
+        .listen_addr
+        .rsplit_once(':')
+        .and_then(|(_, p)| p.parse::<u16>().ok())
+        .unwrap_or(3000);
+    format!("http://localhost:{port}/oauth/callback")
+}
+
+/// authorization_code → token 的纯 HTTP 交换（不含落盘/注入——独立可测，
+/// mock IdP 集成测试直打这里）。
+async fn exchange_authorization_code(
+    token_url: &str,
+    client_id: &str,
+    client_secret: &str,
+    code: &str,
+    redirect_uri: &str,
+) -> Result<serde_json::Value, RfcError> {
+    let client = reqwest::Client::builder()
+        .timeout(TEST_TIMEOUT)
+        .build()
+        .map_err(|e| RfcError {
+            code: -1,
+            status: 500,
+            message: format!("HTTP 客户端构建失败: {e}"),
+            key: "SETUP_INTERNAL".into(),
+        })?;
+    let resp = client
+        .post(crate::adt::oauth_token_endpoint(token_url))
+        .basic_auth(client_id, Some(client_secret))
+        .header("Accept", "application/json")
+        .form(&[
+            ("grant_type", "authorization_code".to_string()),
+            ("code", code.to_string()),
+            ("redirect_uri", redirect_uri.to_string()),
+        ])
+        .send()
+        .await
+        .map_err(|e| RfcError {
+            code: -1,
+            status: 502,
+            message: format!("token 端点不可达: {e}"),
+            key: "ADT_OAUTH_EXCHANGE".into(),
+        })?;
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(RfcError {
+            code: -1,
+            status: if status.as_u16() == 400 || status.as_u16() == 401 { 401 } else { 502 },
+            message: format!(
+                "authorization_code 换 token 失败（HTTP {}）——code 一次性且 10 分钟内有效，\
+                 重新起流再授权。XSUAA 响应: {}",
+                status.as_u16(),
+                crate::explore::first_line(&body)
+            ),
+            key: "ADT_OAUTH_EXCHANGE".into(),
+        });
+    }
+    serde_json::from_str(&body).map_err(|e| RfcError {
+        code: -1,
+        status: 502,
+        message: format!("token 响应不是 JSON: {e}"),
+        key: "ADT_OAUTH_EXCHANGE".into(),
+    })
+}
+
+/// code → token 换取 + 落盘 + 热注入（起流回调与手工补完共用）。
+async fn complete_authorization(
+    state: &SharedState,
+    name: &str,
+    token_url: &str,
+    client_id: &str,
+    client_secret: &str,
+    code: &str,
+    redirect_uri: &str,
+) -> Result<serde_json::Value, RfcError> {
+    let data =
+        exchange_authorization_code(token_url, client_id, client_secret, code, redirect_uri).await?;
+    let access = data
+        .get("access_token")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| RfcError {
+            code: -1,
+            status: 502,
+            message: "token 响应缺少 access_token".into(),
+            key: "ADT_OAUTH_EXCHANGE".into(),
+        })?
+        .to_string();
+    let refresh = data
+        .get("refresh_token")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| RfcError {
+            code: -1,
+            status: 502,
+            message: "token 响应缺少 refresh_token——authorization_code 流必须能拿到 \
+                      refresh token 才能静默续期（检查 credential-type 配置）"
+                .into(),
+            key: "ADT_OAUTH_EXCHANGE".into(),
+        })?
+        .to_string();
+    // 授权用户：JWT payload 的 sub（仅展示用，不验签——验签是 XSUAA 的事）
+    let user = jwt_sub(&access);
+    crate::oauth_state::record_authorization(name, &refresh, user.as_deref()).map_err(|e| {
+        RfcError {
+            code: -1,
+            status: 500,
+            message: format!("refresh token 落盘失败: {e}"),
+            key: "SETUP_WRITE_FAILED".into(),
+        }
+    })?;
+    // 热注入运行中的端点（无需重启/重载——种子直接进内存缓存）
+    let seeded = state
+        .resolve(name)
+        .and_then(|h| h.adt.clone())
+        .map(|ep| ep.seed_oauth_refresh(Some(refresh)))
+        .unwrap_or(false);
+    tracing::info!(
+        system = %name,
+        user = user.as_deref().unwrap_or("?"),
+        seeded,
+        "OAuth authorization_code 授权完成（refresh token 已落盘并注入）"
+    );
+    Ok(serde_json::json!({
+        "authorized": true,
+        "system": name,
+        "user": user,
+        "seeded": seeded,
+        "note": if seeded {
+            "refresh token 已热注入运行端点并落盘——后续 ADT 调用自动用它换新 access token"
+        } else {
+            "refresh token 已落盘；该系统 ADT 端点未启用或非 authcode 形态——下次系统重建时自动水合"
+        },
+    }))
+}
+
+/// 解 JWT payload 的 `sub`（无验签；解析失败返回 None——仅展示字段）。
+fn jwt_sub(token: &str) -> Option<String> {
+    use base64::Engine as _;
+    let payload = token.split('.').nth(1)?;
+    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload.trim_end_matches('='))
+        .ok()?;
+    let v: serde_json::Value = serde_json::from_slice(&decoded).ok()?;
+    v.get("sub").and_then(|s| s.as_str()).map(str::to_string)
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct CallbackQuery {
+    code: Option<String>,
+    state: Option<String>,
+    error: Option<String>,
+    error_description: Option<String>,
+}
+
+const CALLBACK_OK_HTML: &str = r#"<!DOCTYPE html><html><head><meta charset="utf-8"><title>授权完成</title>
+<style>body{background:#fff;font-family:-apple-system,sans-serif;display:flex;align-items:center;justify-content:center;height:100vh}
+.card{text-align:center}.ok{font-size:48px}.t{font-size:20px;color:#333;margin:12px 0}.s{font-size:13px;color:#888}</style></head>
+<body><div class="card"><div class="ok">✅</div><div class="t">授权完成，可以关闭此窗口</div>
+<div class="s">refresh token 已保存——网关将自动续期，无需再次登录</div></div></body></html>"#;
+
+fn callback_error_html(detail: &str, hint: &str) -> String {
+    format!(
+        r#"<!DOCTYPE html><html><head><meta charset="utf-8"><title>授权失败</title>
+<style>body{{background:#fff;font-family:-apple-system,sans-serif;display:flex;align-items:center;justify-content:center;height:100vh}}
+.card{{text-align:center;max-width:560px;padding:24px}}.err{{font-size:48px}}.t{{font-size:20px;color:#333;margin:12px 0}}
+.d{{font-size:14px;color:#a00;margin:8px 0}}.s{{font-size:13px;color:#888}}</style></head>
+<body><div class="card"><div class="err">❌</div><div class="t">授权失败</div>
+<div class="d">{detail}</div><div class="s">{hint}</div></div></body></html>"#
+    )
+}
+
+/// `GET /oauth/callback`（公开路由；浏览器重定向带不了 Bearer——安全靠
+/// 单次 state：10min TTL、用后即焚、unknown 即拒）。
+///
+/// 未鉴权部署追加 Host 回环检查（同 admin 门姿态）；鉴权部署放行
+/// （state 已是比 Host 更强的防护）。授权失败页给出手工补完路径。
+pub async fn oauth_callback_handler(
+    axum::extract::State(state): axum::extract::State<SharedState>,
+    axum::extract::Query(q): axum::extract::Query<CallbackQuery>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Html<String> {
+    const MANUAL_HINT: &str = "兜底路径：重新 POST /api/setup/system/{name}/authorize 起流，\
+         浏览器登录后从地址栏复制 ?code= 的值，再 POST 同端点带 {\"code\":\"…\"}";
+    let fail = |detail: &str| axum::response::Html(callback_error_html(detail, MANUAL_HINT));
+
+    // 未鉴权部署：Host 必须回环（与 config/admin 写门同一防线）
+    if !crate::auth::is_enabled() && !is_forced() && !host_header_is_loopback(&headers) {
+        return fail("请求 Host 不是本机回环地址——回调只接受本机浏览器");
+    }
+    if let Some(err) = q.error.as_deref() {
+        return fail(&format!(
+            "XSUAA 返回错误 {err}: {}",
+            q.error_description.as_deref().unwrap_or("")
+        ));
+    }
+    let (Some(code), Some(st)) = (q.code.as_deref().map(str::trim), q.state.as_deref().map(str::trim)) else {
+        return fail("缺少 code/state 参数");
+    };
+    // 单次取出：unknown/过期即拒（重放与猜测都无意义）
+    let Some(flow) = PENDING.lock().unwrap_or_else(|e| e.into_inner()).remove(st) else {
+        return fail("state 无效或已过期（10 分钟有效期，单次使用）");
+    };
+    // 凭据从 toml 重新解析（pending 只存系统名与 redirect_uri，不存密钥——
+    // state 的泄露面不扩大到密钥生命周期）。中途被删/改 → 干净报错。
+    let creds = match oauth_creds_of(&state, &flow.system) {
+        Ok(c) => c,
+        Err(e) => return fail(&e),
+    };
+    match complete_authorization(
+        &state,
+        &flow.system,
+        &creds.0,
+        &creds.1,
+        &creds.2,
+        code,
+        &flow.redirect_uri,
+    )
+    .await
+    {
+        Ok(_) => {
+            tracing::info!(system = %flow.system, "OAuth 回调授权成功");
+            axum::response::Html(CALLBACK_OK_HTML.to_string())
+        }
+        Err(e) => fail(&format!("{}（{}）", e.message, e.key)),
+    }
+}
+
+/// 回调完成时从 toml 重新解析该系统的 oauth 凭据（起流后配置被删/改的
+/// 中途失效也要有干净的失败面）。返回 (token_url, client_id, client_secret)。
+fn oauth_creds_of(
+    state: &SharedState,
+    system: &str,
+) -> Result<(String, String, String), String> {
+    let ctx = format!("systems.{system}");
+    read_system_raw(state.cfg(), system)
+        .map_err(|e| format!("读取系统 '{system}' 配置失败: {e}"))?
+        .and_then(|r| oauth_block_of(&r).cloned())
+        .ok_or_else(|| format!("系统 '{system}' 的 oauth 配置块已消失（授权流起后配置被删/改）"))
+        .and_then(|o| {
+            Ok((
+                crate::systems::interpolate(&o.token_url, &ctx)
+                    .map_err(|e| format!("token_url 插值失败: {e}"))?,
+                crate::systems::interpolate(&o.client_id, &ctx)
+                    .map_err(|e| format!("client_id 插值失败: {e}"))?,
+                crate::systems::interpolate(&o.client_secret, &ctx)
+                    .map_err(|e| format!("client_secret 插值失败: {e}"))?,
+            ))
+        })
+}
+
 /// 404 SYSTEM_UNKNOWN（与 ScopeService 的未知系统错误同键同形）。
 fn system_unknown(state: &SharedState, name: &str) -> RfcError {
     RfcError {
@@ -898,6 +1407,7 @@ fn system_raw_json(
             "sso2": a.sso2.as_ref().map(|t| serde_json::json!({
                 "ticket": mask_str(&Some(t.ticket.clone())),
             })),
+            "oauth": a.oauth.as_ref().map(|o| oauth_json(o, &mask_str)),
             "plugin": a.plugin.as_ref().map(|p| serde_json::json!({
                 "command": p.command, "params": p.params,
                 "cache_secs": p.cache_secs,
@@ -915,6 +1425,7 @@ fn system_raw_json(
                 "sso2": aa.sso2.as_ref().map(|t| serde_json::json!({
                     "ticket": mask_str(&Some(t.ticket.clone())),
                 })),
+                "oauth": aa.oauth.as_ref().map(|o| oauth_json(o, &mask_str)),
                 "plugin": aa.plugin.as_ref().map(|p| serde_json::json!({
                     "command": p.command, "params": p.params,
                     "cache_secs": p.cache_secs,
@@ -923,6 +1434,22 @@ fn system_raw_json(
             })),
             "tls": a.tls,
         })
+    });
+    // OAuth 授权状态（authcode 形态才有授权概念；client_credentials 只报 grant）
+    let oauth_status = oauth_block_of(raw).map(|o| {
+        let grant = o.grant.as_deref().unwrap_or("client_credentials").trim();
+        if grant == "authorization_code" {
+            let (user, at) = crate::oauth_state::entry_info(name).unwrap_or((None, None));
+            serde_json::json!({
+                "grant": "authorization_code",
+                "authorized": crate::oauth_state::entry_info(name).is_some(),
+                "user": user,
+                "authorized_at": at,
+                "authorize_hint": "POST /api/setup/system/{name}/authorize",
+            })
+        } else {
+            serde_json::json!({"grant": "client_credentials"})
+        }
     });
     serde_json::json!({
         "name": name,
@@ -933,12 +1460,27 @@ fn system_raw_json(
         "lang": raw.lang,
         "auth": auth,
         "adt": adt,
+        "oauth": oauth_status,
         "pool_size": raw.pool_size,
         "idle_validate_secs": raw.idle_validate_secs,
         "request_timeout_secs": raw.request_timeout_secs,
         "read_only": raw.read_only,
         "conn": raw.conn,
         "source": if from_toml { "toml" } else { "env_synthetic" },
+    })
+}
+
+/// oauth 块的回显渲染（secret 掩码；oauth 之前没进 GET 响应——编辑预填会
+/// 丢块，v0.23 补上）。
+fn oauth_json(
+    o: &crate::systems::OAuthRaw,
+    mask: &dyn Fn(&Option<String>) -> serde_json::Value,
+) -> serde_json::Value {
+    serde_json::json!({
+        "token_url": o.token_url,
+        "client_id": o.client_id,
+        "client_secret": mask(&Some(o.client_secret.clone())),
+        "grant": o.grant,
     })
 }
 
@@ -1185,6 +1727,28 @@ fn set_default_in_toml(cfg: &crate::config::AppConfig, name: &str) -> Result<boo
 }
 
 /// 请求体的原始字段 → toml 表（保留 `${VAR}` 原样；只写显式提供的键）。
+/// oauth 块的 toml 序列化（`raw_to_table` 之前漏了 oauth——API 写入会把
+/// oauth 块静默丢弃，手工 toml 才能配 BTP；v0.23 补上）。
+fn oauth_table(o: &crate::systems::OAuthRaw) -> toml::Value {
+    let mut ot = toml::map::Map::new();
+    ot.insert("token_url".into(), toml::Value::from(o.token_url.clone()));
+    ot.insert("client_id".into(), toml::Value::from(o.client_id.clone()));
+    ot.insert(
+        "client_secret".into(),
+        toml::Value::from(o.client_secret.clone()),
+    );
+    if let Some(g) = &o.grant {
+        ot.insert("grant".into(), toml::Value::from(g.clone()));
+    }
+    if let Some(u) = &o.user {
+        ot.insert("user".into(), toml::Value::from(u.clone()));
+    }
+    if let Some(p) = &o.passwd {
+        ot.insert("passwd".into(), toml::Value::from(p.clone()));
+    }
+    toml::Value::Table(ot)
+}
+
 fn raw_to_table(raw: &RawSystem, is_default: bool) -> toml::Value {
     fn put_str(t: &mut toml::map::Map<String, toml::Value>, k: &str, v: &Option<String>) {
         if let Some(v) = v {
@@ -1237,6 +1801,9 @@ fn raw_to_table(raw: &RawSystem, is_default: bool) -> toml::Value {
             }
             a.insert("plugin".into(), toml::Value::Table(pt));
         }
+        if let Some(o) = &auth.oauth {
+            a.insert("oauth".into(), oauth_table(o));
+        }
         if let Some(s) = &auth.snc {
             let mut st = toml::map::Map::new();
             put_str(&mut st, "qop", &s.qop);
@@ -1278,6 +1845,9 @@ fn raw_to_table(raw: &RawSystem, is_default: bool) -> toml::Value {
                     pt.insert("cache_secs".into(), toml::Value::Integer(c as i64));
                 }
                 a.insert("plugin".into(), toml::Value::Table(pt));
+            }
+            if let Some(o) = &auth.oauth {
+                a.insert("oauth".into(), oauth_table(o));
             }
             if let Some(s) = &auth.snc {
                 let mut st = toml::map::Map::new();
@@ -1445,6 +2015,7 @@ mod tests {
             adt_passwd: String::new(),
             read_only: false,
             registry_file: "test-registry.json".into(),
+            oauth_state_file: std::env::temp_dir().join("sap-oauth-test-state.json"),
             runtime_mode: false,
             update_check: false,
             systems_file: systems_file.into(),
@@ -1728,5 +2299,145 @@ mod tests {
         assert_eq!(merged2.conn.get("MSHOST").map(String::as_str), Some("m"));
         assert!(merged2.default);
         assert_eq!(merged2.ashost.as_deref(), Some("vhcala4h"));
+    }
+}
+
+#[cfg(test)]
+mod oauth_flow_tests {
+    use super::*;
+
+    // ---------------- OAuth authorization_code 流（v0.23） ----------------
+
+    #[test]
+    fn jwt_sub_decodes_payload_without_verification() {
+        use base64::Engine as _;
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(br#"{"sub":"user@example.com","zid":"z"}"#);
+        let token = format!("fakeheader.{payload}.fakesig");
+        assert_eq!(jwt_sub(&token).as_deref(), Some("user@example.com"));
+        // 非 JWT / 坏 payload → None（展示字段不炸）
+        assert_eq!(jwt_sub("not-a-jwt"), None);
+        assert_eq!(jwt_sub("a.b.c"), None);
+    }
+
+    #[test]
+    fn state_token_is_hex_and_unique() {
+        let a = generate_state_token();
+        let b = generate_state_token();
+        assert_eq!(a.len(), 32, "128-bit → 32 hex chars");
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(a, b, "连续两枚 state 不得相同");
+    }
+
+    #[test]
+    fn pending_flow_single_use_and_ttl_prune() {
+        let fresh = generate_state_token();
+        let expired = generate_state_token();
+        let unknown = generate_state_token();
+        {
+            let now = std::time::Instant::now();
+            let mut p = PENDING.lock().unwrap_or_else(|e| e.into_inner());
+            p.insert(
+                fresh.clone(),
+                PendingFlow {
+                    system: "s1".into(),
+                    redirect_uri: "http://localhost:1/oauth/callback".into(),
+                    created: now,
+                },
+            );
+            p.insert(
+                expired.clone(),
+                PendingFlow {
+                    system: "s2".into(),
+                    redirect_uri: "http://localhost:1/oauth/callback".into(),
+                    created: now - PENDING_TTL,
+                },
+            );
+        }
+        prune_pending();
+        {
+            let p = PENDING.lock().unwrap_or_else(|e| e.into_inner());
+            assert!(p.contains_key(&fresh), "未过期保留");
+            assert!(!p.contains_key(&expired), "过期清除");
+        }
+        // 单次使用：取出即焚，重放拒
+        let taken = PENDING
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&fresh);
+        assert!(taken.is_some());
+        assert!(PENDING
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&fresh)
+            .is_none());
+        // unknown state 取不到（防猜防重放）
+        assert!(PENDING
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&unknown)
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn exchange_code_parses_token_response() {
+        // mock IdP：校验请求形态，回标准 token 响应
+        let app = axum::Router::new().route(
+            "/oauth/token",
+            axum::routing::post(
+                |axum::extract::RawQuery(q): axum::extract::RawQuery| async move {
+                    // form 编码在 body 里；这里只断言能收到——参数校验走真实 XSUAA
+                    let _ = q;
+                    axum::Json(serde_json::json!({
+                        "access_token": "fakeheader.eyJzdWIiOiJ1QGV4YW1wbGUuY29tIn0.sig",
+                        "refresh_token": "rt-1",
+                        "expires_in": 43199,
+                        "token_type": "bearer",
+                    }))
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let data = exchange_authorization_code(
+            &format!("http://{addr}"),
+            "cid",
+            "sec",
+            "the-code",
+            "http://localhost:3000/oauth/callback",
+        )
+        .await
+        .expect("exchange ok");
+        assert_eq!(data["refresh_token"], "rt-1");
+        assert_eq!(data["expires_in"], 43199);
+    }
+
+    #[tokio::test]
+    async fn exchange_code_surfaces_xsuaa_error_as_401() {
+        let app = axum::Router::new().route(
+            "/oauth/token",
+            axum::routing::post(|| async {
+                (
+                    axum::http::StatusCode::BAD_REQUEST,
+                    r#"{"error":"invalid_grant","error_description":"code expired"}"#,
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let e = exchange_authorization_code(
+            &format!("http://{addr}"),
+            "cid",
+            "sec",
+            "expired-code",
+            "http://localhost:3000/oauth/callback",
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(e.key, "ADT_OAUTH_EXCHANGE");
+        assert_eq!(e.status, 401);
+        assert!(e.message.contains("code expired"), "got: {}", e.message);
     }
 }

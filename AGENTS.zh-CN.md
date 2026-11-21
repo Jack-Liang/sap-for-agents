@@ -78,6 +78,7 @@ curl -H "Authorization: Bearer <SAP_API_KEY>" http://127.0.0.1:3000/api/function
 | OpenSQL SELECT 走 ADT 数据预览（池表、JOIN） | `POST /api/table/osql` |
 | 远程调试 ABAP（断点 / 监听 / 调用栈 / **变量写** / 单步放行；只读系统可观察） | `POST`·`GET`·`DELETE /api/debug/**` |
 | 每系统登录方式：SSO2 / SNC / ADT mTLS+OAuth2 / 鉴权插件 | `sap_systems.toml` 的 `auth.*` / `adt.*` 块（见 §13） |
+| BTP trial oauth 系统**浏览器授权**（authorization_code → refresh token，v0.23） | `POST /api/setup/system/{name}/authorize` |
 | 人类友好的交互式 API 文档 | `GET /docs`（Redoc 渲染规范） |
 
 ## 首次启动引导（Agent 引导配置）
@@ -729,7 +730,49 @@ passwd = "${SAP_PRD_ADT_PASSWD}"
 token_url = "https://acme.authentication.eu10.hana.ondemand.com/oauth/token"
 client_id = "sb-…"
 client_secret = "${SAP_BTP_SECRET}"
+# grant = "authorization_code"            # 可选（缺省 client_credentials）；
+# user = "you@example.com"                # 可选——两个一起配走 password grant
+# passwd = "${SAP_BTP_PASSWD}"
 ```
+
+**BTP trial / `binding-secret` 绑定（v0.23）**：broker 客户端只放 `client_credentials`，而 trial 的 ABAP 系统**拒收**这种无用户身份的 token（401 "Anmeldung fehlgeschlagen"）。两条可行路径，选一条：
+
+- **password grant**（最简——sapcli 同款）：XSUAA 客户端放行 password grant 的话，在 oauth 块加 `user` + `passwd`（BTP 登录账号）即可直取带用户身份的 token，refresh token 自动复用。先探针：dummy 密码报 *"User authentication failed"*（而非 *"unauthorized_client"*）= grant 放行。
+- **浏览器授权**（通吃）：oauth 块加 `grant = "authorization_code"`，然后跑一次授权流：
+  ```bash
+  # 1) 起流 → 拿 authorize URL
+  curl -X POST http://127.0.0.1:3000/api/setup/system/btp/authorize
+  #    → 202 {"authorize_url": "https://<tenant>.authentication.../oauth/authorize?…",
+  #           "redirect_uri": "http://localhost:3000/oauth/callback", "state": "…", "expires_in_secs": 600}
+  # 2) 浏览器打开 authorize_url 用 BTP 账号登录——回调落在本机网关，
+  #    refresh token 落盘 + 热注入。
+  #    网关在远程主机（回调不可达）？从浏览器地址栏复制 ?code= 手工补完：
+  curl -X POST http://127.0.0.1:3000/api/setup/system/btp/authorize \
+    -H "Content-Type: application/json" -d '{"code":"<粘贴>"}'
+  # 3) GET /api/setup/system/btp → "oauth": {"grant":"authorization_code","authorized":true,"user":"…"}
+  ```
+  - refresh token 存 `sap_oauth_state.json`（`SAP_OAUTH_STATE_FILE`，0600），重启不丢；配置台对这类系统显示 **Authorize** 按钮。
+  - refresh 失败**快速报错**（`ADT_OAUTH_REAUTH`）——绝不静默回落到 ABAP 必拒收的无用户 `client_credentials` token；重新跑授权流即可。
+  - redirect 缺省 `http://localhost:<port>/oauth/callback`（XSUAA 未配 `redirect-uris` 时只放行 `localhost`），所以**浏览器必须与网关同机**；authorize 调用支持 `redirect_uri` 覆盖。
+
+**ADT-only 系统（v0.23）**：无 RFC 坐标（`ashost`/`conn` 全省）+ `adt` 块带 `base_url` + `auth` 的系统即 ADT-only——BTP/ABAP Cloud 形态。不需要占位的系统级 `auth`：
+
+```toml
+[systems.btp]
+# 不写 ashost / sysnr / conn——BTP 没有 RFC
+
+[systems.btp.adt]
+base_url = "https://1bc3fa3b-….abap.ap21.hana.ondemand.com"
+
+[systems.btp.adt.auth.oauth]
+token_url = "https://<tenant>.authentication.ap21.hana.ondemand.com/oauth/token"
+client_id = "sb-…"
+client_secret = "${SAP_BTP_SECRET}"
+grant = "authorization_code"        # 配好后跑一次授权流（见上）
+```
+
+- `/api/systems` 回显 `auth: "adt-only"`；就绪探针（`/ready`、配置台「测试」、60s 探测循环）改打 **ADT**（轻量 discovery GET）而不是 `RFC_PING`——卡片显示真实健康度，而不是永远的「不可达」。
+- RFC 侧调用（`/api/rfc`、`/api/functions/**`、`/api/table/**`…）在入口被干净拒绝：**400 `RFC_NOT_AVAILABLE`**，而不是对着不存在的 RFC 端口超时。该系统的 API 面是 `/api/s/{name}/adt/**`（与 `/api/adt/**` 同构）以及 `/api/s/{name}/dumps/**`、`/api/s/{name}/tests/**`、`/api/s/{name}/atc/**` 这些 ADT 派生端点。
 
 要点：
 - `GET /api/systems` 回显每系统 `auth`：`basic` | `sso2` | `plugin` | `oauth`（可 +`+snc`）。

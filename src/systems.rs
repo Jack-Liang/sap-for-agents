@@ -54,6 +54,12 @@ pub enum AuthPrimary {
         token_url: String,
         client_id: String,
         client_secret: String,
+        /// grant 形态（v0.23）：缺省 client_credentials（旧行为）；
+        /// authorization_code = 浏览器授权 + refresh_token 种子流
+        grant: crate::adt::OAuthGrant,
+        /// 可选 BTP 登录账号（配了走 password grant，sapcli 同款）
+        user: Option<String>,
+        passwd: Option<String>,
     },
 }
 
@@ -136,6 +142,11 @@ impl AuthConfig {
         self.primary
             .basic_ref()
             .map(|(u, _)| u.trim().to_uppercase())
+            // OAuth password grant 形态：登录账号即对象 responsible
+            .or_else(|| match &self.primary {
+                AuthPrimary::OAuth { user, .. } => user.as_deref().map(|u| u.trim().to_uppercase()),
+                _ => None,
+            })
             .unwrap_or_else(|| "AGENT".to_string())
     }
 
@@ -188,6 +199,10 @@ pub struct SystemSpec {
     /// 持有**解密后**的密码，直接落 toml 会把 `${VAR}` 约定打穿成明文
     /// （2026-11-05 审计 P1）。带引用时 `spec_to_table` 用引用代替解析值。
     pub passwd_ref: Option<String>,
+    /// ADT-only 系统（v0.23）：无 RFC 坐标（ashost / conn.ASHOST / conn.MSHOST
+    /// 全缺）——BTP/ABAP Cloud 形态，只服务 `/api/adt/**`；RFC 调用在
+    /// `run_blocking` 入口被干净拒绝（`RFC_NOT_AVAILABLE`），就绪探针改打 ADT。
+    pub adt_only: bool,
 }
 
 /// `sap_systems.toml` 原始形态（serde 反序列化用；setup API 的请求体
@@ -240,6 +255,18 @@ pub(crate) struct OAuthRaw {
     pub(crate) token_url: String,
     pub(crate) client_id: String,
     pub(crate) client_secret: String,
+    /// grant 形态（可选）：`client_credentials`（缺省，旧行为）|
+    /// `authorization_code`（v0.23：浏览器授权 + refresh_token 种子流——
+    /// BTP trial 等拒收 client_credentials token 的环境用这个）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) grant: Option<String>,
+    /// 可选用户名/密码（sapcli 借鉴 B：配了走 **password grant**——XSUAA
+    /// 放行 password grant 的客户端（含 trial broker，实测探针可达）用 BTP
+    /// 登录账号直取带用户身份的 token，免去浏览器授权）。支持 `${VAR}`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) user: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) passwd: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -339,10 +366,40 @@ impl AuthConfig {
                     return Err(format!("{ctx}.oauth.{k} 为空串"));
                 }
             }
+            // grant 缺省 = client_credentials（旧行为，向后兼容）
+            let grant = match &o.grant {
+                Some(g) => crate::adt::OAuthGrant::parse(g, ctx)?,
+                None => crate::adt::OAuthGrant::ClientCredentials,
+            };
+            // user/passwd（可选）：成对给出才有效（配一半报错，防误判成 client_credentials）
+            let oauth_user = match &o.user {
+                Some(u) => Some(interpolate(u, ctx)?),
+                None => None,
+            };
+            let oauth_passwd = match &o.passwd {
+                Some(p) => Some(interpolate(p, ctx)?),
+                None => None,
+            };
+            if oauth_user.is_some() != oauth_passwd.is_some() {
+                return Err(format!(
+                    "{ctx}.oauth.user/passwd 必须成对配置（缺一半会静默退化成 client_credentials）"
+                ));
+            }
+            if let (Some(u), Some(p)) = (&oauth_user, &oauth_passwd) {
+                if u.trim().is_empty() {
+                    return Err(format!("{ctx}.oauth.user 为空串"));
+                }
+                if p.is_empty() {
+                    return Err(format!("{ctx}.oauth.passwd 为空串"));
+                }
+            }
             AuthPrimary::OAuth {
                 token_url,
                 client_id,
                 client_secret,
+                grant,
+                user: oauth_user,
+                passwd: oauth_passwd,
             }
         } else {
             let p = raw.plugin.as_ref().unwrap();
@@ -416,7 +473,7 @@ impl AuthConfig {
 }
 
 /// `${VAR}` 环境变量插值。未设置的变量报错（密码缺失应在启动期炸掉）。
-fn interpolate(value: &str, ctx: &str) -> Result<String, String> {
+pub(crate) fn interpolate(value: &str, ctx: &str) -> Result<String, String> {
     if !value.contains("${") {
         return Ok(value.to_string());
     }
@@ -474,21 +531,66 @@ pub(crate) fn build_spec(name: &str, raw: &RawSystem) -> Result<SystemSpec, Stri
     validate_name(name)?;
     let ctx = format!("systems.{}", name);
 
-    // ① auth 块：必填（互斥与必填字段由 AuthConfig::from_raw 校验），
-    //    其 SDK 键值对（USER/PASSWD | MYSAPSSO2 | SNC_*）进连接参数。
-    let auth_raw = raw.auth.as_ref().ok_or_else(|| {
-        format!(
-            "{ctx} 缺少 auth 配置——加 [systems.{name}.auth.basic]（user+passwd）\n或 auth.sso2 / auth.plugin（形态见 sap_systems.toml.example）"
-        )
-    })?;
-    let auth = AuthConfig::from_raw(auth_raw, &format!("{ctx}.auth"))?;
-    if matches!(auth.primary, AuthPrimary::OAuth { .. }) {
-        return Err(format!(
-            "{ctx} 的 OAuth 是 ADT 专用通道（RFC 无 OAuth）——请放到 [systems.{name}.adt.auth.oauth]"
-        ));
-    }
+    // ⓪ ADT-only 判定（v0.23）：无 RFC 坐标（ashost / conn.ASHOST / conn.MSHOST
+    //    全缺）——BTP/ABAP Cloud 形态：没有 RFC 服务，只有 ADT。此时系统级
+    //    auth 可省（没有 RFC 凭据可言），探针与「测试」改打 ADT。
+    let rfc_coords = raw.ashost.is_some()
+        || raw
+            .conn
+            .keys()
+            .any(|k| matches!(k.trim().to_uppercase().as_str(), "ASHOST" | "MSHOST"));
+    let adt_only = !rfc_coords;
 
-    let mut params: Vec<(&'static str, String)> = auth.primary_conn_params();
+    // ① auth 块：RFC 形态必填（互斥与必填字段由 AuthConfig::from_raw 校验），
+    //    其 SDK 键值对（USER/PASSWD | MYSAPSSO2 | SNC_*）进连接参数；
+    //    ADT-only 形态可省——合成占位 auth 仅满足类型（永不触达：RFC 调用
+    //    在 run_blocking 入口拒绝，ADT 鉴权走 adt.auth）。
+    let auth = if adt_only {
+        let adt_raw = raw.adt.as_ref().ok_or_else(|| {
+            format!(
+                "{ctx} 既没有 ashost/conn 也没有 adt 块——两种合法形态：\n\
+                 ① 经典 RFC：ashost+sysnr + [systems.{name}.auth]；\n\
+                 ② ADT-only（BTP/ABAP Cloud）：[systems.{name}.adt] = base_url + auth"
+            )
+        })?;
+        if adt_raw.base_url.as_deref().unwrap_or("").trim().is_empty() {
+            return Err(format!(
+                "{ctx} 是 ADT-only 形态（无 ashost/conn）——必须显式配 [systems.{name}.adt] base_url（无法从 ashost 推导）"
+            ));
+        }
+        if adt_raw.auth.is_none() {
+            return Err(format!(
+                "{ctx} 是 ADT-only 形态——必须配 [systems.{name}.adt.auth]（系统级 auth 已省略，无凭据可继承）"
+            ));
+        }
+        AuthConfig {
+            primary: AuthPrimary::Basic {
+                user: "ADT-ONLY".into(),
+                passwd: String::new(),
+            },
+            snc: None,
+        }
+    } else {
+        let auth_raw = raw.auth.as_ref().ok_or_else(|| {
+            format!(
+                "{ctx} 缺少 auth 配置——加 [systems.{name}.auth.basic]（user+passwd）\n或 auth.sso2 / auth.plugin（形态见 sap_systems.toml.example）"
+            )
+        })?;
+        let auth = AuthConfig::from_raw(auth_raw, &format!("{ctx}.auth"))?;
+        if matches!(auth.primary, AuthPrimary::OAuth { .. }) {
+            return Err(format!(
+                "{ctx} 的 OAuth 是 ADT 专用通道（RFC 无 OAuth）——请放到 [systems.{name}.adt.auth.oauth]"
+            ));
+        }
+        auth
+    };
+
+    // 合成占位 auth 不进连接参数（ADT-only 没有 RFC 连接可言）
+    let mut params: Vec<(&'static str, String)> = if adt_only {
+        Vec::new()
+    } else {
+        auth.primary_conn_params()
+    };
     if let Some(snc) = &auth.snc {
         params.extend(snc.to_conn_params());
     }
@@ -543,22 +645,25 @@ pub(crate) fn build_spec(name: &str, raw: &RawSystem) -> Result<SystemSpec, Stri
         params.push((key, v));
     }
 
-    // ③ 连接形态校验：直连（ASHOST+SYSNR）或负载均衡（MSHOST）
-    let has = |k: &str| params.iter().any(|(k2, _)| *k2 == k);
-    if has("MSHOST") {
-        Ok(())
-    } else if has("ASHOST") {
-        if has("SYSNR") {
+    // ③ 连接形态校验：直连（ASHOST+SYSNR）或负载均衡（MSHOST）；
+    //    ADT-only 无 RFC 坐标，跳过（连接校验对它没有意义）
+    if !adt_only {
+        let has = |k: &str| params.iter().any(|(k2, _)| *k2 == k);
+        if has("MSHOST") {
             Ok(())
+        } else if has("ASHOST") {
+            if has("SYSNR") {
+                Ok(())
+            } else {
+                Err(format!("{} 指定了 ashost 但缺少 sysnr", ctx))
+            }
         } else {
-            Err(format!("{} 指定了 ashost 但缺少 sysnr", ctx))
-        }
-    } else {
-        Err(format!(
-            "{} 缺少连接目标：需要 ashost+sysnr（直连）或 conn 里给 MSHOST（负载均衡）",
-            ctx
-        ))
-    }?;
+            Err(format!(
+                "{} 缺少连接目标：需要 ashost+sysnr（直连）或 conn 里给 MSHOST（负载均衡）",
+                ctx
+            ))
+        }?;
+    }
 
     // ④ ADT 块（可选；缺省 = URL 推导 + auth 继承）
     let adt = match &raw.adt {
@@ -586,6 +691,7 @@ pub(crate) fn build_spec(name: &str, raw: &RawSystem) -> Result<SystemSpec, Stri
             .map(Duration::from_secs),
         read_only: raw.read_only,
         passwd_ref: None,
+        adt_only,
     })
 }
 
@@ -644,6 +750,7 @@ fn synth_from_env(cfg: &AppConfig) -> SystemSpec {
         read_only: None,
         // 落盘引用形态：env 密码来自 SAP_PASSWD，落 toml 时保留 ${VAR} 引用
         passwd_ref: Some("${SAP_PASSWD}".into()),
+        adt_only: false,
     }
 }
 
@@ -778,9 +885,15 @@ pub struct SystemHandle {
     pub meta: crate::metadata::MetadataCache,
     /// 该系统只读（写端点 403）
     pub read_only: bool,
-    /// 连接鉴权形态（sapcli 借鉴 B1）：basic | sso2 | snc | sso2+snc。
+    /// 连接鉴权形态（sapcli 借鉴 B1）：basic | sso2 | snc | sso2+snc | adt-only。
     /// /api/systems 自描述用——agent 据此知道该系统是密码、票据还是 SNC 登录。
     pub auth: &'static str,
+    /// ADT-only 系统（BTP/ABAP Cloud，无 RFC）：RFC 调用在 run_blocking 入口
+    /// 干净拒绝（RFC_NOT_AVAILABLE），就绪探针与 setup「测试」走 ADT ping。
+    pub adt_only: bool,
+    /// ADT-only 系统最近一轮 **ADT 探针**是否成功（`connected()` 的判据；
+    /// RFC 系统用 sysid 登记，这里没有 sysid 可登记）
+    adt_connected: AtomicBool,
     /// 该系统单请求超时**覆盖**（toml 的 request_timeout_secs；None = 跟随
     /// 全局热设置——v0.20 起 PUT /api/settings 即改即生效，见 effective_timeout）
     pub request_timeout: Option<Duration>,
@@ -927,8 +1040,14 @@ impl SystemHandle {
 
     /// 连接状态：最近一轮探测成功（从未连上过 → false）。
     /// 探测间隔（60s）内的瞬时断连要等下一轮才反映——页面状态以此为准。
+    /// ADT-only 系统：sysid 永远不存在（没有 RFC），以 ADT 探针成功标记为准。
     pub fn connected(&self) -> bool {
-        self.sysid().is_some() && self.connect_error().is_none()
+        if self.adt_only {
+            self.adt_connected.load(std::sync::atomic::Ordering::SeqCst)
+                && self.connect_error().is_none()
+        } else {
+            self.sysid().is_some() && self.connect_error().is_none()
+        }
     }
 
     /// sap_info 负缓存读取（fresh 与否由调用方按 TTL 判断）。
@@ -1191,13 +1310,17 @@ fn build_adt(spec: &SystemSpec, timeout: Duration) -> Option<Arc<crate::adt::Adt
             token_url,
             client_id,
             client_secret,
+            grant,
+            user,
+            passwd,
         } => (
             crate::adt::AdtAuthSpec::OAuth {
                 token_url: token_url.clone(),
                 client_id: client_id.clone(),
                 client_secret: client_secret.clone(),
-                user: None,
-                passwd: None,
+                user: user.clone(),
+                passwd: passwd.clone(),
+                grant: *grant,
             },
             auth_cfg.display_user(),
         ),
@@ -1214,13 +1337,27 @@ fn build_adt(spec: &SystemSpec, timeout: Duration) -> Option<Arc<crate::adt::Adt
         ca = t.ca.as_deref();
     }
 
-    let ep = match crate::adt::AdtEndpoint::new_with_auth(&base, auth, &tls_files, ca, timeout) {
+    let ep = match crate::adt::AdtEndpoint::new_with_auth(
+        &base,
+        auth,
+        &tls_files,
+        ca,
+        Some(&spec.name),
+        timeout,
+    ) {
         Ok(ep) => ep,
         Err(e) => {
             tracing::error!(system = %spec.name, error = %e, "ADT 端点构建失败——该系统 ADT 通道停用");
             return None;
         }
     };
+    // authorization_code 流的水合：已授权过的系统从 state 文件回填
+    // refresh token 种子（启动装配与 setup 热加载共用这一条路径）
+    if let Some(seed) = crate::oauth_state::load_refresh(&spec.name) {
+        if ep.seed_oauth_refresh(Some(seed)) {
+            tracing::info!(system = %spec.name, "OAuth refresh token 已从 state 文件水合");
+        }
+    }
     tracing::info!(
         system = %spec.name,
         base = %ep.base_url(),
@@ -1253,7 +1390,10 @@ pub(crate) fn make_handle(spec: &SystemSpec, cfg: &AppConfig) -> Arc<SystemHandl
         adt,
         meta: crate::metadata::MetadataCache::new(),
         read_only,
-        auth: spec.auth.mode(),
+        // ADT-only 系统：合成占位 auth（basic）不外显——如实用 "adt-only"
+        auth: if spec.adt_only { "adt-only" } else { spec.auth.mode() },
+        adt_only: spec.adt_only,
+        adt_connected: AtomicBool::new(false),
         request_timeout: spec.request_timeout,
         backend: backend_key(&spec.conn_params),
         sysid: OnceLock::new(),
@@ -1310,6 +1450,35 @@ pub async fn probe_all(registry: Arc<SystemRegistry>) {
         .into_iter()
         .map(|sys| {
             tokio::spawn(async move {
+                // ADT-only 系统（BTP/ABAP Cloud，无 RFC）：探针改打轻量 ADT
+                // 请求（discovery GET，带鉴权/401 重试）——RFC_PING 对它永远
+                // 失败，会一直显示"不可达"误导使用者。
+                if sys.adt_only {
+                    match sys.adt.as_ref() {
+                        Some(adt) => match adt.ping().await {
+                            Ok(()) => {
+                                sys.adt_connected
+                                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                                sys.set_connect_error(None);
+                                tracing::debug!(system = %sys.name, "ADT-only 系统探测成功");
+                            }
+                            Err(e) => {
+                                sys.adt_connected
+                                    .store(false, std::sync::atomic::Ordering::SeqCst);
+                                tracing::warn!(
+                                    system = %sys.name,
+                                    msg = %e.message,
+                                    "ADT-only 系统不可达（不影响网关监听；下一周期重试）"
+                                );
+                                sys.set_connect_error(Some(format!("ADT 不可达: {}", e.message)));
+                            }
+                        },
+                        None => {
+                            sys.set_connect_error(Some("ADT-only 系统缺少 ADT 端点（配置异常）".into()));
+                        }
+                    }
+                    return;
+                }
                 let s = sys.clone();
                 let info = tokio::time::timeout(
                     Duration::from_secs(5),
@@ -1462,6 +1631,7 @@ mod tests {
             adt_passwd: "P".into(),
             read_only: false,
             registry_file: "registry.json".into(),
+            oauth_state_file: std::env::temp_dir().join("sap-oauth-test-state.json"),
             runtime_mode: false,
             update_check: false,
             systems_file: "no-such-file.toml".into(),
@@ -1742,6 +1912,8 @@ ashost = "h"
                 Duration::from_secs(30),
             )),
             adt: None,
+            adt_only: false,
+            adt_connected: std::sync::atomic::AtomicBool::new(false),
             meta: crate::metadata::MetadataCache::new(),
             read_only: false,
             auth: "basic",
@@ -1834,6 +2006,7 @@ ashost = "h"
         SystemSpec {
             name: name.into(),
             is_default: false,
+            adt_only: false,
             conn_params,
             auth: AuthConfig {
                 primary: AuthPrimary::Basic {
@@ -2120,6 +2293,215 @@ mod auth_tests {
         raw2.auth = None;
         let err = build_spec("noauth2", &raw2).unwrap_err();
         assert!(err.contains("缺少 auth 配置"), "got: {err}");
+    }
+
+    // ---------------- OAuth grant / user-passwd 配置（v0.23） ----------------
+
+    /// oauth 块在 `[systems.x.adt.auth.oauth]`（系统级 oauth 被 build_spec 刻意
+    /// 拒绝——RFC 无 OAuth）。oauth 凭据断言走 `spec.adt.auth.primary`。
+    fn mk_oauth_sys(
+        grant: Option<&str>,
+        user: Option<&str>,
+        passwd: Option<&str>,
+    ) -> RawSystem {
+        let mut raw = mk_raw(AuthRaw {
+            basic: Some(BasicRaw {
+                user: "u".into(),
+                passwd: "p".into(),
+            }),
+            sso2: None,
+            plugin: None,
+            oauth: None,
+            snc: None,
+        });
+        raw.adt = Some(AdtRaw {
+            base_url: None,
+            auth: Some(AuthRaw {
+                basic: None,
+                sso2: None,
+                plugin: None,
+                oauth: Some(OAuthRaw {
+                    token_url: "https://uaa.example.com".into(),
+                    client_id: "cid".into(),
+                    client_secret: "sec".into(),
+                    grant: grant.map(str::to_string),
+                    user: user.map(str::to_string),
+                    passwd: passwd.map(str::to_string),
+                }),
+                snc: None,
+            }),
+            tls: None,
+        });
+        raw
+    }
+
+    fn adt_oauth_primary(spec: &SystemSpec) -> &AuthPrimary {
+        &spec.adt.as_ref().unwrap().auth.as_ref().unwrap().primary
+    }
+
+    #[test]
+    fn build_spec_oauth_default_grant_is_client_credentials() {
+        let raw = mk_oauth_sys(None, None, None);
+        let spec = build_spec("btp", &raw).expect("oauth spec");
+        match adt_oauth_primary(&spec) {
+            AuthPrimary::OAuth { grant, user, passwd, .. } => {
+                assert_eq!(*grant, crate::adt::OAuthGrant::ClientCredentials);
+                assert!(user.is_none() && passwd.is_none());
+            }
+            other => panic!("expected oauth primary, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_spec_oauth_authcode_grant_parses() {
+        let raw = mk_oauth_sys(Some("authorization_code"), None, None);
+        let spec = build_spec("btp", &raw).expect("oauth spec");
+        match adt_oauth_primary(&spec) {
+            AuthPrimary::OAuth { grant, .. } => {
+                assert_eq!(*grant, crate::adt::OAuthGrant::AuthorizationCode);
+            }
+            other => panic!("expected oauth primary, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_spec_oauth_bad_grant_rejected_with_allowed_list() {
+        let raw = mk_oauth_sys(Some("browser"), None, None);
+        let err = build_spec("btp", &raw).unwrap_err();
+        assert!(
+            err.contains("client_credentials, authorization_code"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn build_spec_oauth_user_passwd_must_pair() {
+        // 只配 user → 拒（防静默退化成 client_credentials）
+        let raw = mk_oauth_sys(None, Some("me@example.com"), None);
+        let err = build_spec("btp", &raw).unwrap_err();
+        assert!(err.contains("成对"), "got: {err}");
+        // 只配 passwd → 拒
+        let raw = mk_oauth_sys(None, None, Some("pw"));
+        let err = build_spec("btp", &raw).unwrap_err();
+        assert!(err.contains("成对"), "got: {err}");
+        // 成对 → 进 primary（password grant 形态）
+        let raw = mk_oauth_sys(None, Some("me@example.com"), Some("pw"));
+        let spec = build_spec("btp", &raw).expect("paired oauth spec");
+        match adt_oauth_primary(&spec) {
+            AuthPrimary::OAuth { user, passwd, .. } => {
+                assert_eq!(user.as_deref(), Some("me@example.com"));
+                assert_eq!(passwd.as_deref(), Some("pw"));
+            }
+            other => panic!("expected oauth primary, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn oauth_grant_parse_lists_allowed_values() {
+        assert_eq!(
+            crate::adt::OAuthGrant::parse("client_credentials", "t").unwrap(),
+            crate::adt::OAuthGrant::ClientCredentials
+        );
+        assert_eq!(
+            crate::adt::OAuthGrant::parse("authorization_code", "t").unwrap(),
+            crate::adt::OAuthGrant::AuthorizationCode
+        );
+        let err = crate::adt::OAuthGrant::parse("browser", "t").unwrap_err();
+        assert!(err.contains("client_credentials, authorization_code"), "got: {err}");
+    }
+
+    // ---------------- ADT-only 系统（v0.23：BTP/ABAP Cloud） ----------------
+
+    fn mk_adt_only(adt: Option<AdtRaw>) -> RawSystem {
+        RawSystem {
+            ashost: None,
+            sysnr: None,
+            client: None,
+            lang: None,
+            auth: None,
+            adt,
+            default: false,
+            pool_size: None,
+            idle_validate_secs: None,
+            request_timeout_secs: None,
+            read_only: None,
+            conn: Default::default(),
+        }
+    }
+
+    fn mk_adt_raw(base: &str, with_auth: bool) -> AdtRaw {
+        AdtRaw {
+            base_url: Some(base.into()),
+            auth: with_auth.then(|| AuthRaw {
+                basic: Some(BasicRaw {
+                    user: "u".into(),
+                    passwd: "p".into(),
+                }),
+                sso2: None,
+                plugin: None,
+                oauth: None,
+                snc: None,
+            }),
+            tls: None,
+        }
+    }
+
+    #[test]
+    fn build_spec_adt_only_ok() {
+        let raw = mk_adt_only(Some(mk_adt_raw("https://trial.example.com", true)));
+        let spec = build_spec("btp", &raw).expect("adt-only spec");
+        assert!(spec.adt_only);
+        // 合成占位 auth 不进连接参数（没有 RFC 连接可言）
+        assert!(spec.conn_params.is_empty());
+        assert!(spec.adt.is_some());
+    }
+
+    #[test]
+    fn build_spec_adt_only_requires_adt_block() {
+        let raw = mk_adt_only(None);
+        let err = build_spec("btp", &raw).unwrap_err();
+        assert!(err.contains("两种合法形态"), "got: {err}");
+    }
+
+    #[test]
+    fn build_spec_adt_only_requires_base_url() {
+        let mut a = mk_adt_raw("", true);
+        a.base_url = Some(String::new());
+        let raw = mk_adt_only(Some(a));
+        let err = build_spec("btp", &raw).unwrap_err();
+        assert!(err.contains("base_url"), "got: {err}");
+    }
+
+    #[test]
+    fn build_spec_adt_only_requires_adt_auth() {
+        let raw = mk_adt_only(Some(mk_adt_raw("https://trial.example.com", false)));
+        let err = build_spec("btp", &raw).unwrap_err();
+        assert!(err.contains("adt.auth"), "got: {err}");
+    }
+
+    #[test]
+    fn build_spec_classic_still_requires_auth() {
+        // 回归：有 ashost 时 auth 仍必填（ADT-only 豁免不外溢到经典形态）
+        // ① auth 整块缺失 → "缺少 auth 配置"
+        let mut raw = mk_raw(AuthRaw {
+            basic: None,
+            sso2: None,
+            plugin: None,
+            oauth: None,
+            snc: None,
+        });
+        raw.auth = None;
+        let err = build_spec("classic", &raw).unwrap_err();
+        assert!(err.contains("缺少 auth 配置"), "got: {err}");
+        // ② auth 块存在但空 → "缺主通道"
+        let err2 = build_spec("classic2", &mk_raw(AuthRaw {
+            basic: None,
+            sso2: None,
+            plugin: None,
+            oauth: None,
+            snc: None,
+        }));
+        assert!(err2.unwrap_err().contains("缺主通道"));
     }
 
     #[test]

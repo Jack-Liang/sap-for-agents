@@ -269,6 +269,24 @@ fn timeout_error(timeout: Duration) -> RfcError {
     }
 }
 
+/// ADT-only 系统（BTP/ABAP Cloud，无 RFC）的 RFC 入口守卫：在入口干净拒绝，
+/// 而不是去连一个不存在的 RFC 端口再报 SYSTEM_UNREACHABLE（连接超时噪音）。
+fn ensure_rfc_available(sys: &SystemHandle) -> Result<(), RfcError> {
+    if sys.adt_only {
+        return Err(RfcError {
+            code: -1,
+            status: 400,
+            message: format!(
+                "系统 '{}' 是 ADT-only（BTP/ABAP Cloud，无 RFC）——RFC/BAPI/函数/表读取 \
+                 不可用；该系统的 ADT 面用 /api/s/{}/adt/**（与 /api/adt/** 作用域形态同构）",
+                sys.name, sys.name
+            ),
+            key: "RFC_NOT_AVAILABLE".into(),
+        });
+    }
+    Ok(())
+}
+
 /// 用指定超时在阻塞线程池内执行 SAP 调用（目标系统由 `sys` 给出）。
 ///
 /// `spawn_blocking` + `with_connection`（含自动重连）+ `tokio::time::timeout` 收敛到一处。
@@ -289,6 +307,7 @@ where
     R: Send + 'static,
 {
     sys.check_available()?;
+    ensure_rfc_available(&sys)?;
     let pool = Arc::clone(&sys.pool);
     let hook_sys = Arc::clone(&sys);
     let mut f = f;
@@ -369,6 +388,7 @@ where
     R: Send + 'static,
 {
     sys.check_available()?;
+    ensure_rfc_available(&sys)?;
     let pool = Arc::clone(&sys.pool);
     let hook_sys = Arc::clone(&sys);
     let mut f = f;
@@ -512,6 +532,12 @@ pub fn app(state: SharedState) -> Router {
                 .put(crate::setup::update_handler)
                 .delete(crate::setup::delete_handler),
         )
+        // OAuth 浏览器授权（v0.23）：authorization_code 流的起流/手工补完。
+        // 配置写语义——与 setup 写同一道门（admin_write_gate）。
+        .route(
+            "/api/setup/system/{name}/authorize",
+            post(crate::setup::authorize_handler),
+        )
         // 切默认系统（热切换：无前缀路径的新目标）
         .route(
             "/api/setup/default",
@@ -550,6 +576,13 @@ pub fn app(state: SharedState) -> Router {
         .route(
             "/api/setup",
             axum::routing::get(crate::setup::status_handler),
+        )
+        // OAuth 浏览器授权回调（v0.23）：公开免鉴权——浏览器重定向带不了
+        // Bearer；安全靠单次 state（10min TTL 用后即焚）+ 未鉴权部署的
+        // Host 回环检查（handler 内实现，同 admin 门防线）。
+        .route(
+            "/oauth/callback",
+            axum::routing::get(crate::setup::oauth_callback_handler),
         )
         .route("/metrics", axum::routing::get(metrics_handler))
         .merge(api)
@@ -1024,6 +1057,45 @@ async fn ready_handler(sap: Sap) -> axum::response::Response {
     }
 
     const READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+    // ADT-only 系统（BTP/ABAP Cloud，无 RFC）：探针改打轻量 ADT 请求——
+    // RFC_PING 对它永远失败，readiness 只能反映"没有 RFC"这个恒真事实。
+    if sap.arc().adt_only {
+        return match sap.arc().adt.as_ref() {
+            None => (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "status": "unavailable",
+                    "message": "ADT-only 系统缺少 ADT 端点（配置异常）",
+                })),
+            )
+                .into_response(),
+            Some(adt) => match tokio::time::timeout(READY_TIMEOUT, adt.ping()).await {
+                Ok(Ok(())) => (
+                    axum::http::StatusCode::OK,
+                    Json(serde_json::json!({ "status": "ready", "sap": "adt" })),
+                )
+                    .into_response(),
+                Ok(Err(e)) => (
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                    Json(serde_json::json!({
+                        "status": "unavailable",
+                        "code": e.code,
+                        "message": e.message,
+                    })),
+                )
+                    .into_response(),
+                Err(_elapsed) => (
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                    Json(serde_json::json!({
+                        "status": "timeout",
+                        "timeout_ms": READY_TIMEOUT.as_millis() as u64,
+                    })),
+                )
+                    .into_response(),
+            },
+        };
+    }
 
     let ping =
         tokio::time::timeout(READY_TIMEOUT, run_blocking(sap.arc(), |conn| conn.ping())).await;
@@ -3422,6 +3494,7 @@ mod tests {
             adt_passwd: String::new(),
             read_only: false,
             registry_file: "test-registry.json".into(),
+            oauth_state_file: std::env::temp_dir().join("sap-oauth-test-state.json"),
             runtime_mode: false,
             update_check: false,
             // 临时目录：setup POST（test:false）会把系统落盘到这里，
@@ -3455,6 +3528,7 @@ mod tests {
                     snc: None,
                 },
                 adt: None,
+            adt_only: false,
                 pool_size: None,
                 idle_validate: None,
                 request_timeout: None,
@@ -3464,6 +3538,7 @@ mod tests {
             SystemSpec {
                 name: "prd".into(),
                 is_default: false,
+            adt_only: false,
                 conn_params: direct(),
                 auth: crate::systems::AuthConfig {
                     primary: crate::systems::AuthPrimary::Basic {
@@ -3893,6 +3968,7 @@ mod tests {
             adt_passwd: String::new(),
             read_only: false,
             registry_file: "test-registry.json".into(),
+            oauth_state_file: std::env::temp_dir().join("sap-oauth-test-state.json"),
             runtime_mode: false,
             update_check: false,
             systems_file: toml_path.to_path_buf(),

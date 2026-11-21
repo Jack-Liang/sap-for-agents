@@ -426,7 +426,8 @@ FYI: your full working documentation is at {{ORIGIN}}/agents.md (read it if you 
                     '</div>' +
                 '</div>' +
                 '<div class="text-[12px] text-on-surface-variant" data-role="meta">' + (s.connect_error ? probeErrText(String(s.connect_error)) : '') + '</div>' +
-                '<div class="text-[12px] mt-1" data-role="test"></div>';
+                '<div class="text-[12px] mt-1" data-role="test"></div>' +
+                '<div class="text-[12px] mt-1" data-role="oauth"></div>';
             card.querySelectorAll('button[data-act]').forEach(function (b) {
                 b.addEventListener('click', function () { act(b.getAttribute('data-act'), s.name); });
             });
@@ -444,6 +445,20 @@ FYI: your full working documentation is at {{ORIGIN}}/agents.md (read it if you 
                     var meta = card.querySelector('[data-role="meta"]');
                     var extra = bits.join(' · ');
                     meta.textContent = meta.textContent ? extra + ' · ' + meta.textContent : extra;
+                    // OAuth authorization_code 系统：授权状态行 + 浏览器授权按钮
+                    if (j.oauth && j.oauth.grant === 'authorization_code') {
+                        var os = card.querySelector('[data-role="oauth"]');
+                        if (j.oauth.authorized) {
+                            os.innerHTML = '<span class="badge bg-green-100 text-green-700">oauth authorized' +
+                                (j.oauth.user ? ' as ' + String(j.oauth.user).replace(/</g, '&lt;') : '') + '</span>';
+                        } else {
+                            var b = document.createElement('button');
+                            b.className = 'btn btn-ghost';
+                            b.textContent = 'Authorize (browser login)';
+                            b.addEventListener('click', function () { act('authorize', s.name); });
+                            os.appendChild(b);
+                        }
+                    }
                 });
             }
             grid.appendChild(card);
@@ -463,6 +478,30 @@ FYI: your full working documentation is at {{ORIGIN}}/agents.md (read it if you 
             });
         }
         if (name === 'edit') return openEdit(system);
+        if (name === 'authorize') {
+            var oslot = findOauthSlot(system);
+            return api('POST', '/api/setup/system/' + encodeURIComponent(system) + '/authorize').then(function (res) {
+                if (!res.ok || !res.json || !res.json.authorize_url) {
+                    if (oslot) oslot.innerHTML = '<span class="badge bg-red-100 text-red-700">Authorize failed: ' + String(errMsg(res, 'HTTP ' + res.status)).slice(0, 140) + '</span>';
+                    return;
+                }
+                window.open(res.json.authorize_url, '_blank');
+                if (oslot) oslot.innerHTML = '<span class="text-on-surface-variant">Waiting for browser login…</span>';
+                var deadline = Date.now() + (res.json.expires_in_secs || 600) * 1000;
+                var timer = setInterval(function () {
+                    api('GET', '/api/setup/system/' + encodeURIComponent(system)).then(function (r) {
+                        if (!r.ok || !r.json) { clearInterval(timer); return; }
+                        if (r.json.oauth && r.json.oauth.authorized) {
+                            clearInterval(timer);
+                            refresh();
+                        } else if (Date.now() > deadline) {
+                            clearInterval(timer);
+                            if (oslot) oslot.innerHTML = '<span class="badge bg-amber-100 text-amber-700">Authorization window expired — click Authorize again</span>';
+                        }
+                    });
+                }, 2000);
+            });
+        }
         if (name === 'default') {
             return api('PUT', '/api/setup/default', { name: system }).then(function (res) {
                 if (!res.ok) alert(errMsg(res, 'Switch failed'));
@@ -494,6 +533,17 @@ FYI: your full working documentation is at {{ORIGIN}}/agents.md (read it if you 
         return null;
     }
 
+    // OAuth 授权状态槽（authorization_code 系统的等待/结果展示）
+    function findOauthSlot(name) {
+        var cards = $('systems-grid').children;
+        for (var i = 0; i < cards.length; i++) {
+            if (cards[i].getAttribute('data-system') === name) {
+                return cards[i].querySelector('[data-role="oauth"]');
+            }
+        }
+        return null;
+    }
+
     function testSystem(name) {
         var slotEl = findCardSlot(name);
         if (!slotEl) return;
@@ -504,8 +554,13 @@ FYI: your full working documentation is at {{ORIGIN}}/agents.md (read it if you 
                 return { ok: r.ok, status: r.status, json: j };
             });
         }).then(function (res) {
+            // ADT-only 系统（BTP/ABAP Cloud）：/ready 探的是 ADT（discovery GET），
+            // 没有 RFC_PING 这回事——按响应的 sap 字段区分文案
+            var okBadge = res.json && res.json.sap === 'adt'
+                ? '<span class="badge bg-green-100 text-green-700">ADT reachable (discovery ok)</span>'
+                : '<span class="badge bg-green-100 text-green-700">SAP reachable (RFC_PING ok)</span>';
             slotEl.innerHTML = res.ok
-                ? '<span class="badge bg-green-100 text-green-700">SAP reachable (RFC_PING ok)</span>'
+                ? okBadge
                 : '<span class="badge bg-red-100 text-red-700">unreachable: ' + String(errMsg(res, 'HTTP ' + res.status)).slice(0, 160) + '</span>';
         });
     }
