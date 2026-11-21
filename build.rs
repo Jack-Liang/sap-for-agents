@@ -146,5 +146,8 @@ fn emit_git_commit() {
         })
         .unwrap_or_else(|| "unknown".to_string());
     println!("cargo:rustc-env=SAP_GIT_COMMIT={commit}");
-    println!("cargo:rerun-if-changed=.git/HEAD");
+    // 只盯 .git/HEAD 不够：commit 改的是 refs/heads/main（HEAD 仍指向同一 ref），
+    // 版本号不重跑、自报 commit 停在旧值（v0.23 发版实测）。盯整个 .git 目录——
+    // 任何 git 写操作（commit/tag/add）都会触发重跑，代价只是几十毫秒的 rev-parse。
+    println!("cargo:rerun-if-changed=.git");
 }
