@@ -2111,6 +2111,12 @@ ashost = "h"
 mod auth_tests {
     use super::*;
 
+    /// 环境变量是进程全局态，`interpolate("${VAR}")` 的读写必须互斥——
+    /// 并行测试里一个 set_var/remove_var 撞上另一个的读取会随机炸
+    /// （v0.23 发版实测：from_raw_sso2_with_snc_overlay ~1/3 概率被
+    /// build_spec_sso2_has_no_user_key 的 remove 撞掉）。
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
     fn mk_raw(auth: AuthRaw) -> RawSystem {
         RawSystem {
             ashost: Some("h".into()),
@@ -2167,6 +2173,7 @@ mod auth_tests {
             oauth: None,
             snc: None,
         };
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         unsafe { std::env::set_var("SAP_T", "s3cret") };
         let cfg = AuthConfig::from_raw(&raw, "systems.x.auth").unwrap();
         assert_eq!(cfg.mode(), "basic");
@@ -2226,6 +2233,7 @@ mod auth_tests {
                 lib: Some("gsskrb5".into()),
             }),
         };
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         unsafe { std::env::set_var("SAP_T", "ticket-value") };
         let cfg = AuthConfig::from_raw(&raw, "auth").unwrap();
         assert_eq!(cfg.mode(), "sso2+snc");
@@ -2265,6 +2273,7 @@ mod auth_tests {
             oauth: None,
             snc: None,
         });
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         unsafe { std::env::set_var("SAP_T", "ticket-value") };
         let spec = build_spec("sso", &raw).expect("sso2 spec");
         assert!(spec
