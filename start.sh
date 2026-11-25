@@ -19,6 +19,23 @@ err()  { printf "${RED}✗${NC} %s\n" "$1"; }
 echo "=== sap-for-agents 启动检查 ==="
 echo ""
 
+# 单实例锁：防止多个守护循环并发启动，抢同一个端口造成
+# "AddrInUse → 退出 → 1 秒后重启" 的死循环（2026-11-25 事故：3 个守护循环
+# 同时运行，累计重启 13 万次，向 s4h:3300 疯狂建连）。
+# 用 mkdir 的原子性做跨平台锁（macOS/Linux/Git Bash 均可用）。
+LOCK_DIR="${TMPDIR:-/tmp}/sap-for-agents.start.lock"
+if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+    LOCK_PID="$(cat "$LOCK_DIR/pid" 2>/dev/null || true)"
+    err "另一个 start.sh 守护进程正在运行（锁: $LOCK_DIR，PID: ${LOCK_PID:-未知}）"
+    echo "  如确认该进程已退出，删除锁后重试：rm -rf \"$LOCK_DIR\""
+    exit 1
+fi
+printf '%s\n' "$$" > "$LOCK_DIR/pid"
+cleanup_lock() { rm -rf "$LOCK_DIR" 2>/dev/null || true; }
+trap cleanup_lock EXIT
+ok "单实例锁已获取（PID $$）"
+echo ""
+
 # 1. Rust 工具链
 if command -v cargo >/dev/null 2>&1; then
     ok "Rust 已安装: $(cargo --version)"
@@ -256,9 +273,35 @@ set +e
 
 STOP=0
 RESTARTS=0
+CONSECUTIVE_FAILS=0
+MAX_CONSECUTIVE_FAILS="${SAP_MAX_RESTARTS:-5}"
+BACKOFF=1
+MAX_BACKOFF="${SAP_MAX_BACKOFF:-30}"
 trap 'STOP=1' INT TERM
 
+# 端口占用检测（循环内复用；只认 LISTEN 状态，不误伤 TIME_WAIT 客户端）
+port_is_listening() {
+    if command -v lsof >/dev/null 2>&1; then
+        lsof -nP -iTCP:"$LISTEN_PORT" -sTCP:LISTEN >/dev/null 2>&1
+    elif command -v ss >/dev/null 2>&1; then
+        ss -tln 2>/dev/null | grep -q ":$LISTEN_PORT\b"
+    elif [ "$(uname -s)" = "Linux" ] && command -v netstat >/dev/null 2>&1; then
+        netstat -tln 2>/dev/null | grep -q ":$LISTEN_PORT\b"
+    else
+        return 1
+    fi
+}
+
 while [ "$STOP" -eq 0 ]; do
+    # 重启前先确认端口空闲：若被别的实例占着，再启动只会 AddrInUse 死循环
+    if port_is_listening; then
+        err "端口 $LISTEN_PORT 已被占用，放弃重启（避免 AddrInUse 死循环）"
+        echo "  占用进程："
+        lsof -nP -iTCP:"$LISTEN_PORT" -sTCP:LISTEN 2>/dev/null || true
+        echo "  处理：停掉占用进程，或 export SAP_LISTEN_ADDR=127.0.0.1:3001 换端口"
+        break
+    fi
+
     "$BIN"
     RC=$?
 
@@ -269,8 +312,30 @@ while [ "$STOP" -eq 0 ]; do
         break
     fi
 
+    # 正常退出（如 /api/admin/restart 的 exit(0)）：重置失败计数，短延迟重启
+    if [ "$RC" -eq 0 ]; then
+        CONSECUTIVE_FAILS=0
+        BACKOFF=1
+        RESTARTS=$((RESTARTS + 1))
+        echo ""
+        ok "进程正常退出，1 秒后重启（累计第 $RESTARTS 次）"
+        sleep 1
+        continue
+    fi
+
+    # 异常退出：连续崩溃达上限就停手，不再无限重启
+    CONSECUTIVE_FAILS=$((CONSECUTIVE_FAILS + 1))
+    if [ "$CONSECUTIVE_FAILS" -ge "$MAX_CONSECUTIVE_FAILS" ]; then
+        err "进程连续崩溃 $CONSECUTIVE_FAILS 次（最后 exit=$RC），达到上限 ${MAX_CONSECUTIVE_FAILS}，停止自动重启"
+        echo "  排查：tail -n 100 /private/tmp/gw-*.log"
+        echo "  确认修复后重新执行 ./start.sh；如需放宽：export SAP_MAX_RESTARTS=20"
+        break
+    fi
+
     RESTARTS=$((RESTARTS + 1))
     echo ""
-    warn "进程退出（code $RC），1 秒后自动重启（累计第 $RESTARTS 次）—— Ctrl+C 可停止"
-    sleep 1
+    warn "进程异常退出（code $RC），${BACKOFF}s 后重启（累计第 $RESTARTS 次，连续失败 ${CONSECUTIVE_FAILS}/${MAX_CONSECUTIVE_FAILS}）—— Ctrl+C 可停止"
+    sleep "$BACKOFF"
+    BACKOFF=$((BACKOFF * 2))
+    [ "$BACKOFF" -gt "$MAX_BACKOFF" ] && BACKOFF=$MAX_BACKOFF
 done
