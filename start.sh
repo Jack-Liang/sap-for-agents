@@ -23,15 +23,56 @@ echo ""
 # "AddrInUse → 退出 → 1 秒后重启" 的死循环（2026-11-25 事故：3 个守护循环
 # 同时运行，累计重启 13 万次，向 s4h:3300 疯狂建连）。
 # 用 mkdir 的原子性做跨平台锁（macOS/Linux/Git Bash 均可用）。
+# 注意：macOS 自带 bash 3.2 会吞掉「未加花括号的 $变量」后面紧跟的多字节字符的首字节，
+# 本段与下方循环里的中文提示一律写 ${VAR}。
 LOCK_DIR="${TMPDIR:-/tmp}/sap-for-agents.start.lock"
-if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+STALE_DIR="$LOCK_DIR.stale.$$"
+
+# 锁持有者是否还活着。用 ps -p 而非 kill -0：后者对「进程存在但属于别的用户」同样
+# 失败，分不清死活；没有 ps（精简容器）或 Git Bash（ps 不支持 -p）时退回 kill -0。
+pid_alive() {
+    case "$(uname -s)" in
+        MINGW*|MSYS*|CYGWIN*) kill -0 "$1" 2>/dev/null ;;
+        *) if command -v ps >/dev/null 2>&1; then ps -p "$1" >/dev/null 2>&1; else kill -0 "$1" 2>/dev/null; fi ;;
+    esac
+}
+
+# 取锁：mkdir 抢不到时，只有确认持有者进程已死才回收残留锁。残留来自 EXIT trap 来不及
+# 跑的场景（kill -9、断电重启）——macOS 的 $TMPDIR 重启后仍在，不回收的话下一次
+# ./start.sh 会被一把没人持有的锁永远拒绝。
+# 回收走「rename 搬走 → 独占下复核 → 重建」：两个进程同时抢同一把残留锁时，rename
+# 只有一个能成功，另一方不会删掉对方刚建好的新锁。
+acquire_lock() {
+    mkdir "$LOCK_DIR" 2>/dev/null && return 0
     LOCK_PID="$(cat "$LOCK_DIR/pid" 2>/dev/null || true)"
-    err "另一个 start.sh 守护进程正在运行（锁: $LOCK_DIR，PID: ${LOCK_PID:-未知}）"
+    if [ -z "$LOCK_PID" ] || pid_alive "$LOCK_PID"; then
+        return 1
+    fi
+    mv "$LOCK_DIR" "$STALE_DIR" 2>/dev/null || { LOCK_PID="$(cat "$LOCK_DIR/pid" 2>/dev/null || true)"; return 1; }
+    MOVED_PID="$(cat "$STALE_DIR/pid" 2>/dev/null || true)"
+    if [ -n "$MOVED_PID" ] && pid_alive "$MOVED_PID"; then
+        mv "$STALE_DIR" "$LOCK_DIR" 2>/dev/null || true   # 搬走的是别人刚建的新锁：放回
+        LOCK_PID="$MOVED_PID"
+        return 1
+    fi
+    rm -rf "$STALE_DIR"
+    mkdir "$LOCK_DIR" 2>/dev/null || return 1
+    warn "残留锁已回收：持有者 PID ${MOVED_PID:-未知} 早已退出（kill -9 / 重启后 trap 没跑到）"
+}
+
+if ! acquire_lock; then
+    err "另一个 start.sh 守护进程正在运行（锁: ${LOCK_DIR}，PID: ${LOCK_PID:-未知}）"
     echo "  如确认该进程已退出，删除锁后重试：rm -rf \"$LOCK_DIR\""
     exit 1
 fi
 printf '%s\n' "$$" > "$LOCK_DIR/pid"
-cleanup_lock() { rm -rf "$LOCK_DIR" 2>/dev/null || true; }
+# 只删自己的锁——pid 文件不是自己时，说明锁目录已被别的进程接管
+cleanup_lock() {
+    if [ "$(cat "$LOCK_DIR/pid" 2>/dev/null)" = "$$" ]; then
+        rm -rf "$LOCK_DIR"
+    fi
+    true
+}
 trap cleanup_lock EXIT
 ok "单实例锁已获取（PID $$）"
 echo ""
@@ -265,6 +306,7 @@ cargo build --release || { err "cargo build --release 失败，无法启动"; ex
 BIN="$PWD/target/release/sap_for_agents"
 
 if [ "${SAP_GUARD:-on}" = "off" ]; then
+    cleanup_lock   # exec 不触发 EXIT trap，锁要在这里放掉，否则下次启动被自己的残留锁拒绝
     exec "$BIN"
 fi
 
@@ -277,6 +319,9 @@ CONSECUTIVE_FAILS=0
 MAX_CONSECUTIVE_FAILS="${SAP_MAX_RESTARTS:-5}"
 BACKOFF=1
 MAX_BACKOFF="${SAP_MAX_BACKOFF:-30}"
+# 存活满这个秒数再退出，就不算「连续崩溃」（崩溃循环的特征是刚起来就死）——
+# 否则跑几天崩一次的服务，攒满 MAX_CONSECUTIVE_FAILS 次就被永久停机。
+STABLE_RUN_SECS=60
 trap 'STOP=1' INT TERM
 
 # 端口占用检测（循环内复用；只认 LISTEN 状态，不误伤 TIME_WAIT 客户端）
@@ -302,8 +347,18 @@ while [ "$STOP" -eq 0 ]; do
         break
     fi
 
+    # 端口探测期间收到过停止信号的话，不再拉起服务：bash 要等前台命令（lsof/ss）结束
+    # 才执行 trap，所以 Ctrl+C 只打断了探测，STOP 是在那之后才置位的——启动前再查一次
+    if [ "$STOP" -ne 0 ]; then
+        echo ""
+        ok "服务已停止（本次运行周期内自动重启 ${RESTARTS} 次）"
+        break
+    fi
+
+    START_TS=$(date +%s)
     "$BIN"
     RC=$?
+    RUN_SECS=$(( $(date +%s) - START_TS ))
 
     # 收到 Ctrl+C / SIGTERM：不再重启（信号已透传给上面的服务，它会先排空再退）
     if [ "$STOP" -ne 0 ]; then
@@ -323,10 +378,15 @@ while [ "$STOP" -eq 0 ]; do
         continue
     fi
 
-    # 异常退出：连续崩溃达上限就停手，不再无限重启
+    # 异常退出：连续崩溃达上限就停手，不再无限重启。
+    # 这次是跑够了 STABLE_RUN_SECS 才倒下的：不算崩溃循环，连续计数从头来。
+    if [ "$RUN_SECS" -ge "$STABLE_RUN_SECS" ]; then
+        CONSECUTIVE_FAILS=0
+        BACKOFF=1
+    fi
     CONSECUTIVE_FAILS=$((CONSECUTIVE_FAILS + 1))
     if [ "$CONSECUTIVE_FAILS" -ge "$MAX_CONSECUTIVE_FAILS" ]; then
-        err "进程连续崩溃 $CONSECUTIVE_FAILS 次（最后 exit=$RC），达到上限 ${MAX_CONSECUTIVE_FAILS}，停止自动重启"
+        err "进程连续崩溃 ${CONSECUTIVE_FAILS} 次（最后 exit=${RC}），达到上限 ${MAX_CONSECUTIVE_FAILS}，停止自动重启"
         echo "  排查：tail -n 100 /private/tmp/gw-*.log"
         echo "  确认修复后重新执行 ./start.sh；如需放宽：export SAP_MAX_RESTARTS=20"
         break
@@ -334,7 +394,7 @@ while [ "$STOP" -eq 0 ]; do
 
     RESTARTS=$((RESTARTS + 1))
     echo ""
-    warn "进程异常退出（code $RC），${BACKOFF}s 后重启（累计第 $RESTARTS 次，连续失败 ${CONSECUTIVE_FAILS}/${MAX_CONSECUTIVE_FAILS}）—— Ctrl+C 可停止"
+    warn "进程异常退出（code ${RC}），${BACKOFF}s 后重启（累计第 ${RESTARTS} 次，连续失败 ${CONSECUTIVE_FAILS}/${MAX_CONSECUTIVE_FAILS}）—— Ctrl+C 可停止"
     sleep "$BACKOFF"
     BACKOFF=$((BACKOFF * 2))
     [ "$BACKOFF" -gt "$MAX_BACKOFF" ] && BACKOFF=$MAX_BACKOFF
