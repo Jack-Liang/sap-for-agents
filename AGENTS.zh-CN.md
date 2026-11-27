@@ -462,6 +462,23 @@ curl -X POST http://127.0.0.1:3000/api/objects/prog/ZMY_REPORT/syntax \
 - **读回保留原文大小写**：`/api/programs/{name}/source` 现以 `WITH_LOWERCASE` 请求——读到即存到，从读回内容取的锚点必然匹配。`GET /api/objects/{type}/{name}/source`（ADT 通道）是新类型与函数模块的规范读入口（SEDI 形态，与写入口径一致）。
 - **只读部署**：部署者可能以 `SAP_READ_ONLY=1` 运行网关——写端点（`PUT .../source`、`POST .../replace`、`POST .../create`、`DELETE`、`/api/adt` 非读方法）此时返回 403 `READ_ONLY`。这是刻意为之：不要重试写操作，改为只读操作与 `POST .../syntax`（仍可用，不落库）。`POST /api/rfc` 不受该开关影响。
 
+### 写后激活检查清单（必做）
+
+Agent 写 ABAP 最常见的静默失败：写入返回 200、没人读 `activated.success`、对象停留在非激活版本——下一次测试/运行就报出难懂的「inactive version」错误。每次源代码写入（`PUT .../source`、`POST .../replace`、`POST .../create` 带 `source`）之后：
+
+1. **读写响应里的 `activated.success`**——HTTP 200 不代表激活成功。`success:false` → 读 `problems[]` / `activated.messages[]`，改源码，重试写入。
+2. **不要走裸 `/api/adt/**` PUT 写源代码**——用 `/api/objects/{type}/{name}/source`（同一请求内自动激活，`activate` 默认 true）。裸 ADT 写入只留给结构编辑器对象（doma/dtel/ttyp，见下方小节）——且其后必须跟激活 POST。
+3. **不确定上次写入激活了没有？**继续之前先验证：`GET /api/objects/{type}/{name}/meta` → `active` 必须为 `true`（§10；这正是「我的激活到底成没成」的读侧答案）。
+4. **会话收尾清扫**：列出非激活对象，只把自己写入留下的遗留补激活——不要批量激活别人未提交的对象：
+
+```bash
+curl http://127.0.0.1:3000/api/adt/activation/inactiveobjects
+
+curl -X POST "http://127.0.0.1:3000/api/adt/activation?method=activate&preauditRequested=true" \
+  -H "Content-Type: application/xml" -H "Accept: */*" \
+  -d '<?xml version="1.0" encoding="UTF-8"?><adtcore:objectReferences xmlns:adtcore="http://www.sap.com/adt/core"><adtcore:objectReference adtcore:uri="/sap/bc/adt/oo/classes/zcl_mine" adtcore:name="ZCL_MINE"/></adtcore:objectReferences>'
+```
+
 ### 10. 包导出与对象元数据动词（abapGit 吸收，v0.21）
 
 **包级快照**——把一个包（含子包）序列化为 abapGit 风格文件树，zip 交付：agent 可直接提交 git、做 SAP↔本地 diff、做备份：

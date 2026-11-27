@@ -463,6 +463,23 @@ curl -X POST http://127.0.0.1:3000/api/objects/prog/ZMY_REPORT/syntax \
 - **Reads return the original case**: `/api/programs/{name}/source` now requests `WITH_LOWERCASE` — what you read is what is stored, so anchors taken from a previous read always match. `GET /api/objects/{type}/{name}/source` (ADT channel) is the canonical read for the new types and for function modules (SEDI form, matching what writes expect).
 - **Read-only deployments**: the deployer may run the gateway with `SAP_READ_ONLY=1` — write endpoints (`PUT .../source`, `POST .../replace`, `POST .../create`, `DELETE`, non-read `/api/adt` methods) then return 403 `READ_ONLY`. This is intentional: don't retry writes, stick to reads and `POST .../syntax` (still allowed, nothing is stored). `POST /api/rfc` is unaffected by the switch.
 
+### Post-write activation checklist (mandatory)
+
+The most common silent failure in agent-driven ABAP work: the write returned 200, nobody read `activated.success`, and the object stays inactive — the next test/run then fails with a confusing "inactive version" error. After EVERY source write (`PUT .../source`, `POST .../replace`, `POST .../create` with `source`):
+
+1. **Read `activated.success` in the write response** — HTTP 200 does NOT mean activated. `success:false` → read `problems[]` / `activated.messages[]`, fix the source, retry the write.
+2. **Don't write source via raw `/api/adt/**` PUT** — use `/api/objects/{type}/{name}/source` (activates in the same request, `activate` defaults to true). Raw ADT writes are only for the structure-editor objects (doma/dtel/ttyp, subsection below) — and those MUST be followed by the activation POST.
+3. **Unsure whether the last write activated?** Verify before moving on: `GET /api/objects/{type}/{name}/meta` → `active` must be `true` (section 10; this is the read-side answer to "did my activation fail?").
+4. **Session-end sweep**: list inactive objects and activate any leftovers of **your own** writes — never mass-activate objects you didn't touch:
+
+```bash
+curl http://127.0.0.1:3000/api/adt/activation/inactiveobjects
+
+curl -X POST "http://127.0.0.1:3000/api/adt/activation?method=activate&preauditRequested=true" \
+  -H "Content-Type: application/xml" -H "Accept: */*" \
+  -d '<?xml version="1.0" encoding="UTF-8"?><adtcore:objectReferences xmlns:adtcore="http://www.sap.com/adt/core"><adtcore:objectReference adtcore:uri="/sap/bc/adt/oo/classes/zcl_mine" adtcore:name="ZCL_MINE"/></adtcore:objectReferences>'
+```
+
 ### 10. Package export & object metadata verbs (abapGit absorption, v0.21)
 
 **Package snapshot** — serialize a package (and its subpackages) into an abapGit-style file tree, delivered as a zip the agent can commit straight to git, diff against local files, or keep as a backup:
